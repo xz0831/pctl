@@ -462,7 +462,38 @@ fn print<T: serde::Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
+/// `pctl --host <ssh-target> ARGS...` runs `PCTL_REMOTE_BIN ARGS...` (default `pctl`) on that
+/// computer over the user's existing ssh setup. Paths in ARGS are the remote host's paths.
+fn remote(argv: &[String]) -> Option<i32> {
+    let i = argv.iter().position(|a| a == "--host")?;
+    let host = argv.get(i + 1).filter(|h| !h.starts_with('-'));
+    let Some(host) = host else {
+        eprintln!("{}", json!({"schema_version":1,"ok":false,"error":"--host needs an ssh target","error_code":"operation_failed"}));
+        return Some(2);
+    };
+    let bin = std::env::var("PCTL_REMOTE_BIN").unwrap_or_else(|_| "pctl".into());
+    let rest = argv[1..i].iter().chain(&argv[i + 2..]);
+    let line = std::iter::once(&bin)
+        .chain(rest)
+        .map(|a| pctl::shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let status = std::process::Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "--", host, &line])
+        .status();
+    Some(match status {
+        Ok(s) => s.code().unwrap_or(2),
+        Err(e) => {
+            eprintln!("{}", json!({"schema_version":1,"ok":false,"error":format!("ssh: {e}"),"error_code":"operation_failed"}));
+            2
+        }
+    })
+}
 fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(code) = remote(&argv) {
+        std::process::exit(code)
+    }
     if let Err(e) = run() {
         eprintln!(
             "{}",
