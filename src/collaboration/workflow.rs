@@ -221,6 +221,23 @@ impl Core {
             q.role.is_some() != q.reply.is_some(),
             "exactly one role or reply handle is required"
         );
+        let (mut out, wake) = self.msg_send_store(c, q)?;
+        // Wake after the registry lock is released: input takes the same lock.
+        out["wake"] = match wake {
+            None => json!("skipped: deduplicated retry"),
+            Some((agent, run, text)) => match self.wake(&agent, &run, &text) {
+                Ok(state) => json!(state),
+                Err(e) => json!(format!("failed: {e:#}")),
+            },
+        };
+        Ok(out)
+    }
+    #[allow(clippy::type_complexity)]
+    fn msg_send_store(
+        &self,
+        c: &Caller,
+        q: &RoleSend,
+    ) -> Result<(Value, Option<(String, String, String)>)> {
         let _lock = self.lock()?;
         let r = self.registry()?;
         check_caller(&r, c)?;
@@ -297,9 +314,29 @@ impl Core {
             } else { error }
         })?;
         let current = self.read_mailbox(&c.project)?;
-        Ok(
-            json!({"message":with_reply_handle(&r,&current,&sent.message,true),"key":q.key,"deduplicated":sent.deduplicated,"delivery":"stored_only; no automatic wake, PTY input or execution"}),
-        )
+        let wake = (!sent.deduplicated).then(|| {
+            (
+                sent.message.to_agent_id.clone(),
+                sent.message.to_run_id.clone(),
+                // Self-contained command: some harnesses (shared Codex server) run tools
+                // without the pane's PCTL_* environment.
+                format!(
+                    "[pctl] new message {} from {}. Read it with: PCTL_STATE={} PCTL_TMUX={} PCTL_PROJECT_ID={} PCTL_AGENT_ID={} PCTL_RUN_ID={} {} msg inbox",
+                    handle(&sent.message),
+                    role_name(&r, &sent.message.from_agent_id).unwrap_or("?"),
+                    shell_quote(&self.state.to_string_lossy()),
+                    shell_quote(&self.tmux.to_string_lossy()),
+                    sent.message.project_id,
+                    sent.message.to_agent_id,
+                    sent.message.to_run_id,
+                    shell_quote(&std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "pctl".into())),
+                ),
+            )
+        });
+        Ok((
+            json!({"message":with_reply_handle(&r,&current,&sent.message,true),"key":q.key,"deduplicated":sent.deduplicated,"delivery":"stored; recipient woken with a one-line notice when its input mode is terminal-line"}),
+            wake,
+        ))
     }
     pub fn msg_inbox(&self, c: &Caller, unacked: bool, after: u64, limit: usize) -> Result<Value> {
         let r = self.registry()?;

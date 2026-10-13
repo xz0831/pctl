@@ -1079,6 +1079,17 @@ impl Core {
         ensure_terminal_input(&r, agent)?;
         self.deliver_text(&r, agent, expected, text.as_bytes(), "terminal_paste")
     }
+    /// Wake a recipient with one notice line and Enter. Only for terminal-line opt-in agents.
+    pub(crate) fn wake(&self, agent: &str, run: &str, text: &str) -> Result<&'static str> {
+        if ensure_terminal_input(&self.registry()?, agent).is_err() {
+            return Ok("skipped: recipient input mode is native");
+        }
+        self.paste_line(agent, run, text)?;
+        // Codex treats an Enter right after a paste burst as a newline; wait it out.
+        std::thread::sleep(Duration::from_millis(500));
+        self.submit_line(agent, run)?;
+        Ok("delivered; acceptance unverified")
+    }
     pub fn submit_line(&self, agent: &str, expected: &str) -> Result<()> {
         let _lock = self.lock()?;
         let r = self.registry()?;
