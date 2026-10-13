@@ -1420,6 +1420,19 @@ fn check_identity(run: &Run, p: &Pane) -> Result<()> {
     );
     Ok(())
 }
+#[cfg(target_os = "macos")]
+fn process_start(pid: &str) -> Result<String> {
+    // ponytail: ps lstart has 1 s resolution; PID reuse within the same second goes unnoticed. Use proc_pidinfo if that matters.
+    ensure!(pid.chars().all(|c| c.is_ascii_digit()), "invalid pid");
+    let out = Command::new("/bin/ps")
+        .args(["-o", "lstart=", "-p", pid])
+        .env("LC_ALL", "C")
+        .output()?;
+    let s = String::from_utf8(out.stdout)?.trim().to_string();
+    ensure!(out.status.success() && !s.is_empty(), "missing process starttime");
+    Ok(s)
+}
+#[cfg(not(target_os = "macos"))]
 fn process_start(pid: &str) -> Result<String> {
     let raw = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let fields = raw

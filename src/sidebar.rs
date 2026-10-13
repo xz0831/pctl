@@ -431,16 +431,42 @@ impl Core {
         );
         let start = process_start(f[3])?;
         let exe = std::env::current_exe()?;
-        ensure!(
-            fs::canonicalize(format!("/proc/{}/exe", f[3]))? == fs::canonicalize(&exe)?,
-            "manager executable identity mismatch; controls locked"
-        );
-        let bytes = fs::read(format!("/proc/{}/cmdline", f[3]))?;
-        let argv: Vec<_> = bytes
-            .split(|b| *b == 0)
-            .filter(|v| !v.is_empty())
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-            .collect();
+        #[cfg(not(target_os = "macos"))]
+        let argv: Vec<_> = {
+            ensure!(
+                fs::canonicalize(format!("/proc/{}/exe", f[3]))? == fs::canonicalize(&exe)?,
+                "manager executable identity mismatch; controls locked"
+            );
+            let bytes = fs::read(format!("/proc/{}/cmdline", f[3]))?;
+            bytes
+                .split(|b| *b == 0)
+                .filter(|v| !v.is_empty())
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+                .collect()
+        };
+        // ponytail: macOS ps joins argv with spaces, so compare the joined line; paths containing spaces could alias. Use sysctl KERN_PROCARGS2 if that matters.
+        #[cfg(target_os = "macos")]
+        let argv: Vec<String> = {
+            let out = std::process::Command::new("/bin/ps")
+                .args(["-ww", "-o", "args=", "-p", f[3]])
+                .output()?;
+            vec![String::from_utf8(out.stdout)?.trim_end().to_string()]
+        };
+        #[cfg(target_os = "macos")]
+        let expected = vec![
+            [
+                exe.to_string_lossy().into_owned(),
+                "--state".into(),
+                self.state.to_string_lossy().into_owned(),
+                "--tmux".into(),
+                self.tmux.to_string_lossy().into_owned(),
+                "ui".into(),
+                "--project".into(),
+                project.into(),
+            ]
+            .join(" "),
+        ];
+        #[cfg(not(target_os = "macos"))]
         let expected = vec![
             exe.to_string_lossy().into_owned(),
             "--state".into(),
