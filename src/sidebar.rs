@@ -55,7 +55,8 @@ impl Core {
         ensure!(
             f.len() == 8
                 && f[0] == s.pane
-                && f[1] == s.pid
+                // tmux 3.8 reports an empty pane_pid once the pane is dead.
+                && (f[1] == s.pid || (f[2] == "1" && f[1].is_empty()))
                 && f[3] == s.id
                 && f[4] == s.server_instance
                 && f[5].is_empty()
@@ -144,7 +145,7 @@ impl Core {
         fs::write(
             &launcher,
             format!(
-                "#!/bin/sh\ni=0\nwhile [ ! -f {} ]; do i=$((i+1)); [ \"$i\" -le 300 ] || exit 75; sleep 0.05; done\nexec {}\n",
+                "#!/bin/sh\nend=$(($(date +%s)+15))\nwhile [ ! -f {} ]; do [ \"$(date +%s)\" -lt \"$end\" ] || exit 75; sleep 0.05; done\nexec {}\n",
                 shell_quote(&gate.to_string_lossy()),
                 self.sidebar_command(&sidebar_id)?
             ),
@@ -354,7 +355,7 @@ impl Core {
                 ensure!(
                     f.len() == 7
                         && f[0] == sidebar.pane
-                        && f[1] == sidebar.pid
+                        && (f[1] == sidebar.pid || (f[2] == "1" && f[1].is_empty()))
                         && (f[3].is_empty() || f[3] == sidebar.id)
                         && (f[4].is_empty() || f[4] == sidebar.server_instance)
                         && f[5].is_empty()

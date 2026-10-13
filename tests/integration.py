@@ -2,7 +2,7 @@
 """Real tmux integration suite. Every server is isolated and removed by this script."""
 import argparse, concurrent.futures, json, os, pathlib, shutil, subprocess, tempfile, time, shlex
 parser=argparse.ArgumentParser(); parser.add_argument('--bin',required=True); parser.add_argument('--tmux',required=True);parser.add_argument('--report',default='test-results/integration.json');args=parser.parse_args()
-B=str(pathlib.Path(args.bin).resolve()); T=str(pathlib.Path(args.tmux).resolve()); root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-it-',dir='/tmp')); state=root/'state'; results=[]
+B=str(pathlib.Path(args.bin).resolve()); T=str(pathlib.Path(args.tmux).resolve()); root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-it-',dir=os.path.realpath('/tmp'))); state=root/'state'; results=[]
 def cli(*a,ok=True):
  p=subprocess.run([B,'--state',str(state),'--tmux',T,*map(str,a)],text=True,capture_output=True,timeout=15)
  if ok and p.returncode: raise AssertionError(f'{a}: {p.stderr} {p.stdout}')
@@ -67,7 +67,12 @@ try:
  case('terminate one joined pane leaves sibling running',terminate_joined)
  def generic():
   a,r=start_agent(ps[0]['id']);v=inspect(a['id']);assert v['process']=='running';assert v['task']=='unknown';e=send(a['id'],r['id'],'hello',ok=False);assert 'unsupported' in e['error']
-  a2,r2=start_agent(ps[0]['id'],'exit-zero',['/bin/sh','-c','exit 0']);time.sleep(.1);v=inspect(a2['id']);assert v['process']=='exited(0)',v;assert v['task']=='unknown';e=cli('agent','start','--agent',a2['id'],ok=False);assert 'existing run' in e['error']
+  a2,r2=start_agent(ps[0]['id'],'exit-zero',['/bin/sh','-c','exit 0'])
+  for _ in range(40):
+   v=inspect(a2['id'])
+   if v['process']!='starting' and v['process']!='running':break
+   time.sleep(.05)
+  assert v["process"]=="exited(0)",v;assert v['task']=='unknown';e=cli('agent','start','--agent',a2['id'],ok=False);assert 'existing run' in e['error']
  case('silent generic running and exit-zero never imply task completion',generic)
  def concurrent_writes():
   with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:

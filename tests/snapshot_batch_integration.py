@@ -2,7 +2,7 @@
 """Isolated native snapshot batching, partial-output and fresh-control-guard regression."""
 import argparse, hashlib, json, os, pathlib, subprocess, tempfile
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--tmux',required=True);p.add_argument('--report',required=True);a=p.parse_args()
-B=str(pathlib.Path(a.bin).resolve());T=str(pathlib.Path(a.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-batch-',dir='/tmp'));state=root/'s';calls=root/'calls.jsonl';mode=root/'mode';shim=root/'tmux-shim';results=[]
+B=str(pathlib.Path(a.bin).resolve());T=str(pathlib.Path(a.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-batch-',dir=os.path.realpath('/tmp')));state=root/'s';calls=root/'calls.jsonl';mode=root/'mode';shim=root/'tmux-shim';results=[]
 env={k:v for k,v in os.environ.items() if not k.startswith('PCTL_')}
 def cli(*args,ok=True,wrapped=False):
  q=subprocess.run([B,'--state',str(state),'--tmux',str(shim) if wrapped else T,*map(str,args)],capture_output=True,text=True,env=env,timeout=20)

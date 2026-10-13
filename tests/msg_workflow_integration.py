@@ -2,7 +2,7 @@
 """Real-tmux local contract checks. Synthetic sleep processes; no model cooperation claim."""
 import argparse, concurrent.futures, hashlib, json, os, pathlib, subprocess, tempfile, time
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--tmux',required=True);p.add_argument('--report',required=True);args=p.parse_args()
-B=str(pathlib.Path(args.bin).resolve());T=str(pathlib.Path(args.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-wf-',dir='/tmp'));state=root/'s';results=[]
+B=str(pathlib.Path(args.bin).resolve());T=str(pathlib.Path(args.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-wf-',dir=os.path.realpath('/tmp')));state=root/'s';results=[]
 base_env={k:v for k,v in os.environ.items() if not k.startswith('PCTL_')}
 def cli(*a,who=None,ok=True,env_extra=None):
  env=base_env.copy()

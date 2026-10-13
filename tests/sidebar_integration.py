@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Disposable native tmux sidebar contract tests. Four inert fixtures, no model."""
-import argparse,json,pathlib,subprocess,tempfile,time,uuid
+import os,argparse,json,pathlib,subprocess,tempfile,time,uuid
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--tmux',required=True);p.add_argument('--report',required=True);a=p.parse_args()
-B=str(pathlib.Path(a.bin).resolve());T=str(pathlib.Path(a.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-side-',dir='/tmp'));state=root/'s';results=[];commands=[]
+B=str(pathlib.Path(a.bin).resolve());T=str(pathlib.Path(a.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-side-',dir=os.path.realpath('/tmp')));state=root/'s';results=[];commands=[]
 def cli(*args,ok=True):
  r=subprocess.run([B,'--state',str(state),'--tmux',T,*map(str,args)],capture_output=True,text=True,timeout=20)
  commands.append({'args':list(map(str,args)),'exit':r.returncode,'stdout':r.stdout,'stderr':r.stderr})

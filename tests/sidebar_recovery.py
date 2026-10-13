@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Disposable sidebar intent fault tests; direct state mutation is test setup only."""
-import argparse,json,pathlib,shlex,subprocess,tempfile,time,uuid
+import os,argparse,json,pathlib,shlex,subprocess,tempfile,time,uuid
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--tmux',required=True);p.add_argument('--report',required=True);a=p.parse_args()
-B=str(pathlib.Path(a.bin).resolve());T=str(pathlib.Path(a.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-side-fault-',dir='/tmp'));state=root/'s';results=[]
+B=str(pathlib.Path(a.bin).resolve());T=str(pathlib.Path(a.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-side-fault-',dir=os.path.realpath('/tmp')));state=root/'s';results=[]
 def cli(*args,ok=True,tmux=T):
  r=subprocess.run([B,'--state',str(state),'--tmux',tmux,*map(str,args)],capture_output=True,text=True,timeout=20)
  assert (r.returncode==0)==ok,(args,r.returncode,r.stdout,r.stderr)
@@ -18,7 +18,7 @@ def cleanup(record):
  for name in ['sidebar.json','pending-sidebar.json',f"sidebar-{record['id']}.ready"]:(state/name).unlink(missing_ok=True)
 def pending(with_registry=False,partial=False):
  pane,pid=tm('split-window','-d','-h','-t',run['pane'],'-P','-F','#{pane_id}\t#{pane_pid}','exec /bin/sleep 300').split('\t')
- start=pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()[19]
+ start=subprocess.run(['ps','-o','lstart=','-p',str(pid)],text=True,capture_output=True,env={'LC_ALL':'C'}).stdout.strip()
  rec={'schema_version':1,'id':str(uuid.uuid4()),'server_instance':json.loads((state/'registry.json').read_text())['server_instance'],'pane':pane,'pid':pid,'process_start':start,'width':28,'host_project_id':project['id'],'host_agent_id':agent['id'],'host_run_id':run['id'],'started_at':int(time.time()*1000)}
  intent={'sidebar_id':rec['id'],'phase':'gated_pane_created','sidebar':rec,'window':run['window']}
  (state/'pending-sidebar.json').write_text(json.dumps(intent))

@@ -2,7 +2,7 @@
 """Isolated real-tmux mailbox regression; never sends text to agent terminals."""
 import argparse, concurrent.futures, json, os, pathlib, subprocess, tempfile, time, uuid
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--tmux',required=True);p.add_argument('--report',default='test-results/v03-collaboration-integration.json');args=p.parse_args()
-B=str(pathlib.Path(args.bin).resolve());T=str(pathlib.Path(args.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-msg-',dir='/tmp'));state=root/'s';results=[]
+B=str(pathlib.Path(args.bin).resolve());T=str(pathlib.Path(args.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-msg-',dir=os.path.realpath('/tmp')));state=root/'s';results=[]
 def cli(*a,ok=True):
  q=subprocess.run([B,'--state',str(state),'--tmux',T,*map(str,a)],text=True,capture_output=True,timeout=20)
  if ok: assert q.returncode==0,(a,q.stderr,q.stdout)

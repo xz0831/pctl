@@ -2,7 +2,7 @@
 """No tmux required: actor CLI context rejection must precede all state mutation."""
 import argparse,json,os,pathlib,subprocess,tempfile
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--tmux',required=True);p.add_argument('--report',default='test-results/team-context-preflight.json');q=p.parse_args()
-B=str(pathlib.Path(q.bin).resolve());T=str(pathlib.Path(q.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='team-ctx-',dir='/tmp'));state=root/'s';plain={k:v for k,v in os.environ.items() if not k.startswith('PCTL_')}
+B=str(pathlib.Path(q.bin).resolve());T=str(pathlib.Path(q.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='team-ctx-',dir=os.path.realpath('/tmp')));state=root/'s';plain={k:v for k,v in os.environ.items() if not k.startswith('PCTL_')}
 def call(s,args,env):return subprocess.run([B,'--state',str(s),'--tmux',T,*args],env=env,text=True,capture_output=True,timeout=8)
 assert call(state,['project','add','--name','test','--root',str(root)],plain).returncode==0
 state.chmod(0o755);original={p.name:p.read_bytes() for p in state.iterdir() if p.is_file()}

@@ -25,7 +25,7 @@ cases=[
 ]
 results=[]
 for name,chunks,want_exit,required,forbidden,extra in cases:
- m,s=pty.openpty();before=termios.tcgetattr(s)
+ m,s=pty.openpty();before=termios.tcgetattr(m)
  child=subprocess.Popen([probe,*extra],stdin=s,stdout=s,stderr=s,env=dict(os.environ,TERM='xterm-256color'),preexec_fn=lambda:(os.setsid(),fcntl.ioctl(0,termios.TIOCSCTTY,0)))
  os.set_blocking(m,False);output=b'';ready=False;index=0;offset=0;next_send=0;deadline=time.monotonic()+6
  while time.monotonic()<deadline:
@@ -41,7 +41,7 @@ for name,chunks,want_exit,required,forbidden,extra in cases:
     if index<len(chunks):next_send=time.monotonic()+chunks[index][0]
   if child.poll() is not None:break
  if child.poll() is None:child.kill()
- child.wait();after=termios.tcgetattr(s);os.close(s);os.close(m)
+ child.wait();after=termios.tcgetattr(m);os.close(s);os.close(m)
  text=output.decode(errors='replace')
  unsupported=name.startswith("UNSUPPORTED")
  if not unsupported:forbidden=forbidden+["Char('r')","Char('8')","Char('/')"]

@@ -271,19 +271,21 @@ impl Core {
             let mut child = command
                 .spawn()
                 .with_context(|| format!("cannot execute {}", self.tmux.display()))?;
-            let deadline = Instant::now() + Duration::from_secs(3);
-            let status = loop {
-                if let Some(status) = child.try_wait()? {
-                    break status;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+            // Blocking wait on a helper thread: macOS timer coalescing stretches a 10 ms
+            // poll sleep to ~70 ms, which made every tmux call ~80 ms.
+            let pid = child.id();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(child.wait());
+            });
+            let status = match rx.recv_timeout(Duration::from_secs(3)) {
+                Ok(status) => status?,
+                Err(_) => {
+                    let _ = Command::new("/bin/kill").args(["-9", &pid.to_string()]).status();
                     bail!(
                         "tmux command timeout; outcome_unknown for mutations; inspect before retrying"
                     );
                 }
-                std::thread::sleep(Duration::from_millis(10));
             };
             Ok(Output {
                 status,
@@ -1415,7 +1417,8 @@ fn check_identity(run: &Run, p: &Pane) -> Result<()> {
         "pane moved outside registered project; controls locked"
     );
     ensure!(
-        p.pid == run.pid,
+        // tmux 3.8 reports an empty pane_pid once the pane is dead.
+        p.pid == run.pid || (p.dead && p.pid.is_empty()),
         "process identity changed (external respawn); controls locked"
     );
     Ok(())

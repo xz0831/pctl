@@ -4,8 +4,11 @@ No real models, account access, arbitrary message execution, or preexisting serv
 """
 import argparse, concurrent.futures, hashlib, json, os, pathlib, subprocess, tempfile, time
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--tmux',required=True);p.add_argument('--report',default='test-results/v06-orchestration.json');args=p.parse_args()
-B=str(pathlib.Path(args.bin).resolve());T=str(pathlib.Path(args.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-team-',dir='/tmp'));state=root/'s';results=[]
+B=str(pathlib.Path(args.bin).resolve());T=str(pathlib.Path(args.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-team-',dir=os.path.realpath('/tmp')));state=root/'s';results=[]
 baseenv={k:v for k,v in os.environ.items() if not k.startswith('PCTL_')}
+def pid_cwd(pid):
+ out=subprocess.run(['lsof','-a','-d','cwd','-Fn','-p',str(pid)],text=True,capture_output=True).stdout
+ return pathlib.Path(next((l[1:] for l in out.splitlines() if l.startswith('n')),'/nonexistent')).resolve()
 def cli(*a,env=None,ok=True):
  q=subprocess.run([B,'--state',str(state),'--tmux',T,*map(str,a)],env=env or baseenv,text=True,capture_output=True,timeout=25)
  if ok: assert q.returncode==0,(a,q.stderr,q.stdout)
@@ -61,9 +64,9 @@ try:
   assert ca['binding']['project_id']==pa['id'];assert cb['binding']['project_id']==pb['id'];assert ca['binding']['id']!=cb['binding']['id']
   for c,a in [(ca,wa),(cb,wb)]:
    for _ in range(100):
-    if pathlib.Path('/proc',c['binding']['pid'],'cwd').resolve()==pathlib.Path(a['cwd']):break
+    if pid_cwd(c['binding']['pid'])==pathlib.Path(a['cwd']):break
     time.sleep(.02)
-   assert pathlib.Path('/proc',c['binding']['pid'],'cwd').resolve()==pathlib.Path(a['cwd'])
+   assert pid_cwd(c['binding']['pid'])==pathlib.Path(a['cwd'])
    assert c['task']=='unknown'
  case('two projects launch distinct registered native processes in role workdirs',two_projects)
  def dedup():
