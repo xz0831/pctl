@@ -383,7 +383,21 @@ impl Core {
         cwd: &Path,
         project: Option<&str>,
         argv: Vec<String>,
+        conversation: Option<&str>,
     ) -> Result<Value> {
+        // Moving a Herdr session: start it already resuming its conversation.
+        if let Some(c) = conversation {
+            ensure!(
+                !harness(&argv).is_empty(),
+                "--conversation needs a claude or codex command"
+            );
+            ensure!(
+                !c.is_empty()
+                    && c.len() <= 128
+                    && c.chars().all(|x| x.is_ascii_alphanumeric() || x == '-'),
+                "invalid conversation ID"
+            );
+        }
         let cwd = fs::canonicalize(cwd).context("cwd")?;
         ensure!(
             !self.registry()?.agents.iter().any(|a| a.name == name),
@@ -407,6 +421,14 @@ impl Core {
             None => self.register_project(&pname, &cwd)?.id,
         };
         let a = self.register_agent(&pid, name, &cwd, argv, "generic")?;
+        if let Some(c) = conversation {
+            let _lock = self.lock()?;
+            let mut r = self.registry()?;
+            if let Some(x) = r.agents.iter_mut().find(|x| x.id == a.id) {
+                x.conversation = Some(c.to_string());
+            }
+            self.save(&r)?;
+        }
         self.configure_input(&a.id, "terminal-line")?;
         self.configure_collaboration(&a.id, "mailbox")?;
         self.start(&a.id)?;

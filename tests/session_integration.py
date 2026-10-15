@@ -98,6 +98,14 @@ try:
         assert until(lambda: len(log.read_text().splitlines()) == 2)
         assert log.read_text().splitlines()[1] == f'claude --resume {c}'
     case('claude: fixed --session-id on first start, --resume on restart', claude_resume)
+    def moved():
+        cli('session', 'add', '--name', 'c-moved', '--cwd', cwd('c-moved'), '--conversation', 'herdr-convo-1', '--', bindir / 'claude')
+        log = cwd('c-moved') / 'argv.log'
+        assert until(lambda: log.exists() and log.read_text().strip())
+        assert log.read_text().splitlines()[0] == 'claude --resume herdr-convo-1'
+        assert cli('session', 'get', 'c-moved')['conversation'] == 'herdr-convo-1'
+        assert 'needs a claude or codex' in cli('session', 'add', '--name', 'p-moved', '--cwd', cwd('p-moved'), '--conversation', 'x', '--', bindir / 'plain', ok=False)
+    case('add --conversation starts a moved session in its existing conversation', moved)
     def codex_hook():
         assert cli('session', 'get', 'x-work')['conversation'] is None, 'no rollout: unknown, no guess'
         s = cli('session', 'get', 'x-work')

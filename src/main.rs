@@ -358,6 +358,9 @@ enum SessionCmd {
         /// Project name; default is the cwd's folder name.
         #[arg(long)]
         project: Option<String>,
+        /// Resume this existing conversation (moving a Herdr session) instead of a new one.
+        #[arg(long)]
+        conversation: Option<String>,
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
@@ -779,8 +782,15 @@ fn run() -> Result<()> {
                 name,
                 cwd,
                 project,
+                conversation,
                 argv,
-            } => print(&core.session_add(&name, &cwd, project.as_deref(), argv)?)?,
+            } => print(&core.session_add(
+                &name,
+                &cwd,
+                project.as_deref(),
+                argv,
+                conversation.as_deref(),
+            )?)?,
             SessionCmd::Prompt { name, text } => print(&core.session_prompt(&name, &text)?)?,
             SessionCmd::Wait {
                 name,
