@@ -9,10 +9,12 @@ use std::path::PathBuf;
     about = "Guarded native-tmux project-agent pilot. JSON CLI and shared Ratatui TUI."
 )]
 struct Args {
-    #[arg(long, global = true, env = "PCTL_STATE", default_value = ".pctl")]
-    state: PathBuf,
-    #[arg(long, global = true, env = "PCTL_TMUX", default_value = "tmux")]
-    tmux: PathBuf,
+    /// Default: ~/.local/state/pctl (one server for every project; ssh callers get it too).
+    #[arg(long, global = true, env = "PCTL_STATE")]
+    state: Option<PathBuf>,
+    /// Default: tmux on PATH, else /opt/homebrew/bin/tmux (non-login ssh PATH lacks it).
+    #[arg(long, global = true, env = "PCTL_TMUX")]
+    tmux: Option<PathBuf>,
     /// Save a state-local appearance preset; existing UIs refresh automatically.
     #[arg(long, global = true)]
     theme: Option<pctl::theme::ThemeName>,
@@ -50,6 +52,11 @@ enum Cmd {
     Peer {
         #[command(subcommand)]
         cmd: PeerCmd,
+    },
+    /// Name-addressed sessions for msg and Hermes: list, read, prompt, wait, restart, restore.
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
     },
     /// Short role-name mailbox workflow, bound to the launcher PCTL_* context.
     Msg {
@@ -336,6 +343,57 @@ enum MessageCmd {
     },
 }
 #[derive(Subcommand)]
+enum SessionCmd {
+    /// Every registered session with process, screen status and conversation ID.
+    List,
+    Get {
+        name: String,
+    },
+    /// Register in the cwd's project, opt in to terminal input and mailbox, and start.
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        cwd: PathBuf,
+        /// Project name; default is the cwd's folder name.
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
+    /// Paste text and press Enter. Refused while the session waits for a human decision.
+    Prompt {
+        name: String,
+        text: String,
+    },
+    /// Wait until the status is one of --until (default: anything but working).
+    Wait {
+        name: String,
+        #[arg(long)]
+        until: Vec<String>,
+        #[arg(long, default_value_t = 1_800_000)]
+        timeout_ms: u64,
+    },
+    /// Print the last lines of the session's screen.
+    Read {
+        name: String,
+        #[arg(long, default_value_t = 40)]
+        lines: usize,
+    },
+    /// Restart in the same conversation. Refused when blocked; when working unless --force.
+    Restart {
+        name: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Start again, in the same conversation, every session whose pane was lost (reboot).
+    Restore,
+    /// Name of the caller's own session (from PCTL_AGENT_ID).
+    Whoami,
+    /// SessionStart hook: read the hook JSON on stdin and record the conversation ID.
+    Hook,
+}
+#[derive(Subcommand)]
 enum MsgCmd {
     /// List exact same-project role names. Does not grant permission to send.
     Peers,
@@ -468,7 +526,10 @@ fn remote(argv: &[String]) -> Option<i32> {
     let i = argv.iter().position(|a| a == "--host")?;
     let host = argv.get(i + 1).filter(|h| !h.starts_with('-'));
     let Some(host) = host else {
-        eprintln!("{}", json!({"schema_version":1,"ok":false,"error":"--host needs an ssh target","error_code":"operation_failed"}));
+        eprintln!(
+            "{}",
+            json!({"schema_version":1,"ok":false,"error":"--host needs an ssh target","error_code":"operation_failed"})
+        );
         return Some(2);
     };
     let bin = std::env::var("PCTL_REMOTE_BIN").unwrap_or_else(|_| "pctl".into());
@@ -484,7 +545,10 @@ fn remote(argv: &[String]) -> Option<i32> {
     Some(match status {
         Ok(s) => s.code().unwrap_or(2),
         Err(e) => {
-            eprintln!("{}", json!({"schema_version":1,"ok":false,"error":format!("ssh: {e}"),"error_code":"operation_failed"}));
+            eprintln!(
+                "{}",
+                json!({"schema_version":1,"ok":false,"error":format!("ssh: {e}"),"error_code":"operation_failed"})
+            );
             2
         }
     })
@@ -515,14 +579,27 @@ fn run() -> Result<()> {
             Cmd::Team { cmd } => pctl::orchestration::requires_context(cmd),
             _ => false,
         };
+    let state = args.state.clone().unwrap_or_else(|| {
+        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state/pctl")
+    });
+    let tmux = args.tmux.clone().unwrap_or_else(|| {
+        let brew = PathBuf::from("/opt/homebrew/bin/tmux");
+        let on_path = std::env::var_os("PATH")
+            .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("tmux").is_file()));
+        if !on_path && brew.is_file() {
+            brew
+        } else {
+            PathBuf::from("tmux")
+        }
+    });
     let core = if bound {
         anyhow::ensure!(
             args.theme.is_none(),
             "unsupported: --theme is not permitted on context-bound workflow commands; use the explicit operator theme command"
         );
-        pctl::collaboration::workflow::open_bound_core(args.state, args.tmux)?
+        pctl::collaboration::workflow::open_bound_core(state, tmux)?
     } else {
-        Core::new(args.state, args.tmux)?
+        Core::new(state, tmux)?
     };
     if let Some(theme) = args.theme {
         core.set_theme(theme)?;
@@ -686,6 +763,38 @@ fn run() -> Result<()> {
                 agent,
                 expected_run,
             } => print(&core.peers(&agent, &expected_run)?)?,
+        },
+        Cmd::Session { cmd } => match cmd {
+            SessionCmd::List => print(&core.session_list()?)?,
+            SessionCmd::Get { name } => print(&core.session_get(&name)?)?,
+            SessionCmd::Add {
+                name,
+                cwd,
+                project,
+                argv,
+            } => print(&core.session_add(&name, &cwd, project.as_deref(), argv)?)?,
+            SessionCmd::Prompt { name, text } => print(&core.session_prompt(&name, &text)?)?,
+            SessionCmd::Wait {
+                name,
+                until,
+                timeout_ms,
+            } => print(&core.session_wait(
+                &name,
+                &until,
+                std::time::Duration::from_millis(timeout_ms),
+            )?)?,
+            SessionCmd::Read { name, lines } => println!("{}", core.session_read(&name, lines)?),
+            SessionCmd::Restart { name, force } => print(&core.session_restart(&name, force)?)?,
+            SessionCmd::Restore => print(&core.session_restore()?)?,
+            SessionCmd::Whoami => print(&core.session_whoami()?)?,
+            SessionCmd::Hook => {
+                let mut input = String::new();
+                std::io::Read::read_to_string(
+                    &mut std::io::Read::take(std::io::stdin(), 1 << 20),
+                    &mut input,
+                )?;
+                print(&core.session_hook(&input)?)?
+            }
         },
         Cmd::Msg { cmd } => {
             let caller = core.msg_caller()?;

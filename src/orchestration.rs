@@ -851,6 +851,7 @@ mod tests {
             adapter: "generic".into(),
             input_mode: "native".into(),
             collaboration_mode: "disabled".into(),
+            conversation: None,
         };
         let mut child = actor.clone();
         child.id = "worker".into();
@@ -997,6 +998,7 @@ mod tests {
             adapter: "generic".into(),
             input_mode: "native".into(),
             collaboration_mode: "disabled".into(),
+            conversation: None,
         };
         let g = Grant {
             id: "g".into(),

@@ -12,6 +12,7 @@ use std::{
 use uuid::Uuid;
 pub mod collaboration;
 pub mod orchestration;
+pub mod session;
 pub mod sidebar;
 pub mod terminal_input;
 pub mod theme;
@@ -53,6 +54,9 @@ pub struct Agent {
     pub input_mode: String,
     #[serde(default = "collaboration::disabled_collaboration")]
     pub collaboration_mode: String,
+    /// Harness conversation ID (Claude session, Codex thread); starts resume it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Run {
@@ -235,6 +239,15 @@ impl Core {
             .arg("-f")
             .arg("/dev/null");
         c.env_remove("TMUX");
+        // A server started from a Herdr pane would copy that pane's identity into every PCTL
+        // pane (msg sender, Herdr hooks). Permissions follow process lineage, not environment.
+        for (k, _) in std::env::vars_os() {
+            if k.to_str()
+                .is_some_and(|k| k.starts_with("HERDR_") || k == "CODEX_THREAD_ID")
+            {
+                c.env_remove(k);
+            }
+        }
         c
     }
     /// File-backed subprocess I/O avoids pipe deadlocks even if an unexpected
@@ -281,7 +294,9 @@ impl Core {
             let status = match rx.recv_timeout(Duration::from_secs(3)) {
                 Ok(status) => status?,
                 Err(_) => {
-                    let _ = Command::new("/bin/kill").args(["-9", &pid.to_string()]).status();
+                    let _ = Command::new("/bin/kill")
+                        .args(["-9", &pid.to_string()])
+                        .status();
                     bail!(
                         "tmux command timeout; outcome_unknown for mutations; inspect before retrying"
                     );
@@ -402,6 +417,7 @@ impl Core {
             adapter: adapter.into(),
             input_mode: native_input(),
             collaboration_mode: collaboration::disabled_collaboration(),
+            conversation: None,
         };
         r.agents.push(a.clone());
         self.save(&r)?;
@@ -608,7 +624,7 @@ impl Core {
             shell_quote(&self.tmux.to_string_lossy()),
             shell_quote(&a.project_id),
             shell_quote(&a.id),
-            a.argv
+            session::launch_argv(r, agent)?
                 .iter()
                 .map(|s| shell_quote(s))
                 .collect::<Vec<_>>()
@@ -1077,7 +1093,14 @@ impl Core {
         let _lock = self.lock()?;
         let r = self.registry()?;
         ensure_terminal_input(&r, agent)?;
-        self.deliver_text(&r, agent, expected, text.as_bytes(), "terminal_paste")
+        self.deliver_text(
+            &r,
+            agent,
+            expected,
+            text.as_bytes(),
+            "terminal_paste",
+            false,
+        )
     }
     /// Wake a recipient with one notice line and Enter. Only for terminal-line opt-in agents.
     pub(crate) fn wake(&self, agent: &str, run: &str, text: &str) -> Result<&'static str> {
@@ -1118,6 +1141,7 @@ impl Core {
         expected: &str,
         text: &[u8],
         action: &str,
+        bracketed: bool,
     ) -> Result<()> {
         let p = self.guard(r, agent, expected, true)?;
         ensure!(!p.in_mode, "pane is in copy/other mode");
@@ -1137,7 +1161,11 @@ impl Core {
                 bail!("target changed while staging; nothing sent")
             }
         };
-        match self.tm(&["paste-buffer", "-d", "-b", &name, "-t", &latest.pane]) {
+        let mut paste = vec!["paste-buffer", "-d", "-b", &name, "-t", &latest.pane];
+        if bracketed {
+            paste.push("-p");
+        }
+        match self.tm(&paste) {
             Ok(_) => self
                 .audit(action, expected, "input_delivered; acceptance unverified")
                 .context("input_delivered but audit failed; do not retry"),
@@ -1171,6 +1199,7 @@ impl Core {
             expected,
             format!("{text}\n").as_bytes(),
             "synthetic_input",
+            false,
         )
     }
     pub fn clients(&self) -> Result<Vec<String>> {
@@ -1443,7 +1472,10 @@ fn process_start(pid: &str) -> Result<String> {
         .env("LC_ALL", "C")
         .output()?;
     let s = String::from_utf8(out.stdout)?.trim().to_string();
-    ensure!(out.status.success() && !s.is_empty(), "missing process starttime");
+    ensure!(
+        out.status.success() && !s.is_empty(),
+        "missing process starttime"
+    );
     Ok(s)
 }
 #[cfg(not(target_os = "macos"))]
