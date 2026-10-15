@@ -401,6 +401,12 @@ enum SessionCmd {
     },
     /// Name of the caller's own session (from PCTL_AGENT_ID).
     Whoami,
+    /// Start a stopped session in its saved conversation. Unknown conversation needs --new.
+    Start {
+        name: String,
+        #[arg(long)]
+        new: bool,
+    },
     /// Unregister a session that has no run (refused while it has one).
     Remove {
         name: String,
@@ -811,6 +817,7 @@ fn run() -> Result<()> {
             }
             SessionCmd::Restore { new } => print(&core.session_restore(new)?)?,
             SessionCmd::Whoami => print(&core.session_whoami()?)?,
+            SessionCmd::Start { name, new } => print(&core.session_start(&name, new)?)?,
             SessionCmd::Remove { name } => print(&core.session_remove(&name)?)?,
             SessionCmd::Hook => {
                 // Silent and always successful: Claude adds SessionStart hook output to the

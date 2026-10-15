@@ -106,6 +106,16 @@ try:
         assert cli('session', 'get', 'c-moved')['conversation'] == 'herdr-convo-1'
         assert 'needs a claude or codex' in cli('session', 'add', '--name', 'p-moved', '--cwd', cwd('p-moved'), '--conversation', 'x', '--', bindir / 'plain', ok=False)
     case('add --conversation starts a moved session in its existing conversation', moved)
+    def start_stopped():
+        assert 'has_run' in cli('session', 'start', 'c-moved', ok=False)
+        s = cli('session', 'get', 'c-moved')
+        cli('agent', 'terminate', '--agent', s['agent_id'], '--expected-run', s['run_id'])
+        assert cli('session', 'get', 'c-moved')['process'] == 'stopped'
+        v = cli('session', 'start', 'c-moved')
+        assert v['process'] == 'running' and v['conversation'] == 'herdr-convo-1', v
+        log = cwd('c-moved') / 'argv.log'
+        assert until(lambda: log.read_text().splitlines()[-1] == 'claude --resume herdr-convo-1')
+    case('start runs a stopped session in its saved conversation', start_stopped)
     def remove():
         assert 'has_run' in cli('session', 'remove', 'c-moved', ok=False)
         s = cli('session', 'get', 'c-moved')

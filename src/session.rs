@@ -435,6 +435,20 @@ impl Core {
         self.session_get(name)
     }
     /// Restart in the same conversation. Refuses a session that is mid-turn unless forced.
+    /// Start a stopped registration in its saved conversation (after `agent edit`, a terminate,
+    /// or a skipped restore). Refused while it has a run, and when the conversation is unknown
+    /// unless `new`.
+    pub fn session_start(&self, name: &str, new: bool) -> Result<Value> {
+        let r = self.registry()?;
+        let a = self.by_name(&r, name)?.clone();
+        ensure!(
+            !r.runs.iter().any(|x| x.agent_id == a.id),
+            "has_run: {name} already has a run; use restart"
+        );
+        self.fresh_or_known(&a, new)?;
+        self.start(&a.id)?;
+        self.session_get(name)
+    }
     pub fn session_restart(&self, name: &str, force: bool, new: bool) -> Result<Value> {
         let v = self.session_get(name)?;
         let s = v["status"].as_str().unwrap_or("");
