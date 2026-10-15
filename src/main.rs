@@ -401,6 +401,10 @@ enum SessionCmd {
     },
     /// Name of the caller's own session (from PCTL_AGENT_ID).
     Whoami,
+    /// Unregister a session that has no run (refused while it has one).
+    Remove {
+        name: String,
+    },
     /// SessionStart hook: read the hook JSON on stdin and record the conversation ID.
     Hook,
 }
@@ -807,6 +811,7 @@ fn run() -> Result<()> {
             }
             SessionCmd::Restore { new } => print(&core.session_restore(new)?)?,
             SessionCmd::Whoami => print(&core.session_whoami()?)?,
+            SessionCmd::Remove { name } => print(&core.session_remove(&name)?)?,
             SessionCmd::Hook => {
                 // Silent and always successful: Claude adds SessionStart hook output to the
                 // conversation, and a hook failure must never disturb the harness.

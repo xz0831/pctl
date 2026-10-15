@@ -106,6 +106,14 @@ try:
         assert cli('session', 'get', 'c-moved')['conversation'] == 'herdr-convo-1'
         assert 'needs a claude or codex' in cli('session', 'add', '--name', 'p-moved', '--cwd', cwd('p-moved'), '--conversation', 'x', '--', bindir / 'plain', ok=False)
     case('add --conversation starts a moved session in its existing conversation', moved)
+    def remove():
+        assert 'has_run' in cli('session', 'remove', 'c-moved', ok=False)
+        s = cli('session', 'get', 'c-moved')
+        cli('agent', 'terminate', '--agent', s['agent_id'], '--expected-run', s['run_id'])
+        assert cli('session', 'remove', 'c-moved')['removed'] == 'c-moved'
+        assert 'c-moved' not in [x['name'] for x in cli('session', 'list')]
+        assert 'not_found' in cli('session', 'remove', 'c-moved', ok=False)
+    case('remove unregisters only a session without a run', remove)
     def codex_hook():
         assert cli('session', 'get', 'x-work')['conversation'] is None, 'no rollout: unknown, no guess'
         s = cli('session', 'get', 'x-work')

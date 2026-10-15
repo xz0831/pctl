@@ -564,6 +564,21 @@ impl Core {
         }
         Ok(json!({"recorded": true, "conversation": id}))
     }
+    /// Unregister a session that has no run (test names, retired workers), so it stops being
+    /// a msg address. A session with a run, even an exited or lost one, is refused.
+    pub fn session_remove(&self, name: &str) -> Result<Value> {
+        let _lock = self.lock()?;
+        let mut r = self.registry()?;
+        let id = self.by_name(&r, name)?.id.clone();
+        ensure!(
+            !r.runs.iter().any(|x| x.agent_id == id),
+            "has_run: {name} still has a run; terminate it first"
+        );
+        r.agents.retain(|a| a.id != id);
+        self.save(&r)?;
+        self.audit("remove", "-", &format!("unregistered {name}"))?;
+        Ok(json!({"removed": name, "agent_id": id}))
+    }
     /// The session name of the caller's own run (PCTL_AGENT_ID + PCTL_RUN_ID).
     pub fn session_whoami(&self) -> Result<Value> {
         let agent = std::env::var("PCTL_AGENT_ID").context("not inside a PCTL session")?;
