@@ -125,21 +125,42 @@ try:
         (day / 'rollout-2.jsonl').write_text(meta3('twin-a')); (day / 'rollout-3.jsonl').write_text(meta3('twin-b'))
         assert cli('session', 'get', 'x-three')['conversation'] is None, 'two candidates: unknown'
     case('codex fallback: one rollout candidate is taken, two are left unknown', codex_fallback)
+    def unknown_conversation():
+        log3 = cwd('x-three') / 'argv.log'; assert until(log3.exists)
+        assert 'conversation_unknown' in cli('session', 'restart', 'x-three', ok=False)
+        assert len((cwd('x-three') / 'argv.log').read_text().splitlines()) == 1, 'not restarted'
+    case('restart refuses a session whose conversation ID is unknown', unknown_conversation)
+    def gate():
+        outside = {k: v for k, v in ENV.items() if not k.startswith('HERDR_')}
+        other = root / 's2'
+        q = subprocess.run([B, '--state', str(other), '--tmux', T, 'session', 'add', '--name', 'g', '--cwd', str(cwd('g')), '--', str(bindir / 'plain')], text=True, capture_output=True, timeout=30, env=outside)
+        assert q.returncode != 0 and json.loads(q.stderr)['error_code'] == 'server_start_outside_herdr', q.stderr
+        assert subprocess.run([T, '-S', str(other / 'tmux.sock'), 'ls'], capture_output=True).returncode != 0, 'no server created'
+        subprocess.run([T, '-S', str(state / 'tmux.sock'), 'kill-server'], capture_output=True)
+        err = json.loads(cli('session', 'restore', ok=False, env=outside))
+        assert err['error_code'] == 'server_start_outside_herdr', err
+        assert subprocess.run([T, '-S', str(state / 'tmux.sock'), 'ls'], capture_output=True).returncode != 0, 'no server created'
+        assert all(s['process'] == 'lost' for s in cli('session', 'list', env=outside)), 'refused restore keeps every run'
+    case('outside Herdr (no HERDR_ENV) no server is created: add and restore are refused', gate)
     def restore():
         before = {s['name']: s['conversation'] for s in cli('session', 'list')}
-        assert 'nothing' not in json.dumps(cli('session', 'restore')) and cli('session', 'restore')['restored'] == [], 'live runs are left alone'
-        subprocess.run([T, '-S', str(state / 'tmux.sock'), 'kill-server'], capture_output=True)
-        assert all(s['process'] == 'lost' for s in cli('session', 'list'))
-        out = cli('session', 'restore')['restored']
-        assert sorted(o['name'] for o in out) == sorted(before) and all(o['error'] is None for o in out), out
-        after = cli('session', 'list')
-        assert all(s['process'] == 'running' for s in after), after
-        assert {s['name']: s['conversation'] for s in after} == before
+        out = {o['name']: o for o in cli('session', 'restore')['restored']}
+        assert sorted(out) == sorted(before), out
+        assert 'conversation_unknown' in out['x-three']['error'], out['x-three']
+        assert all(o['error'] is None for n, o in out.items() if n != 'x-three'), out
+        after = {s['name']: s for s in cli('session', 'list')}
+        assert after['x-three']['process'] == 'lost', 'skipped session stays visible as lost'
+        assert all(s['process'] == 'running' for n, s in after.items() if n != 'x-three'), after
+        assert {n: s['conversation'] for n, s in after.items()} == before
         log = cwd('c-main') / 'argv.log'
         assert until(lambda: log.read_text().splitlines()[-1] == f"claude --resume {before['c-main']}")
         assert until(lambda: (cwd('x-work') / 'argv.log').read_text().splitlines()[-1] == 'codex resume 01a1-thread')
+        assert 'conversation_unknown' in cli('session', 'restore')['restored'][0]['error'], 'live runs are left alone'
+        fresh = cli('session', 'restore', '--new')['restored']
+        assert [o['name'] for o in fresh] == ['x-three'] and fresh[0]['error'] is None, fresh
+        assert cli('session', 'get', 'x-three')['process'] == 'running'
         assert cli('session', 'restore')['restored'] == []
-    case('restore restarts lost sessions in the same conversation, non-interactively', restore)
+    case('restore resumes lost sessions, skips unknown conversations unless --new', restore)
     pathlib.Path(a.report).write_text(json.dumps({'results': results, 'passed': len(results)}, indent=1))
 finally:
     subprocess.run([T, '-S', str(state / 'tmux.sock'), 'kill-server'], capture_output=True)

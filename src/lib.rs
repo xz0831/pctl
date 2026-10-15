@@ -518,6 +518,12 @@ impl Core {
                 r.runs.is_empty(),
                 "server disconnected with existing runs; controls locked"
             );
+            // macOS permissions follow the process lineage that starts the server: only a
+            // Herdr pane carries them. A launchd/ssh/front-door caller must not create one.
+            ensure!(
+                std::env::var("HERDR_ENV").as_deref() == Ok("1"),
+                "server_start_outside_herdr: no PCTL server is running and this caller is not in a Herdr pane; start it from Herdr (pctl-server-herdr)"
+            );
         }
         // display-message -t is a pane target: a missing session can return an empty
         // format successfully. Enumerate sessions and match the generated name exactly.
@@ -1336,6 +1342,8 @@ pub fn error_code(message: &str) -> &'static str {
         "launch_limit",
         "orchestration_capacity",
         "operator_only",
+        "server_start_outside_herdr",
+        "conversation_unknown",
     ] {
         if message.contains(code) {
             return code;

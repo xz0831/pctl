@@ -55,6 +55,22 @@ pub(crate) fn launch_argv(r: &mut Registry, agent: &str) -> Result<Vec<String>> 
     }
     Ok(argv)
 }
+/// Whether starting this profile again would land in a fresh conversation by accident: a
+/// Claude/Codex profile whose conversation PCTL does not know and that does not pick one itself.
+fn conversation_unknown(a: &Agent) -> bool {
+    let picks = a.argv.iter().any(|x| {
+        [
+            "-r",
+            "--resume",
+            "-c",
+            "--continue",
+            "--session-id",
+            "resume",
+        ]
+        .contains(&x.as_str())
+    });
+    !harness(&a.argv).is_empty() && a.conversation.is_none() && !picks
+}
 /// Fallback until the SessionStart hook reports: the rollout Codex created for this run (same
 /// cwd, created after the run started, not owned by another profile). Only an unambiguous
 /// single candidate counts; otherwise the conversation stays unknown.
@@ -397,7 +413,7 @@ impl Core {
         self.session_get(name)
     }
     /// Restart in the same conversation. Refuses a session that is mid-turn unless forced.
-    pub fn session_restart(&self, name: &str, force: bool) -> Result<Value> {
+    pub fn session_restart(&self, name: &str, force: bool, new: bool) -> Result<Value> {
         let v = self.session_get(name)?;
         let s = v["status"].as_str().unwrap_or("");
         ensure!(
@@ -409,28 +425,49 @@ impl Core {
             "busy: {name} is working; wait or pass --force"
         );
         let (a, run) = self.current(name)?;
+        self.fresh_or_known(&a, new)?;
         self.restart(&a.id, &run.id)?;
         self.session_get(name)
+    }
+    /// Refuse an accidental fresh conversation (conversation_unknown); `new` asks for one
+    /// explicitly and forgets the old ID so Claude gets a new fixed session ID.
+    fn fresh_or_known(&self, a: &Agent, new: bool) -> Result<()> {
+        if new {
+            let _lock = self.lock()?;
+            let mut r = self.registry()?;
+            if let Some(x) = r.agents.iter_mut().find(|x| x.id == a.id) {
+                x.conversation = None;
+            }
+            return self.save(&r);
+        }
+        ensure!(
+            !conversation_unknown(a),
+            "conversation_unknown: {} has no known conversation ID; pass --new to start a fresh conversation",
+            a.name
+        );
+        Ok(())
     }
     /// Start again, in the same conversation, every profile whose run was lost with its pane
     /// (reboot, killed server). Live and exited runs are left alone. Non-interactive: the login
     /// carrier calls it from a Herdr pane, which also starts the server.
-    pub fn session_restore(&self) -> Result<Value> {
-        let lost: Vec<String> = {
+    pub fn session_restore(&self, new: bool) -> Result<Value> {
+        let lost: Vec<Run> = {
             let _lock = self.lock()?;
             let mut r = self.registry()?;
             let panes = match self.server() {
-                Err(_) => vec![],
+                Err(_) => {
+                    // Checked before touching the registry, so a refused restore loses nothing.
+                    ensure!(
+                        std::env::var("HERDR_ENV").as_deref() == Ok("1"),
+                        "server_start_outside_herdr: no PCTL server is running and this caller is not in a Herdr pane; start it from Herdr (pctl-server-herdr)"
+                    );
+                    vec![]
+                }
                 Ok(m) if m.is_empty() || m == r.server_instance => self.panes()?,
                 Ok(_) => bail!("server identity changed; restore refused"),
             };
             let alive = |x: &Run| panes.iter().any(|p| p.pane == x.pane && p.run == x.id);
-            let lost: Vec<String> = r
-                .runs
-                .iter()
-                .filter(|x| !alive(x))
-                .map(|x| x.agent_id.clone())
-                .collect();
+            let lost: Vec<Run> = r.runs.iter().filter(|x| !alive(x)).cloned().collect();
             if !lost.is_empty() {
                 r.runs.retain(|x| alive(x));
                 self.save(&r)?;
@@ -443,16 +480,33 @@ impl Core {
             lost
         };
         let mut out = vec![];
-        for agent in lost {
+        let mut skipped = vec![];
+        for run in lost {
             let r = self.registry()?;
-            let name = r
+            let a = r
                 .agents
                 .iter()
-                .find(|a| a.id == agent)
-                .map(|a| a.name.clone());
-            let result = self.start(&agent).map(|run| run.id);
-            out.push(json!({"name": name, "agent_id": agent,
+                .find(|a| a.id == run.agent_id)
+                .context("agent not found")?;
+            let result = self
+                .fresh_or_known(a, new)
+                .and_then(|_| self.start(&a.id))
+                .map(|run| run.id);
+            if let Err(e) = &result
+                && format!("{e:#}").contains("conversation_unknown")
+            {
+                skipped.push(run.clone());
+            }
+            out.push(json!({"name": a.name, "agent_id": a.id,
                 "run_id": result.as_ref().ok(), "error": result.as_ref().err().map(|e| format!("{e:#}"))}));
+        }
+        // Keep skipped sessions visible as lost, so a later `restore --new` (a human's choice)
+        // still finds them. Done after the starts: a server-less registry must have no runs.
+        if !skipped.is_empty() {
+            let _lock = self.lock()?;
+            let mut r = self.registry()?;
+            r.runs.extend(skipped);
+            self.save(&r)?;
         }
         Ok(json!({"restored": out}))
     }

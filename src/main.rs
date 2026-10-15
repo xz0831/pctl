@@ -380,14 +380,22 @@ enum SessionCmd {
         #[arg(long, default_value_t = 40)]
         lines: usize,
     },
-    /// Restart in the same conversation. Refused when blocked; when working unless --force.
+    /// Restart in the same conversation. Refused when blocked; when working unless --force;
+    /// when the conversation ID is unknown unless --new.
     Restart {
         name: String,
         #[arg(long)]
         force: bool,
+        /// Start a fresh conversation instead of resuming.
+        #[arg(long)]
+        new: bool,
     },
     /// Start again, in the same conversation, every session whose pane was lost (reboot).
-    Restore,
+    /// Sessions with an unknown conversation ID are skipped unless --new.
+    Restore {
+        #[arg(long)]
+        new: bool,
+    },
     /// Name of the caller's own session (from PCTL_AGENT_ID).
     Whoami,
     /// SessionStart hook: read the hook JSON on stdin and record the conversation ID.
@@ -784,8 +792,10 @@ fn run() -> Result<()> {
                 std::time::Duration::from_millis(timeout_ms),
             )?)?,
             SessionCmd::Read { name, lines } => println!("{}", core.session_read(&name, lines)?),
-            SessionCmd::Restart { name, force } => print(&core.session_restart(&name, force)?)?,
-            SessionCmd::Restore => print(&core.session_restore()?)?,
+            SessionCmd::Restart { name, force, new } => {
+                print(&core.session_restart(&name, force, new)?)?
+            }
+            SessionCmd::Restore { new } => print(&core.session_restore(new)?)?,
             SessionCmd::Whoami => print(&core.session_whoami()?)?,
             SessionCmd::Hook => {
                 // Silent and always successful: Claude adds SessionStart hook output to the
