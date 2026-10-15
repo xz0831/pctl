@@ -101,12 +101,13 @@ try:
     def codex_hook():
         assert cli('session', 'get', 'x-work')['conversation'] is None, 'no rollout: unknown, no guess'
         s = cli('session', 'get', 'x-work')
-        outside = cli('session', 'hook', stdin='{"session_id":"t-outside"}')
-        assert outside['recorded'] is False
+        # Silent always: Claude adds SessionStart hook output to the conversation.
+        assert cli('session', 'hook', stdin='{"session_id":"t-outside"}') == ''
+        assert cli('session', 'hook', stdin='not json') == ''
         env = dict(ENV, PCTL_AGENT_ID=s['agent_id'], PCTL_RUN_ID=s['run_id'])
-        assert cli('session', 'hook', env=env, stdin='{"hook_event_name":"SessionStart","session_id":"01a1-thread"}')['recorded']
+        assert cli('session', 'hook', env=env, stdin='{"hook_event_name":"SessionStart","session_id":"01a1-thread"}') == ''
         stale = dict(env, PCTL_RUN_ID='old')
-        assert cli('session', 'hook', env=stale, stdin='{"session_id":"other"}')['recorded'] is False
+        cli('session', 'hook', env=stale, stdin='{"session_id":"other"}')
         assert cli('session', 'get', 'x-work')['conversation'] == '01a1-thread'
         cli('session', 'restart', 'x-work')
         log = cwd('x-work') / 'argv.log'
@@ -115,6 +116,7 @@ try:
     def codex_fallback():
         cli('session', 'add', '--name', 'x-two', '--cwd', cwd('x-two'), '--', bindir / 'codex')
         day = home / '.codex/sessions/2026/10/15'; day.mkdir(parents=True, exist_ok=True)
+        os.utime(home / '.codex/sessions', (0, 0)); os.utime(home / '.codex/sessions/2026', (0, 0))  # old year folders, as on a real host
         meta = lambda i: json.dumps({'type': 'session_meta', 'payload': {'id': i, 'cwd': str(cwd('x-two'))}}) + '\n'
         (day / 'rollout-1.jsonl').write_text(meta('only-one'))
         assert cli('session', 'get', 'x-two')['conversation'] == 'only-one'

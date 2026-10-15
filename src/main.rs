@@ -788,12 +788,14 @@ fn run() -> Result<()> {
             SessionCmd::Restore => print(&core.session_restore()?)?,
             SessionCmd::Whoami => print(&core.session_whoami()?)?,
             SessionCmd::Hook => {
+                // Silent and always successful: Claude adds SessionStart hook output to the
+                // conversation, and a hook failure must never disturb the harness.
                 let mut input = String::new();
-                std::io::Read::read_to_string(
+                let _ = std::io::Read::read_to_string(
                     &mut std::io::Read::take(std::io::stdin(), 1 << 20),
                     &mut input,
-                )?;
-                print(&core.session_hook(&input)?)?
+                );
+                let _ = core.session_hook(&input);
             }
         },
         Cmd::Msg { cmd } => {

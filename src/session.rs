@@ -115,38 +115,83 @@ fn recent_files(root: &Path, since: u64, depth: usize) -> Vec<PathBuf> {
     let mut out = vec![];
     for e in entries.flatten() {
         let p = e.path();
-        if modified(&p) < since {
-            continue; // directory mtimes move forward when a file is added
-        }
+        // Only a file's own mtime counts: adding a day folder does not touch the year folder.
         if depth > 0 && p.is_dir() {
             out.extend(recent_files(&p, since, depth - 1));
-        } else if depth == 0 && p.extension().is_some_and(|x| x == "jsonl") {
+        } else if depth == 0 && p.extension().is_some_and(|x| x == "jsonl") && modified(&p) >= since
+        {
             out.push(p);
         }
     }
     out
 }
-/// Screen-derived activity, like Herdr's: the harness footer while a turn runs.
-fn activity(screen: &str) -> &'static str {
-    let tail: String = screen
+/// Drop ANSI CSI sequences (colors) from a captured line.
+fn plain(raw: &str) -> String {
+    let mut out = String::new();
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+/// Screen-derived activity, like Herdr's, from a colored capture (`capture-pane -e`).
+/// Working signs seen on real sessions (2026-10-15): Codex "• Working (6s • esc to interrupt)"
+/// and a braille spinner in the pane title; Claude Code 2.1 a spinner line ("✢ Vibing…") before
+/// text streams, and a dimmed input prompt "❯" for the whole turn (default color when idle).
+// shortcut: the dimmed-prompt cue is Claude Code's rendering, not an API; if a Claude update
+// breaks it, report state from UserPromptSubmit/Stop hooks the way `session hook` does.
+fn activity(raw: &str, title: &str) -> &'static str {
+    let rows: Vec<(&str, String)> = raw
         .lines()
+        .map(|l| (l, plain(l).trim().to_lowercase()))
+        .filter(|(_, l)| !l.is_empty())
+        .collect();
+    let tail = &rows[rows.len().saturating_sub(12)..];
+    let spinner_line =
+        |l: &str| l.starts_with(['✢', '✳', '✶', '✻', '✽', '*', '·']) && l.contains('…');
+    // The last prompt row: its color code is written right before the "❯".
+    let dim_prompt = tail
+        .iter()
         .rev()
-        .filter(|l| !l.trim().is_empty())
-        .take(12)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_lowercase();
-    if tail.contains("esc to interrupt") {
-        "working"
-    } else if [
-        "do you want to",
-        "would you like to",
-        "allow command",
-        "approve",
-    ]
-    .iter()
-    .any(|k| tail.contains(k))
+        .find(|(_, l)| l.starts_with('❯'))
+        .is_some_and(|(r, _)| {
+            r.split('❯').next().is_some_and(|before| {
+                before
+                    .rfind("\x1b[")
+                    .is_some_and(|i| !before[i..].starts_with("\x1b[39m"))
+            })
+        });
+    let spinner_title = title
+        .chars()
+        .next()
+        .is_some_and(|c| ('\u{2801}'..='\u{28ff}').contains(&c) || "◐◓◑◒".contains(c));
+    if spinner_title
+        || dim_prompt
+        || tail
+            .iter()
+            .any(|(_, l)| l.contains("esc to interrupt") || spinner_line(l))
     {
+        "working"
+    } else if tail.iter().any(|(_, l)| {
+        [
+            "do you want to",
+            "would you like to",
+            "allow command",
+            "approve",
+        ]
+        .iter()
+        .any(|k| l.contains(k))
+    }) {
         "blocked"
     } else {
         "idle"
@@ -181,8 +226,13 @@ impl Core {
             (Some(_), Some(p)) if p.dead => ("exited", "exited"),
             (Some(_), Some(p)) => (
                 "running",
-                self.tm(&["capture-pane", "-p", "-t", &p.pane])
-                    .map_or("unknown", |s| activity(&s)),
+                self.tm(&["capture-pane", "-p", "-e", "-t", &p.pane])
+                    .map_or("unknown", |s| {
+                        let title = self
+                            .tm(&["display-message", "-p", "-t", &p.pane, "#{pane_title}"])
+                            .unwrap_or_default();
+                        activity(&s, &title)
+                    }),
             ),
         };
         let project = r.projects.iter().find(|p| p.id == a.project_id);
@@ -305,7 +355,8 @@ impl Core {
             .context("lost: the run's pane is gone")?;
         let start = format!("-{}", lines.clamp(1, 2000));
         let text = self.tm(&["capture-pane", "-p", "-J", "-S", &start, "-t", &p.pane])?;
-        let trimmed: Vec<_> = text.trim_end().lines().collect();
+        // Harness UIs pad the screen with empty rows; they carry nothing.
+        let trimmed: Vec<_> = text.lines().filter(|l| !l.trim().is_empty()).collect();
         Ok(trimmed[trimmed.len().saturating_sub(lines)..].join("\n"))
     }
     /// Register (project by name, default the cwd's folder name), opt in to terminal input
@@ -458,15 +509,30 @@ mod tests {
     #[test]
     fn activity_reads_the_footer() {
         assert_eq!(
-            activity("> hi\n\n✻ Thinking… (3s · esc to interrupt)\n"),
+            activity("> hi\n\n✻ Thinking… (3s · esc to interrupt)\n", ""),
             "working"
         );
         assert_eq!(
-            activity("• Working (5s • Esc to interrupt)\n› \n"),
+            activity("• Working (5s • Esc to interrupt)\n› \n", ""),
             "working"
         );
-        assert_eq!(activity("Do you want to proceed?\n❯ 1. Yes\n"), "blocked");
-        assert_eq!(activity("> \n? for shortcuts\n"), "idle");
+        assert_eq!(
+            activity("⏺\n✢ Vibing…\n  ⎿  Tip: x\n❯ \n", "✳ t"),
+            "working"
+        );
+        assert_eq!(
+            activity("⏺ OK\n✻ Cogitated for 2s · done 11:53 PM\n❯ \n", "✳ t"),
+            "idle"
+        );
+        assert_eq!(activity("› Ask Codex\n", "⠧ Remember | codex"), "working");
+        assert_eq!(
+            activity("Do you want to proceed?\n❯ 1. Yes\n", ""),
+            "blocked"
+        );
+        assert_eq!(
+            activity("> \n? for shortcuts\n", "Remember | codex"),
+            "idle"
+        );
     }
     #[test]
     fn launch_argv_assigns_then_resumes() {
