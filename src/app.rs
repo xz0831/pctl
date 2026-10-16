@@ -38,11 +38,18 @@ use std::{
 };
 
 const KINDS: [&str; 5] = ["bash", "Claude Code", "Codex", "OpenCode", "Command"];
-const CAPTURE_EVERY: Duration = Duration::from_millis(120);
 /// A drag longer than this is refused: an OSC 52 sequence this size is more than a terminal reads.
 const MAX_COPY: usize = 100_000;
 /// At most one notification per agent in this long.
 const NOTICE_EVERY: Duration = Duration::from_secs(10);
+/// How often the screen is read: fast while it changes, slower the longer it stays the same.
+fn capture_every(quiet: u32) -> Duration {
+    Duration::from_millis(match quiet {
+        0..=4 => 40,
+        5..=19 => 120,
+        _ => 250,
+    })
+}
 /// What `while_run` prints when the run changed.
 const RUN_CHANGED: &str = "pctl-run-changed";
 /// Typed text waits for the end of a burst of events, but never grows past this many bytes.
@@ -140,6 +147,8 @@ struct View {
     next: Option<Instant>,
     /// The last capture as tmux printed it; an equal one needs no parsing and no redraw.
     raw: String,
+    /// Captures in a row that found the screen unchanged.
+    quiet: u32,
 }
 
 struct Update {
@@ -618,10 +627,16 @@ impl App {
         self.view.raw.clear();
         !std::mem::take(&mut self.view.rows).is_empty()
     }
+    /// Read the current agent's screen and schedule the next read. Whether the screen changed.
+    fn capture(&mut self, core: &Core) -> bool {
+        let changed = self.read_screen(core);
+        self.view.quiet = if changed { 0 } else { self.view.quiet + 1 };
+        self.view.next = Some(Instant::now() + capture_every(self.view.quiet));
+        changed
+    }
     /// Read the current agent's screen from tmux, resizing its window to the view first. Whether
     /// the screen changed.
-    fn capture(&mut self, core: &Core) -> bool {
-        self.view.next = Some(Instant::now() + CAPTURE_EVERY);
+    fn read_screen(&mut self, core: &Core) -> bool {
         let Some(a) = self.current().filter(|a| a.running()).cloned() else {
             self.view.pane.clear();
             return self.blank();
@@ -632,7 +647,6 @@ impl App {
         if self.view.pane != pane {
             self.view = View {
                 pane: pane.clone(),
-                next: self.view.next,
                 ..View::default()
             };
         }
@@ -734,6 +748,11 @@ impl App {
             }
         }
     }
+    /// Something was typed: the echo is on its way, so look at once and often.
+    fn read_soon(&mut self) {
+        self.view.next = Some(Instant::now());
+        self.view.quiet = 0;
+    }
     fn changed(&mut self, a: &Agent) {
         self.say(format!(
             "{} changed (restarted or moved); not typing until the list catches up",
@@ -788,7 +807,7 @@ impl App {
             Ok(false) => self.changed(&a),
             Err(e) => self.say(format!("Could not type into {}: {e:#}", a.name)),
         }
-        self.view.next = Some(Instant::now());
+        self.read_soon();
     }
     fn paste(&mut self, core: &Core, text: &str) {
         self.flush_typed(core);
@@ -821,7 +840,7 @@ impl App {
             Ok(false) => self.changed(&a),
             Err(e) => self.say(format!("Could not paste: {e:#}")),
         }
-        self.view.next = Some(Instant::now());
+        self.read_soon();
     }
 
     fn handle(&mut self, core: &Core, ev: Event) {
