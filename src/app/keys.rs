@@ -1,4 +1,4 @@
-//! Shortcuts. Defaults follow Herdr (prefix `ctrl+b`, then a key). Override them in
+//! Shortcuts. Defaults use a prefix (`ctrl+b`, then a key). Override them in
 //! `$XDG_CONFIG_HOME/pctl/config.toml` or `~/.config/pctl/config.toml`:
 //!
 //! ```toml
@@ -247,12 +247,7 @@ impl Keymap {
     }
     /// Read the config file if there is one. Problems become warnings, never a failed start.
     pub fn load() -> (Self, Vec<String>) {
-        let path = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-            .map(|d| d.join("pctl").join("config.toml"));
-        let Some(path) = path else {
+        let Some(path) = config_path() else {
             return (Self::defaults(), vec![]);
         };
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -286,8 +281,17 @@ impl Keymap {
     }
 }
 
+/// `$XDG_CONFIG_HOME/pctl/config.toml`, else `~/.config/pctl/config.toml`.
+pub(crate) fn config_path() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|d| d.join("pctl").join("config.toml"))
+}
+
 /// `name = "value"` pairs under `[name]`; comments and other sections are skipped.
-fn section(text: &str, name: &str) -> Vec<(String, String)> {
+pub(crate) fn section(text: &str, name: &str) -> Vec<(String, String)> {
     let mut in_keys = false;
     let mut out = Vec::new();
     for line in text.lines() {

@@ -1,4 +1,4 @@
-//! The human entry, Herdr-like: `pctl` alone opens the running workspace, projects are found by
+//! The human entry: `pctl` alone opens the running workspace, projects are found by
 //! name, and tabs carry agent names and states. They are tmux user options: `@pctl_name` (project,
 //! on the session), `@pctl_tab` and `@pctl_status` (agent, on its window; a distinct name because
 //! formats look up window options before session ones). Window and session names stay as they
@@ -81,7 +81,7 @@ impl Core {
         let r = self.registry()?;
         let marker = self.server().map_err(|_| {
             anyhow!(
-                "no PCTL server is running. Start it from a Herdr pane (pctl-server-herdr); on a host without Herdr use PCTL_STANDALONE=1 pctl attach --project <name>"
+                "no PCTL server is running. Start it with PCTL_STANDALONE=1 pctl attach --project <name> (or where [server] start_env in config.toml allows it)"
             )
         })?;
         ensure!(

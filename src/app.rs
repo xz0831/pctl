@@ -1,9 +1,9 @@
-//! The pctl app: what `pctl` alone opens on a terminal. Like Herdr: projects and their agents on
+//! The pctl app: what `pctl` alone opens on a terminal: projects and their agents on
 //! the left, the project's agents as tabs on top, the selected agent's live terminal in the
 //! middle, and the mouse for everything (click to open, `+` to add, right-click for actions).
 //! Shortcuts come from `keys` and can be changed in a config file. tmux stays behind the app and
 //! keeps the agents running; leaving the app stops nothing.
-mod keys;
+pub(crate) mod keys;
 mod quips;
 mod term;
 
@@ -1050,7 +1050,7 @@ impl App {
         self.poke();
     }
 
-    /// A new bash tab right away, like a new terminal tab in Herdr or Ghostty: named
+    /// A new bash tab right away, like a new tab in a terminal app: named
     /// `<project>-bash<n>`, in the project's folder.
     fn new_tab(&mut self, core: &Core, project: &str) {
         let root = self
@@ -1649,11 +1649,9 @@ impl App {
             if !self.connected {
                 lines.push(Line::from("No PCTL server is running yet."));
                 lines.push(Line::from(
-                    "Start it from a Herdr pane with pctl-server-herdr, or on a computer",
+                    "Start pctl with PCTL_STANDALONE=1 (or where [server] start_env allows it),",
                 ));
-                lines.push(Line::from(
-                    "without Herdr start pctl with PCTL_STANDALONE=1, then add a project.",
-                ));
+                lines.push(Line::from("then add a project."));
             }
             lines.push(Line::from(""));
             let y = center(f, lines);

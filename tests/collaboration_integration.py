@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Isolated real-tmux mailbox regression; never sends text to agent terminals."""
 import argparse, concurrent.futures, json, os, pathlib, subprocess, tempfile, time, uuid
-os.environ['HERDR_ENV'] = '1'  # Only disposable test servers bypass the Herdr startup gate.
+os.environ['PCTL_STANDALONE'] = '1'  # Only disposable test servers start themselves.
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--tmux',required=True);p.add_argument('--report',default='test-results/v03-collaboration-integration.json');args=p.parse_args()
 B=str(pathlib.Path(args.bin).resolve());T=str(pathlib.Path(args.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-msg-',dir=os.path.realpath('/tmp')));state=root/'s';results=[]
 def cli(*a,ok=True):

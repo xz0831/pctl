@@ -430,7 +430,7 @@ impl Core {
         ] {
             self.tm(&["set-option", "-g", key, &value])?;
         }
-        // Herdr-like keys: ^b s shows projects and agents by name, ^b q detaches.
+        // Workspace keys: ^b s shows projects and agents by name, ^b q detaches.
         let tree = format!(
             "#{{?window_format,{name} #{{@pctl_status}},#{{?session_format,#{{?#{{@pctl_name}},#{{@pctl_name}},#{{session_name}}}},#{{pane_current_command}}}}}}"
         );

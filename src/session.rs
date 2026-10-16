@@ -1,4 +1,4 @@
-//! Name-addressed session commands (the Herdr replacement surface):
+//! Name-addressed session commands:
 //! list/get/prompt/wait/read/whoami, harness conversation IDs kept across restarts,
 //! and restore after the tmux server is gone (reboot).
 use crate::{Agent, Core, Registry, Run, ensure_terminal_input, now};
@@ -160,7 +160,7 @@ fn plain(raw: &str) -> String {
     }
     out
 }
-/// Screen-derived activity, like Herdr's, from a colored capture (`capture-pane -e`).
+/// Screen-derived activity from a colored capture (`capture-pane -e`).
 /// Working signs seen on real sessions (2026-10-15): Codex "• Working (6s • esc to interrupt)"
 /// and a braille spinner in the pane title; Claude Code 2.1 a spinner line ("✢ Vibing…") before
 /// text streams, and a dimmed input prompt "❯" for the whole turn (default color when idle).
@@ -418,7 +418,7 @@ impl Core {
         worktree: Option<(&str, Option<&str>)>,
         model: Option<&str>,
     ) -> Result<Value> {
-        // Moving a Herdr session: start it already resuming its conversation.
+        // Moving a session from another tool: start it already resuming its conversation.
         if let Some(c) = conversation {
             ensure!(
                 !harness(&argv).is_empty(),
@@ -538,7 +538,7 @@ impl Core {
     }
     /// Start again, in the same conversation, every profile whose run was lost with its pane
     /// (reboot, killed server). Live and exited runs are left alone. Non-interactive: the login
-    /// carrier calls it from a Herdr pane, which also starts the server.
+    /// carrier calls it from a pane allowed to start the server, which it also does.
     pub fn session_restore(&self, new: bool) -> Result<Value> {
         let lost: Vec<Run> = {
             let _lock = self.lock()?;

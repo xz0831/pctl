@@ -15,8 +15,9 @@ echo "> "
 while IFS= read -r line; do echo "got: $line"; echo "> "; done
 '''
 (bindir / 'plain').write_text(FAKE); (bindir / 'plain').chmod(0o755)
-ENV = dict(os.environ, HERDR_ENV='1')
-OUTSIDE = {k: v for k, v in os.environ.items() if not k.startswith(('HERDR_', 'PCTL_STANDALONE'))}
+ENV = dict(os.environ, PCTL_STANDALONE='1')
+OUTSIDE = {k: v for k, v in os.environ.items() if not k.startswith('PCTL_STANDALONE')}
+OUTSIDE['XDG_CONFIG_HOME'] = '/nonexistent-pctl-config'  # no [server] start_env either
 def cli(*args, ok=True):
     q = subprocess.run([B, '--state', str(state), '--tmux', T, *map(str, args)], text=True, capture_output=True, timeout=30, env=ENV)
     assert (q.returncode == 0) == ok, (args, q.returncode, q.stderr, q.stdout)

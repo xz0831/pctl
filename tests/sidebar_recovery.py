@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Disposable sidebar intent fault tests; direct state mutation is test setup only."""
 import os,argparse,json,pathlib,shlex,subprocess,tempfile,time,uuid
-os.environ['HERDR_ENV'] = '1'  # Only disposable test servers bypass the Herdr startup gate.
+os.environ['PCTL_STANDALONE'] = '1'  # Only disposable test servers start themselves.
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--tmux',required=True);p.add_argument('--report',required=True);a=p.parse_args()
 B=str(pathlib.Path(a.bin).resolve());T=str(pathlib.Path(a.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-side-fault-',dir=os.path.realpath('/tmp')));state=root/'s';results=[]
 def cli(*args,ok=True,tmux=T):

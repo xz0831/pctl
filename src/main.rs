@@ -18,7 +18,7 @@ struct Args {
     /// Save a state-local appearance preset; existing UIs refresh automatically.
     #[arg(long, global = true)]
     theme: Option<pctl::theme::ThemeName>,
-    /// Without a command on an interactive terminal: open the pctl app (like herdr).
+    /// Without a command on an interactive terminal: open the pctl app.
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -395,7 +395,7 @@ enum SessionCmd {
         /// Project name; default is the cwd's folder name.
         #[arg(long)]
         project: Option<String>,
-        /// Resume this existing conversation (moving a Herdr session) instead of a new one.
+        /// Resume this existing conversation (moving a session from another tool) instead of a new one.
         #[arg(long)]
         conversation: Option<String>,
         /// Create this new branch in a new worktree beside the cwd's repo (<repo>-wt-<name>) and
@@ -654,7 +654,7 @@ fn run() -> Result<()> {
         }
     });
     let Some(cmd) = args.cmd.take() else {
-        // A person typed `pctl` alone: open the app, like `herdr`. Agents and scripts have no
+        // A person typed `pctl` alone: open the app. Agents and scripts have no
         // terminal and keep getting the usage error.
         use std::io::IsTerminal;
         if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {

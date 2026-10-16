@@ -13,10 +13,11 @@ root = pathlib.Path(tempfile.mkdtemp(prefix='pctl-app-', dir=os.path.realpath('/
 V = root / 'v.sock'; bindir = root / 'bin'; bindir.mkdir(); cfg = root / 'cfg'
 (bindir / 'plain').write_text('#!/bin/bash\nif [ "$(basename "$PWD")" = b-block ]; then echo "Do you want to proceed?"; echo "❯ 1. Yes"; fi\necho "ready in $(basename "$PWD")"\necho "> "\nwhile IFS= read -r line; do echo "got: $line"; echo "> "; done\n')
 (bindir / 'plain').chmod(0o755)
-ENV = {k: v for k, v in os.environ.items() if not k.startswith(('HERDR_', 'PCTL_', 'TMUX', 'XDG_CONFIG'))}
+ENV = {k: v for k, v in os.environ.items() if not k.startswith(('PCTL_', 'TMUX', 'XDG_CONFIG'))}
+ENV['XDG_CONFIG_HOME'] = str(root / 'no-config')  # the person's own config.toml stays out
 ENV.update(TERM='xterm-256color', SHELL='/bin/bash', PS1='$ ')
 def cli(*args, ok=True, st=None):
-    q = subprocess.run([B, '--state', str(st or state), '--tmux', T, *map(str, args)], text=True, capture_output=True, timeout=30, env=dict(ENV, HERDR_ENV='1'))
+    q = subprocess.run([B, '--state', str(st or state), '--tmux', T, *map(str, args)], text=True, capture_output=True, timeout=30, env=dict(ENV, PCTL_STANDALONE='1'))
     assert (q.returncode == 0) == ok, (args, q.returncode, q.stderr, q.stdout)
     return (json.loads(q.stdout) if q.stdout.strip().startswith(('{', '[')) else q.stdout) if ok else q.stderr
 def vt(*args):
@@ -35,7 +36,7 @@ def status(): return lines()[25]
 def app(st=None, env=None, ready=True):
     vt('kill-server')
     envs = ' '.join(f'{k}={v}' for k, v in (env or {}).items())
-    cmd = f"env -u TMUX -u HERDR_ENV {envs} {B} --state {st or state} --tmux {T}; echo EXITED $?; sleep 600"
+    cmd = f"env -u TMUX {envs} {B} --state {st or state} --tmux {T}; echo EXITED $?; sleep 600"
     subprocess.run([T, '-S', str(V), '-f', '/dev/null', 'new-session', '-d', '-x', '110', '-y', '26', '-s', 'view', cmd], env=ENV, check=True, timeout=10)
     if ready: assert until(lambda: '+ agent' in screen() or 'Welcome to pctl' in screen()), screen()
 def st(*args): return subprocess.run([T, '-S', str(state / 'tmux.sock'), *map(str, args)], text=True, capture_output=True, timeout=10).stdout.strip()
@@ -203,7 +204,7 @@ try:
         try:
             assert until(lambda: size('session_attached') == 1), 'the client attached'
             st('select-window', '-t', pane)
-            assert until(lambda: size('window_width') == 100 and size('pane_height') > 30), 'the client took the window'
+            assert until(lambda: size('window_width') == 100 and size('pane_height') > 30, 20), 'the client took the window'
             text('echo BOTTOM-MARK'); keys('Enter')
             assert until(lambda: 'BOTTOM-MARK' in screen()), 'a taller pane shows its bottom rows (input line in sight)'
             click(*side('a-main')); click(*side('a-shell'))  # opening it again asks for the app's size
@@ -279,7 +280,7 @@ try:
         click(*find('Add project'))
         assert until(lambda: 'New agent in gamma' in screen() and str(folder) in screen()), screen()
         text('g-shell'); click(*find('Start agent'))
-        assert until(lambda: 'server_start_outside_herdr' in screen()), screen()
+        assert until(lambda: 'server_start_not_allowed' in screen()), screen()
         assert subprocess.run([T, '-S', str(other / 'tmux.sock'), 'ls'], capture_output=True).returncode != 0, 'refused: no server'
         app(st=other, env={'PCTL_STANDALONE': '1'})
         assert until(lambda: '▾ gamma' in screen()), screen()
@@ -288,7 +289,7 @@ try:
         assert until(lambda: '● g-shell' in screen() and 'New agent' not in screen(), 15), screen()
         assert cli('session', 'get', 'g-shell', st=other)['status'] in ('idle', 'unknown')
         subprocess.run([T, '-S', str(other / 'tmux.sock'), 'kill-server'], capture_output=True)
-    case('first run: + Project, then the first agent; without Herdr the form says why, and PCTL_STANDALONE=1 starts it', first_run)
+    case('first run: + Project, then the first agent; without leave to start a server the form says why, and PCTL_STANDALONE=1 starts it', first_run)
     pathlib.Path(a.report).write_text(json.dumps({'results': results, 'passed': len(results)}, indent=1))
 finally:
     vt('kill-server')
