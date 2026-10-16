@@ -309,6 +309,23 @@ This convenience addresses an observed small-model error in the frozen0.3 test. 
 - The page never switches sessions by itself. The log line per request is time, method, path and status only.
 - HTTP is plain: use it over Tailscale (WireGuard) or loopback only.
 
+## Human entry (`pctl` alone)
+
+`pctl` with no command, on an interactive terminal:
+- It attaches to the running PCTL server at the most recently attached project session (tmux `session_last_attached`, then activity), in that session's current window.
+- It never starts a server. Without one it exits 1 with how to start it.
+- Inside a pane of the same PCTL server, it switches the client. Inside any other tmux (`TMUX` set to another socket), it exits 1 instead of nesting.
+- Without a terminal on stdin and stdout, it is the usual missing-command usage error (exit 2).
+
+`pctl attach --project <name|id>` takes a project name or ID and opens that project's manager window.
+
+Display:
+- Agent windows carry `@pctl_tab` (the session name) and `@pctl_status`. Project sessions carry `@pctl_name`.
+- Window and session names are not changed, so no identity check changes.
+- The status line shows the project name and tabs `#I:<mark><name>`. Marks: `!` blocked, `*` working, `x` exited.
+- The status line reruns `pctl session marks` every 5 seconds, and only while a client is attached. That hidden command writes the window options and prints the totals across all projects.
+- Keys: `^b s` is `choose-tree` with names and states, `^b q` detaches, `^b m` opens the manager. Mouse stays on.
+
 ## Worktree workers
 
 `pctl session add --name <name> --cwd <repo> --worktree <branch> [--base <ref>] [--model <provider/model>] -- <argv>` gives a worker its own branch and checkout.

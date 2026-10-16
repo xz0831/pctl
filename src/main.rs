@@ -18,8 +18,9 @@ struct Args {
     /// Save a state-local appearance preset; existing UIs refresh automatically.
     #[arg(long, global = true)]
     theme: Option<pctl::theme::ThemeName>,
+    /// Without a command on an interactive terminal: open the running workspace (like herdr).
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 #[derive(Subcommand)]
 enum Cmd {
@@ -88,6 +89,7 @@ enum Cmd {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Attach to a project's tmux session at its manager window. Project name or ID.
     Attach {
         #[arg(long)]
         project: String,
@@ -435,6 +437,9 @@ enum SessionCmd {
     },
     /// Name of the caller's own session (from PCTL_AGENT_ID).
     Whoami,
+    /// Status-line job: write agent names and states onto tmux tabs; print the totals.
+    #[command(hide = true)]
+    Marks,
     /// Start a stopped session in its saved conversation. Unknown conversation needs --new.
     Start {
         name: String,
@@ -622,18 +627,7 @@ fn main() {
     }
 }
 fn run() -> Result<()> {
-    let args = Args::parse();
-    if let Cmd::Worker { label, tick_ms } = &args.cmd {
-        return pctl::worker(label, *tick_ms);
-    }
-    if let Cmd::Team { cmd } = &args.cmd {
-        pctl::orchestration::preflight(cmd)?;
-    }
-    let bound = matches!(&args.cmd, Cmd::Msg { .. })
-        || match &args.cmd {
-            Cmd::Team { cmd } => pctl::orchestration::requires_context(cmd),
-            _ => false,
-        };
+    let mut args = Args::parse();
     let state = args.state.clone().unwrap_or_else(|| {
         PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state/pctl")
     });
@@ -647,6 +641,39 @@ fn run() -> Result<()> {
             PathBuf::from("tmux")
         }
     });
+    let Some(cmd) = args.cmd.take() else {
+        // A person typed `pctl` alone: open the running workspace, like `herdr`. Agents and
+        // scripts have no terminal and keep getting the usage error.
+        use std::io::IsTerminal;
+        if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+            <Args as clap::CommandFactory>::command()
+                .error(
+                    clap::error::ErrorKind::MissingSubcommand,
+                    "a command is required; `pctl` alone opens the workspace only on an interactive terminal",
+                )
+                .exit();
+        }
+        let core = Core::new(state, tmux)?;
+        if let Some(theme) = args.theme {
+            core.set_theme(theme)?;
+        }
+        if let Err(e) = core.open_default() {
+            eprintln!("pctl: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    };
+    if let Cmd::Worker { label, tick_ms } = &cmd {
+        return pctl::worker(label, *tick_ms);
+    }
+    if let Cmd::Team { cmd } = &cmd {
+        pctl::orchestration::preflight(cmd)?;
+    }
+    let bound = matches!(&cmd, Cmd::Msg { .. })
+        || match &cmd {
+            Cmd::Team { cmd } => pctl::orchestration::requires_context(cmd),
+            _ => false,
+        };
     let core = if bound {
         anyhow::ensure!(
             args.theme.is_none(),
@@ -659,7 +686,7 @@ fn run() -> Result<()> {
     if let Some(theme) = args.theme {
         core.set_theme(theme)?;
     }
-    match args.cmd {
+    match cmd {
         Cmd::Theme { name } => {
             if let Some(theme) = name {
                 core.set_theme(theme)?;
@@ -856,6 +883,7 @@ fn run() -> Result<()> {
             }
             SessionCmd::Restore { new } => print(&core.session_restore(new)?)?,
             SessionCmd::Whoami => print(&core.session_whoami()?)?,
+            SessionCmd::Marks => println!("{}", core.session_marks()?),
             SessionCmd::Start { name, new } => print(&core.session_start(&name, new)?)?,
             SessionCmd::Remove { name } => print(&core.session_remove(&name)?)?,
             SessionCmd::Hook => {
@@ -1057,7 +1085,7 @@ fn run() -> Result<()> {
                 print(&json!({"ok":true,"result":"client detached; agents retained"}))?
             }
         },
-        Cmd::Attach { project } => core.attach(&project)?,
+        Cmd::Attach { project } => core.attach(&core.resolve_project(&project)?)?,
         Cmd::Worktree { cmd } => match cmd {
             WorktreeCmd::List => print(&core.worktree_list()?)?,
             WorktreeCmd::Remove { name } => print(&core.worktree_remove(&name)?)?,

@@ -27,11 +27,24 @@ The real-tmux suites start their own servers in temporary state directories. Eac
 B=target/release/pctl T=$(command -v tmux); mkdir -p test-results
 for s in integration collaboration_integration msg_workflow_integration orchestration_integration \
          session_integration sidebar_integration sidebar_recovery snapshot_batch_integration \
-         team_context_preflight tmux_encoding_integration wake_integration web_integration worktree_integration; do
+         team_context_preflight tmux_encoding_integration wake_integration web_integration worktree_integration human_entry; do
   python3 tests/$s.py --bin $B --tmux $T --report test-results/$s.json >test-results/$s.out 2>&1; echo "$s exit $?"
 done
 python3 tests/remote_quoting.py --bin $B; echo "remote_quoting exit $?"
 ```
+
+## Use it like Herdr
+
+Type `pctl` in a terminal. It attaches to the running workspace at the project and tab you used last.
+- Each project is a tmux session. Each agent is a tab named after its session.
+- Tab marks: `!` waits for a person, `*` is working, `x` exited. The right side counts them across all projects.
+- `^b s`: tree of projects and agents with their state.
+- `^b m`: the project's manager.
+- `^b q` (or `^b d`): detach. The agents keep running.
+- Click a tab or a pane to switch. Drag a border to resize.
+- `pctl attach --project <name>` opens a given project at its manager.
+
+`pctl` alone never starts a server. Without one, it tells you how to start it. Without a terminal (agents, scripts), it is the usage error it always was.
 
 ## Hosts without Herdr
 

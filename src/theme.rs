@@ -156,11 +156,37 @@ impl Core {
     }
     pub(crate) fn apply_theme_chrome(&self) -> Result<()> {
         let theme = self.theme()?;
-        let (bg, text, muted, accent, ink) = match theme {
-            ThemeName::Portal => ("#0a1311", "#e5efda", "#8fa896", "#b7f45e", "#0c1910"),
-            ThemeName::Classic => ("black", "white", "colour7", "cyan", "black"),
-            ThemeName::Mono => ("default", "default", "default", "default", "default"),
+        let (bg, text, muted, accent, ink, alert) = match theme {
+            ThemeName::Portal => (
+                "#0a1311", "#e5efda", "#8fa896", "#b7f45e", "#0c1910", "#ff6b6b",
+            ),
+            ThemeName::Classic => ("black", "white", "colour7", "cyan", "black", "red"),
+            ThemeName::Mono => (
+                "default", "default", "default", "default", "default", "default",
+            ),
         };
+        // Tabs show the agent's name and a state mark written by `session marks` (! blocked,
+        // * working, x exited); the status line reruns it every 5 s while a client is attached.
+        let name =
+            "#{?#{==:#{window_name},manager},CONTROL,#{?#{@pctl_tab},#{@pctl_tab},#{window_name}}}";
+        let mark = |base: &str| {
+            format!(
+                "#{{?#{{==:#{{@pctl_status}},blocked}},#[fg={alert}]!#[fg={base}] ,#{{?#{{==:#{{@pctl_status}},working}},* ,#{{?#{{==:#{{@pctl_status}},exited}},x ,}}}}}}"
+            )
+        };
+        let marks_job = [
+            std::env::current_exe()?.to_string_lossy().to_string(),
+            "--state".into(),
+            self.state.to_string_lossy().to_string(),
+            "--tmux".into(),
+            self.tmux.to_string_lossy().to_string(),
+            "session".into(),
+            "marks".into(),
+        ]
+        .iter()
+        .map(|a| crate::shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
         let selected = if theme == ThemeName::Mono {
             "reverse,bold".to_string()
         } else if theme == ThemeName::Classic {
@@ -172,28 +198,22 @@ impl Core {
             ("status-style", format!("bg={bg},fg={text}")),
             (
                 "status-left",
-                format!("#[{selected}] ◎ PCTL / {} #[default] ", theme.label()),
+                format!("#[{selected}] ◎ #{{?#{{@pctl_name}},#{{@pctl_name}},PCTL}} #[default] "),
             ),
-            ("status-left-length", "26".into()),
+            ("status-left-length", "40".into()),
             (
                 "status-right",
-                format!("#[fg={muted}] ^b m manager  │  ^b d detach "),
+                format!("#[fg={muted}] #({marks_job}) │ ^b s tree  m manager  q detach "),
             ),
-            ("status-right-length", "36".into()),
-            ("status-interval", "0".into()),
+            ("status-right-length", "80".into()),
+            ("status-interval", "5".into()),
             (
                 "window-status-format",
-                format!(
-                    "#[fg={muted}] #I:#{name} ",
-                    name = "{?#{==:#{window_name},manager},CONTROL,#{window_name}}"
-                ),
+                format!("#[fg={muted}] #I:{}{name} ", mark(muted)),
             ),
             (
                 "window-status-current-format",
-                format!(
-                    "#[fg={accent},bold] ▸ #I:#{name} ",
-                    name = "{?#{==:#{window_name},manager},CONTROL,#{window_name}}"
-                ),
+                format!("#[fg={accent},bold] ▸ #I:{}{name} ", mark(accent)),
             ),
             ("pane-border-style", format!("fg={muted}")),
             ("pane-active-border-style", format!("fg={accent}")),
@@ -201,6 +221,12 @@ impl Core {
         ] {
             self.tm(&["set-option", "-g", key, &value])?;
         }
+        // Herdr-like keys: ^b s shows projects and agents by name, ^b q detaches.
+        let tree = format!(
+            "#{{?window_format,{name} #{{@pctl_status}},#{{?session_format,#{{?#{{@pctl_name}},#{{@pctl_name}},#{{session_name}}}},#{{pane_current_command}}}}}}"
+        );
+        self.tm(&["bind-key", "s", "choose-tree", "-Zw", "-F", &tree])?;
+        self.tm(&["bind-key", "q", "detach-client"])?;
         Ok(())
     }
 }
