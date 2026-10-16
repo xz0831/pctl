@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use pctl::Core;
 use serde_json::json;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
@@ -30,6 +31,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: pctl::orchestration::Command,
     },
+    /// Other computers saved by `pctl machine`; reach them with `--machine <label>`.
+    Machine {
+        #[command(subcommand)]
+        cmd: MachineCmd,
+    },
+    /// Internal: serve one `Remote` client over stdin and stdout. ssh starts this, not people.
+    #[command(hide = true)]
+    Bridge,
     /// Inspect or save a state-local visual theme (no agent controls).
     /// Show or set the built-in theme; --new writes your own theme file to edit; --list shows all.
     Theme {
@@ -124,6 +133,32 @@ enum Cmd {
         label: String,
         #[arg(long, default_value_t = 0)]
         tick_ms: u64,
+    },
+}
+#[derive(Subcommand)]
+enum MachineCmd {
+    /// Save this computer after its bridge answers the hello.
+    Add {
+        label: String,
+        #[arg(value_name = "ssh-target")]
+        ssh_target: String,
+    },
+    /// Every saved machine, in file order.
+    List,
+    /// Reachable or not, host name, pctl version, pctl server and agent count.
+    Status,
+    Remove {
+        label: String,
+    },
+    Rename {
+        old: String,
+        new: String,
+    },
+    Enable {
+        label: String,
+    },
+    Disable {
+        label: String,
     },
 }
 #[derive(Subcommand)]
@@ -605,36 +640,50 @@ fn print<T: serde::Serialize>(value: &T) -> Result<()> {
 }
 /// `pctl --host <ssh-target> ARGS...` runs `PCTL_REMOTE_BIN ARGS...` (default `pctl`) on that
 /// computer over the user's existing ssh setup. Paths in ARGS are the remote host's paths.
+/// `pctl --machine <label> ARGS...` is the same with the ssh target saved by `pctl machine add`.
+/// With a terminal on both ends ssh gets `-t`, so `pctl --machine rick` alone opens rick's app here.
 fn remote(argv: &[String]) -> Option<i32> {
-    let i = argv.iter().position(|a| a == "--host")?;
-    let host = argv.get(i + 1).filter(|h| !h.starts_with('-'));
-    let Some(host) = host else {
-        eprintln!(
-            "{}",
-            json!({"schema_version":1,"ok":false,"error":"--host needs an ssh target","error_code":"operation_failed"})
-        );
-        return Some(2);
+    let (at, saved) = match argv.iter().position(|a| a == "--host") {
+        Some(i) => (i, false),
+        None => (argv.iter().position(|a| a == "--machine")?, true),
+    };
+    let target = if saved {
+        match argv.get(at + 1).map(|label| pctl::machine::resolve(label)) {
+            Some(Ok(target)) => target,
+            Some(Err(e)) => return Some(fail(&format!("{e:#}"))),
+            None => return Some(fail("--machine needs a saved machine label")),
+        }
+    } else {
+        match argv.get(at + 1).filter(|h| !h.starts_with('-')) {
+            Some(host) => host.clone(),
+            None => return Some(fail("--host needs an ssh target")),
+        }
     };
     let bin = std::env::var("PCTL_REMOTE_BIN").unwrap_or_else(|_| "pctl".into());
-    let rest = argv[1..i].iter().chain(&argv[i + 2..]);
+    let rest = argv[1..at].iter().chain(&argv[at + 2..]);
     let line = std::iter::once(&bin)
         .chain(rest)
         .map(|a| pctl::shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
-    let status = std::process::Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "--", host, &line])
+    let mut ssh = std::process::Command::new("ssh");
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        ssh.arg("-t");
+    }
+    let status = ssh
+        .args(["-o", "BatchMode=yes", "--", &target, &line])
         .status();
     Some(match status {
         Ok(s) => s.code().unwrap_or(2),
-        Err(e) => {
-            eprintln!(
-                "{}",
-                json!({"schema_version":1,"ok":false,"error":format!("ssh: {e}"),"error_code":"operation_failed"})
-            );
-            2
-        }
+        Err(e) => fail(&format!("ssh: {e}")),
     })
+}
+fn fail(error: &str) -> i32 {
+    eprintln!(
+        "{}",
+        json!({"schema_version":1,"ok":false,"error":error,"error_code":pctl::error_code(error)})
+    );
+    2
 }
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
@@ -667,7 +716,6 @@ fn run() -> Result<()> {
     let Some(cmd) = args.cmd.take() else {
         // A person typed `pctl` alone: open the app. Agents and scripts have no
         // terminal and keep getting the usage error.
-        use std::io::IsTerminal;
         if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
             <Args as clap::CommandFactory>::command()
                 .error(
@@ -741,6 +789,16 @@ fn run() -> Result<()> {
         }
         Cmd::Doctor => print(&core.doctor())?,
         Cmd::Team { cmd } => print(&pctl::orchestration::run(&core, cmd)?)?,
+        Cmd::Machine { cmd } => print(&match cmd {
+            MachineCmd::Add { label, ssh_target } => pctl::machine::add(&label, &ssh_target)?,
+            MachineCmd::List => pctl::machine::list()?,
+            MachineCmd::Status => pctl::machine::status()?,
+            MachineCmd::Remove { label } => pctl::machine::remove(&label)?,
+            MachineCmd::Rename { old, new } => pctl::machine::rename(&old, &new)?,
+            MachineCmd::Enable { label } => pctl::machine::set_enabled(&label, true)?,
+            MachineCmd::Disable { label } => pctl::machine::set_enabled(&label, false)?,
+        })?,
+        Cmd::Bridge => pctl::bridge::run(&core)?,
         Cmd::Project { cmd } => match cmd {
             ProjectCmd::Add { name, root } => print(&core.register_project(&name, &root)?)?,
             ProjectCmd::List => print(&core.registry()?.projects)?,
