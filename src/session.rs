@@ -175,11 +175,12 @@ fn activity(raw: &str, title: &str) -> &'static str {
     let tail = &rows[rows.len().saturating_sub(12)..];
     let spinner_line =
         |l: &str| l.starts_with(['✢', '✳', '✶', '✻', '✽', '*', '·']) && l.contains('…');
-    // The last prompt row: its color code is written right before the "❯".
+    // The last prompt row: its color code is written right before the "❯". A numbered menu row
+    // ("❯ 1. Yes", often coloured) is a question waiting for a person, not a dim prompt.
     let dim_prompt = tail
         .iter()
         .rev()
-        .find(|(_, l)| l.starts_with('❯'))
+        .find(|(_, l)| l.starts_with('❯') && !menu_row(l))
         .is_some_and(|(r, _)| {
             r.split('❯').next().is_some_and(|before| {
                 before
@@ -191,25 +192,28 @@ fn activity(raw: &str, title: &str) -> &'static str {
         .chars()
         .next()
         .is_some_and(|c| ('\u{2801}'..='\u{28ff}').contains(&c) || "◐◓◑◒".contains(c));
-    if spinner_title
-        || dim_prompt
+    let busy = spinner_title
         || tail
             .iter()
-            .any(|(_, l)| l.contains("esc to interrupt") || spinner_line(l))
-    {
-        "working"
-    } else if tail.iter().any(|(_, l)| {
+            .any(|(_, l)| l.contains("esc to interrupt") || spinner_line(l));
+    // A question beats the dim-prompt hint: when both show, refusing input is the safe side.
+    let question = tail.iter().any(|(_, l)| {
         [
             "do you want to",
             "would you like to",
             "allow command",
             "approve",
+            "enter to confirm",
         ]
         .iter()
         .any(|k| l.contains(k))
-    }) || tail.iter().any(|(_, l)| menu_row(l))
-    {
+    }) || tail.iter().any(|(_, l)| menu_row(l));
+    if busy {
+        "working"
+    } else if question {
         "blocked"
+    } else if dim_prompt {
+        "working"
     } else {
         "idle"
     }
@@ -676,6 +680,18 @@ mod tests {
         assert_eq!(activity("  1. Update now\n› 2. Skip\n", ""), "blocked");
         assert_eq!(activity("› Ask Codex to do anything\n", ""), "idle");
         assert_eq!(activity("❯ 10 items left\n", ""), "idle");
+        // A coloured menu row must not read as Claude's dim (working) prompt.
+        assert_eq!(
+            activity(
+                "Do you want to proceed?\n\x1b[36m❯ 1. Yes\x1b[0m\n  2. No\n",
+                ""
+            ),
+            "blocked"
+        );
+        assert_eq!(activity("\x1b[38;5;153m❯ 2. Skip\x1b[39m\n", ""), "blocked");
+        // Claude Code's folder-trust dialog (2.1.x, captured): unnumbered, coloured choices.
+        let trust = " Quick safety check: Is this a project you created or one you trust?\n \x1b[38;5;153m❯\x1b[39m \x1b[38;5;153mNo,\x1b[39m \x1b[38;5;153mexit\x1b[39m\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel\n";
+        assert_eq!(activity(trust, ""), "blocked");
     }
     #[test]
     fn launch_argv_assigns_then_resumes() {
