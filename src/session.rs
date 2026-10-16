@@ -197,6 +197,12 @@ fn activity(raw: &str, title: &str) -> &'static str {
         || tail
             .iter()
             .any(|(_, l)| l.contains("esc to interrupt") || spinner_line(l));
+    // OpenCode 2.0 shows "esc interrupt" (no "to") in its footer while it works, next to its
+    // progress glyphs ("⬝⬝⬝■■ esc interrupt …") or its "ctrl+p commands" hint. Only a footer row
+    // counts: prose that says "esc interrupt" has neither.
+    let opencode_footer = rows[rows.len().saturating_sub(4)..].iter().any(|(_, l)| {
+        l.contains("esc interrupt") && (l.contains(['⬝', '■']) || l.contains("ctrl+p commands"))
+    });
     // A question beats the dim-prompt hint: when both show, refusing input is the safe side.
     // Only rows below the last free input row count: prose an agent wrote above its own prompt
     // ("if the reviewer approves") is not a question. Dialogs replace the input row or sit below
@@ -226,7 +232,7 @@ fn activity(raw: &str, title: &str) -> &'static str {
         "working"
     } else if question {
         "blocked"
-    } else if dim_prompt {
+    } else if opencode_footer || dim_prompt {
         "working"
     } else {
         "idle"
@@ -815,6 +821,40 @@ mod tests {
         }
     }
     #[test]
+    fn opencode_footer_reads_working() {
+        let head = "  ┃  Build · DeepSeek V4.1 Flash Free OpenCode\n  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n";
+        for footer in [
+            "   ⬝⬝⬝⬝⬝⬝■■ esc interrupt                                                 35.2K (18%)  ctrl+p commands\n",
+            "   ■■■■■⬝⬝⬝ esc interrupt   123.5K (62%)  ctrl+p commands\n",
+            "   ⬝⬝⬝⬝⬝⬝⬝⬝ esc interrupt ↓ 1 shell · 139.8K (70%)  ctrl+p commands\n",
+        ] {
+            assert_eq!(
+                activity(&format!("{head}{footer}"), ""),
+                "working",
+                "{footer}"
+            );
+            // Coloured, as the terminal gives it.
+            let colored = format!("{head}\x1b[38;5;240m{footer}\x1b[0m");
+            assert_eq!(activity(&colored, ""), "working");
+        }
+        // Idle: no "esc interrupt" anywhere.
+        let idle = "                       ┃  Build · DeepSeek V4.1 Flash Free OpenCode\n                       ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n                       …/pctl-gh-wt-panel-copy:panel/app-copy    shift+tab agents  ctrl+p commands\n  ⊙ 7 MCP /mcps                                                                         2.0.28\n";
+        assert_eq!(activity(idle, ""), "idle");
+        // Prose is not a footer: an answer that says it, in the last rows or above them.
+        let prose =
+            "  ┃ To stop it, press esc interrupt twice.\n  ┃ You can also use ctrl+p commands.\n";
+        assert_eq!(activity(&format!("{idle}{prose}"), ""), "idle");
+        assert_eq!(activity(&format!("{prose}{idle}"), ""), "idle");
+        let old_prose = format!("  press esc interrupt to stop\n{}", "\n  line\n".repeat(6));
+        assert_eq!(activity(&old_prose, ""), "idle");
+        // A footer scrolled far up the screen is old.
+        let stale = format!(
+            "   ⬝⬝⬝■■⬝⬝⬝ esc interrupt  ctrl+p commands\n{}{idle}",
+            "  more text\n".repeat(8)
+        );
+        assert_eq!(activity(&stale, ""), "idle");
+    }
+    #[test]
     fn activity_reads_the_footer() {
         assert_eq!(
             activity("> hi\n\n✻ Thinking… (3s · esc to interrupt)\n", ""),
@@ -867,6 +907,10 @@ mod tests {
         // OpenCode's permission dialog (strings from the installed binary): Enter picks Allow once.
         let opencode = "  △ Permission required\n  ┃ bash: rm -rf build\n  Allow once   Always allow   Reject\n  enter confirm  esc reject\n";
         assert_eq!(activity(opencode, ""), "blocked");
+        // ... also when its footer still says "esc interrupt": the dialog waits for a person.
+        let asking =
+            format!("{opencode}   ⬝⬝⬝■■⬝⬝⬝ esc interrupt   35.2K (18%)  ctrl+p commands\n");
+        assert_eq!(activity(&asking, ""), "blocked");
         assert_eq!(
             activity(
                 "  △ Permission required\n  Allow once   Always allow   Reject\n",
