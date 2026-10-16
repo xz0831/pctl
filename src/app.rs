@@ -78,7 +78,8 @@ enum Hit {
 #[derive(Clone, Debug)]
 enum Act {
     Restart(String),
-    Stop(String),
+    /// The agent and the run shown when Stop was asked.
+    Stop(String, Option<String>),
     Start(String, bool),
     Remove(String),
     NewAgent(String),
@@ -123,6 +124,9 @@ struct View {
     rows: Vec<term::Row>,
     cursor: Option<(u16, u16)>,
     size: (u16, u16),
+    /// The size this app last asked tmux for. Resizing only when this changes keeps two apps that
+    /// show the same agent at different sizes from resizing it back and forth.
+    asked: (u16, u16),
     scroll: usize,
     history: usize,
     next: Option<Instant>,
@@ -172,11 +176,49 @@ struct App {
     refresh: Option<mpsc::Sender<()>>,
     /// Agents added here that a refresh started earlier may not list yet.
     fresh: HashMap<String, (Agent, Instant)>,
+    /// Panes whose window this app resized (resize-window leaves window-size at manual).
+    touched: HashSet<String>,
+}
+
+/// A launched agent, or anything inside this server's tmux (a bash tab of the app itself), must not
+/// open the app: its keys skip the blocked-question refusals of `msg` and `session prompt`, and an
+/// app showing itself fights over the window size. Same rule as orchestration's operator_only;
+/// not a security boundary.
+/// `s` in pieces of at most `max` bytes, cut on character boundaries.
+fn chunks(s: &str, max: usize) -> Vec<&str> {
+    let mut out = vec![];
+    let mut rest = s;
+    while rest.len() > max {
+        let cut = (1..=max)
+            .rev()
+            .find(|&i| rest.is_char_boundary(i))
+            .unwrap_or(rest.len());
+        out.push(&rest[..cut]);
+        rest = &rest[cut..];
+    }
+    out.push(rest);
+    out
+}
+
+fn agent_caller(core: &Core) -> bool {
+    let sock = core.state.join("tmux.sock");
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    std::env::var_os("PCTL_AGENT_ID").is_some()
+        || std::env::var_os("PCTL_RUN_ID").is_some()
+        || std::env::var("TMUX").is_ok_and(|t| {
+            t.split(',')
+                .next()
+                .is_some_and(|s| canon(std::path::Path::new(s)) == canon(&sock))
+        })
 }
 
 /// Open the app until the person leaves it. Never starts a server by itself: adding the first
 /// agent goes through `session add`, which keeps its own start rules.
 pub fn run(core: &Core) -> Result<()> {
+    anyhow::ensure!(
+        !agent_caller(core),
+        "agent_caller: the app is for a person at a terminal. An agent of this server (PCTL_AGENT_ID, PCTL_RUN_ID, or a pane of its tmux) could answer another agent's question with a keystroke; use `pctl session` and `msg`"
+    );
     let (keys, warnings) = Keymap::load();
     let mut app = App::new(core.theme()?, keys);
     // Come back where the person left: last project and each project's tab (per viewer, not
@@ -249,6 +291,10 @@ pub fn run(core: &Core) -> Result<()> {
             }
         }
     }
+    // Hand the windows back to tmux's own sizing, so `pctl attach` and other viewers fit again.
+    for pane in &app.touched {
+        let _ = core.tm(&["set-option", "-wu", "-t", pane, "window-size"]);
+    }
     println!("{}", quips::goodbye(app.keys.wit));
     let _ = std::fs::write(
         &place,
@@ -288,6 +334,7 @@ impl App {
             quit: false,
             refresh: None,
             fresh: HashMap::new(),
+            touched: HashSet::new(),
         }
     }
     fn say(&mut self, text: impl Into<String>) {
@@ -391,7 +438,9 @@ impl App {
         if w < 2 || h < 2 {
             return;
         }
-        if self.view.size != (w, h) {
+        if self.view.asked != (w, h) {
+            self.view.asked = (w, h);
+            self.touched.insert(pane.clone());
             let _ = core.tm(&[
                 "resize-window",
                 "-t",
@@ -482,9 +531,15 @@ impl App {
         let Some(pane) = self.verified(core, &a, true) else {
             return;
         };
-        let r = core
-            .tm(&["set-buffer", "-b", "pctl-app", "--", &literal(text)])
-            .and_then(|_| core.tm(&["paste-buffer", "-p", "-d", "-b", "pctl-app", "-t", &pane]));
+        // One tmux command carries about 16 KB; a longer paste goes in 8 KB pieces into one buffer,
+        // then out as one bracketed paste.
+        let mut r = Ok(String::new());
+        for (i, piece) in chunks(text, 8192).into_iter().enumerate() {
+            let append = if i == 0 { "-b" } else { "-ab" };
+            r = r.and_then(|_| core.tm(&["set-buffer", append, "pctl-app", "--", &literal(piece)]));
+        }
+        let r =
+            r.and_then(|_| core.tm(&["paste-buffer", "-p", "-d", "-b", "pctl-app", "-t", &pane]));
         if let Err(e) = r {
             self.say(format!("Could not paste: {e:#}"));
         }
@@ -504,7 +559,7 @@ impl App {
                     }
                 }
             }
-            Event::Resize(..) => self.view.size = (0, 0),
+            Event::Resize(..) => self.view.asked = (0, 0),
             _ => {}
         }
     }
@@ -762,6 +817,7 @@ impl App {
                 self.theme_menu(w.saturating_sub(70), h.saturating_sub(9));
             }
             Hit::Detach => self.quit = true,
+            Hit::Start(a, true) => self.confirm_new(&a),
             Hit::Start(a, new) => self.run_act(core, Act::Start(a, new)),
             Hit::SidebarEdge => self.drag = true,
             Hit::Menu(i) => self.menu_pick(core, i),
@@ -798,11 +854,11 @@ impl App {
                 "Restart (same conversation)".to_string(),
                 Act::Restart(a.name.clone()),
             ));
-            items.push(("Stop…".to_string(), Act::Stop(a.name.clone())));
+            items.push(("Stop…".to_string(), Act::Stop(a.name.clone(), None)));
         } else {
             items.push(("Start".to_string(), Act::Start(a.name.clone(), false)));
             items.push((
-                "Start a new conversation".to_string(),
+                "Start a new conversation…".to_string(),
                 Act::Start(a.name.clone(), true),
             ));
             items.push((
@@ -830,7 +886,8 @@ impl App {
             return;
         };
         match act {
-            Act::Stop(a) => self.confirm_stop(&a),
+            Act::Stop(a, _) => self.confirm_stop(&a),
+            Act::Start(a, true) => self.confirm_new(&a),
             Act::Remove(a) => {
                 self.modal = Some(Modal::Confirm {
                     text: format!("Remove {a} from the list? Its conversation is not deleted."),
@@ -887,10 +944,25 @@ impl App {
         });
     }
     fn confirm_stop(&mut self, a: &str) {
+        // Stop the run the person saw when asked, not whatever runs by the time they confirm.
+        let run = self
+            .agents
+            .iter()
+            .find(|x| x.name == a)
+            .and_then(|x| x.run.clone());
         self.modal = Some(Modal::Confirm {
             text: quips::stop_question(self.keys.wit, a),
             button: "Stop",
-            act: Act::Stop(a.to_string()),
+            act: Act::Stop(a.to_string(), run),
+        });
+    }
+    fn confirm_new(&mut self, a: &str) {
+        self.modal = Some(Modal::Confirm {
+            text: format!(
+                "Start {a} in a new conversation? pctl forgets the saved one, so Start and Restart no longer resume it."
+            ),
+            button: "Start new",
+            act: Act::Start(a.to_string(), true),
         });
     }
     fn run_act(&mut self, core: &Core, act: Act) {
@@ -900,10 +972,10 @@ impl App {
                 .map(|_| format!("Restarted {a}")),
             Act::Start(a, new) => core.session_start(a, *new).map(|_| format!("Started {a}")),
             Act::Remove(a) => core.session_remove(a).map(|_| format!("Removed {a}")),
-            Act::Stop(a) => core.session_get(a).and_then(|s| {
+            Act::Stop(a, seen) => core.session_get(a).and_then(|s| {
                 let (id, run) = (
                     s["agent_id"].as_str().unwrap_or_default(),
-                    s["run_id"].as_str().unwrap_or_default(),
+                    seen.as_deref().or(s["run_id"].as_str()).unwrap_or_default(),
                 );
                 core.terminate(id, run).map(|_| format!("Stopped {a}"))
             }),
@@ -1586,7 +1658,7 @@ impl App {
                 self,
                 f,
                 y + 2,
-                " Start a new conversation ",
+                " Start a new conversation… ",
                 Hit::Start(a.name.clone(), true),
             );
             return;
@@ -2070,6 +2142,15 @@ fn inner(r: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_pastes_split_on_character_boundaries() {
+        let s = "가".repeat(10); // 3 bytes each
+        let parts = super::chunks(&s, 7);
+        assert_eq!(parts.concat(), s);
+        assert!(parts.iter().all(|p| p.len() <= 7 && !p.is_empty()));
+        assert_eq!(super::chunks("", 8), [""]);
+        assert_eq!(super::chunks("abc", 8), ["abc"]);
+    }
     #[test]
     fn names_typed_in_the_app_are_plain() {
         for ok in ["panel-main", "54_Agent_Panel", "a.b"] {

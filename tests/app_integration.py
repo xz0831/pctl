@@ -4,8 +4,8 @@ outer "monitor" tmux; its screen is read with capture-pane, keys go in with send
 clicks are SGR mouse sequences typed into it. Covers the sidebar, tabs and live terminal, typing,
 clicks, prefix shortcuts, the new-agent form, the right-click menu with its confirmation (and that
 clicks on a box never reach what is behind it), Start for a stopped agent, wheel scroll-back,
-Leave (stops nothing, reopens in place), shortcuts from a config file, and the empty state with no
-server (which starts nothing)."""
+Leave (stops nothing, reopens in place, hands window sizing back), shortcuts from a config file, the
+empty state with no server (which starts nothing), and that agents cannot open the app."""
 import argparse, json, os, pathlib, re, subprocess, tempfile, time
 p = argparse.ArgumentParser(); p.add_argument('--bin', required=True); p.add_argument('--tmux', required=True); p.add_argument('--report', required=True); a = p.parse_args()
 B = str(pathlib.Path(a.bin).resolve()); T = str(pathlib.Path(a.tmux).resolve())
@@ -32,12 +32,13 @@ def case(name, fn):
 def screen(): return vt('capture-pane', '-p', '-t', 'view')
 def lines(): return screen().split('\n')
 def status(): return lines()[25]
-def app(st=None, env=None):
+def app(st=None, env=None, ready=True):
     vt('kill-server')
     envs = ' '.join(f'{k}={v}' for k, v in (env or {}).items())
     cmd = f"env -u TMUX -u HERDR_ENV {envs} {B} --state {st or state} --tmux {T}; echo EXITED $?; sleep 600"
     subprocess.run([T, '-S', str(V), '-f', '/dev/null', 'new-session', '-d', '-x', '110', '-y', '26', '-s', 'view', cmd], env=ENV, check=True, timeout=10)
-    assert until(lambda: '+ agent' in screen() or 'Welcome to pctl' in screen()), screen()
+    if ready: assert until(lambda: '+ agent' in screen() or 'Welcome to pctl' in screen()), screen()
+def st(*args): return subprocess.run([T, '-S', str(state / 'tmux.sock'), *map(str, args)], text=True, capture_output=True, timeout=10).stdout.strip()
 def find(text, row=None, start=0):
     """1-based (column, row) of the middle of `text`; columns count characters as tmux shows them."""
     for i, line in enumerate(lines()):
@@ -74,7 +75,11 @@ try:
         text('hello app'); keys('Enter')
         assert until(lambda: 'got: hello app' in cli('session', 'read', 'a-main', '--lines', '10'))
         assert until(lambda: 'got: hello app' in screen()), screen()
-    case('typing goes to the agent on screen', typing)
+        big = root / 'paste.txt'; big.write_text(''.join(f'{i:04d} ' + 'x' * 995 + '\n' for i in range(20)) + 'END-OF-PASTE\n')  # 20 KB
+        vt('load-buffer', '-b', 'big', big); vt('paste-buffer', '-p', '-b', 'big', '-t', 'view'); time.sleep(0.5)
+        assert until(lambda: 'got: END-OF-PASTE' in cli('session', 'read', 'a-main', '--lines', '10')), status()
+        assert 'Could not paste' not in status(), status()
+    case('typing goes to the agent on screen; a 20 KB paste arrives whole', typing)
     def identity():
         s0 = cli('session', 'get', 'a-main')
         sock = str(state / 'tmux.sock')
@@ -127,14 +132,25 @@ try:
         before = status()
         x, y = find('Stop a-shell?'); click(x + 3, y)
         assert 'Confirm' in screen() and status() == before, 'a click on the box text reached nothing behind it'
+        s = cli('session', 'get', 'a-shell')  # the agent restarts while the box is open
+        cli('agent', 'restart', '--agent', s['agent_id'], '--expected-run', s['run_id'])
+        x, y = find('Stop    Cancel'); click(x - 4, y)
+        assert until(lambda: 'Could not' in status() or 'stale' in status().lower()), status()
+        assert cli('session', 'get', 'a-shell')['process'] == 'running', 'Stop does not stop a run the person never saw'
+        click(*side('a-shell'), button=2); assert until(lambda: 'Stop…' in screen()), screen()
+        click(*find('Stop…')); assert until(lambda: 'Confirm' in screen()), screen()
         x, y = find('Stop    Cancel'); click(x - 4, y)
         assert until(lambda: cli('session', 'get', 'a-shell')['status'] == 'stopped', 15)
         assert until(lambda: '○ a-shell' in screen() and 'Confirm' not in screen()), screen()
-    case('right-click Stop asks first; a click on the box text does nothing; Stop stops it', stop)
+    case('right-click Stop asks first; a click on the box text does nothing; Stop stops the run it showed', stop)
     def start():
         click(*side('a-shell'))
         assert until(lambda: 'a-shell is stopped.' in screen()), screen()
-        x, y = find(' Start ', start=27); click(x, y)
+        click(*find('Start a new conversation…'))
+        assert until(lambda: 'new conversation?' in screen()), screen()
+        x, y = find('Start new    Cancel'); click(x + 8, y)
+        assert until(lambda: 'Confirm' not in screen()) and cli('session', 'get', 'a-shell')['status'] == 'stopped', 'Cancel starts nothing'
+        x, y = find('Start', start=27); click(x, y)  # the first Start button; capture trims its trailing space
         assert until(lambda: cli('session', 'get', 'a-shell')['status'] in ('idle', 'unknown'), 15)
         assert until(lambda: '● a-shell' in screen()), screen()
     case('a stopped agent shows Start; Start brings it back', start)
@@ -148,13 +164,24 @@ try:
     case('the wheel scrolls back over the terminal; a key returns to live', scroll)
     def leave():
         here = status()
+        pane = cli('session', 'get', 'a-shell')['pane']
+        assert st('show-options', '-wv', '-t', pane, 'window-size') == 'manual', 'the app sized the window it shows'
+        st('resize-window', '-t', pane, '-x', '50', '-y', '10'); time.sleep(1.5)  # another viewer's size
+        assert st('display-message', '-p', '-t', pane, '#{pane_width}') == '50', 'the app does not fight another size'
         click(*find('⏏ Leave'))
         assert until(lambda: 'EXITED 0' in screen()), screen()
+        assert st('show-options', '-wv', '-t', pane, 'window-size') == '', 'leaving hands sizing back to tmux'
         rows = {s['name']: s['status'] for s in cli('session', 'list')}
         assert rows['a-main'] == 'idle' and rows['a-shell'] in ('idle', 'unknown') and rows['a-block'] == 'blocked', rows
         app()
         assert until(lambda: 'alpha / ● a-shell' in status()), (here, status())
-    case('Leave exits the app and stops nothing; pctl reopens where it was left', leave)
+    case('Leave exits the app and stops nothing, hands window sizing back; pctl reopens where it was left', leave)
+    def agents_refused():
+        for env in ({'PCTL_AGENT_ID': 'x'}, {'PCTL_RUN_ID': 'x'}, {'TMUX': f'{state}/tmux.sock,1,0'}):
+            app(env=env, ready=False)
+            assert until(lambda: 'EXITED 1' in screen()) and 'agent_caller' in screen(), (env, screen())
+        app()
+    case('an agent, or a pane of this server, cannot open the app', agents_refused)
     def config():
         (cfg / 'pctl').mkdir(parents=True)
         (cfg / 'pctl' / 'config.toml').write_text('[keys]\nprefix = "ctrl+a"\nnext_tab = "alt+right"\nbogus = "x"\n')
