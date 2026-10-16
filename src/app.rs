@@ -138,6 +138,8 @@ struct View {
     scroll: usize,
     history: usize,
     next: Option<Instant>,
+    /// The last capture as tmux printed it; an equal one needs no parsing and no redraw.
+    raw: String,
 }
 
 struct Update {
@@ -384,14 +386,21 @@ pub fn run(core: &Core) -> Result<()> {
         let _guard = TerminalGuard::enter()?;
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         terminal.clear()?;
+        // Draw only what changed: an event, a new list, a different screen, or a notice running out.
+        let (mut dirty, mut notice) = (true, false);
         while !app.quit {
             while let Ok(u) = rx.try_recv() {
                 app.apply(u);
+                dirty = true;
             }
             if app.view.next.is_none_or(|t| Instant::now() >= t) {
-                app.capture(core);
+                dirty |= app.capture(core);
             }
-            terminal.draw(|f| app.render(f))?;
+            let live = app.notice_live();
+            dirty |= live != std::mem::replace(&mut notice, live);
+            if std::mem::take(&mut dirty) {
+                terminal.draw(|f| app.render(f))?;
+            }
             let wait = (app.view.next).map_or(Duration::ZERO, |t| {
                 t.saturating_duration_since(Instant::now())
             });
@@ -404,6 +413,7 @@ pub fn run(core: &Core) -> Result<()> {
                     }
                 }
                 app.flush_typed(core);
+                dirty = true;
             }
         }
         Ok(())
@@ -464,6 +474,10 @@ impl App {
     fn say(&mut self, text: impl Into<String>) {
         self.notice = text.into();
         self.notice_at = Instant::now();
+    }
+    /// Whether the status line still shows the last notice.
+    fn notice_live(&self) -> bool {
+        !self.notice.is_empty() && self.notice_at.elapsed() < Duration::from_secs(8)
     }
     fn poke(&self) {
         if let Some(r) = &self.refresh {
@@ -599,18 +613,21 @@ impl App {
         }
     }
 
-    /// Read the current agent's screen from tmux, resizing its window to the view first.
-    fn capture(&mut self, core: &Core) {
+    /// Show nothing for the agent (its pane is gone or holds another run). Whether that changed the screen.
+    fn blank(&mut self) -> bool {
+        self.view.raw.clear();
+        !std::mem::take(&mut self.view.rows).is_empty()
+    }
+    /// Read the current agent's screen from tmux, resizing its window to the view first. Whether
+    /// the screen changed.
+    fn capture(&mut self, core: &Core) -> bool {
         self.view.next = Some(Instant::now() + CAPTURE_EVERY);
         let Some(a) = self.current().filter(|a| a.running()).cloned() else {
-            self.view.rows.clear();
             self.view.pane.clear();
-            return;
+            return self.blank();
         };
-        // The pane comes from the last list; check it still holds this run before touching it.
-        let Some(pane) = self.verified(core, &a) else {
-            self.view.rows.clear();
-            return;
+        let (Some(pane), Some(run)) = (a.pane.clone(), a.run.clone()) else {
+            return self.blank();
         };
         if self.view.pane != pane {
             self.view = View {
@@ -621,9 +638,14 @@ impl App {
         }
         let (w, h) = (self.term.width, self.term.height);
         if w < 2 || h < 2 {
-            return;
+            return false;
         }
         if self.view.asked != (w, h) {
+            // The pane comes from the last list; check it still holds this run before resizing it.
+            // The capture below checks it again, in its own call.
+            if self.verified(core, &a).is_none() {
+                return self.blank();
+            }
             self.view.asked = (w, h);
             self.touched.insert(pane.clone());
             // resize-window sets window-size to manual. With no client attached, unset it at once:
@@ -662,13 +684,31 @@ impl App {
             "-p",
             "-t",
             &pane,
-            "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_width} #{pane_height} #{history_size}",
+            "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_width} #{pane_height} #{history_size} #{@pctl_run}",
         ]);
-        let Ok(out) = core.tm(&args) else {
-            return;
+        let out = match core.tm(&args) {
+            Ok(out) => out,
+            Err(e) if e.to_string().contains("can't find") => {
+                self.poke();
+                return self.blank();
+            }
+            Err(_) => return false,
         };
         let (body, last) = out.rsplit_once('\n').unwrap_or(("", out.as_str()));
-        let m: Vec<u64> = last.split(' ').filter_map(|v| v.parse().ok()).collect();
+        let mut fields = last.splitn(7, ' ');
+        let m: Vec<u64> = fields
+            .by_ref()
+            .take(6)
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        // What was read belongs to the pane's run now; if that is not the agent's, show none of it.
+        if fields.next() != Some(run.as_str()) {
+            self.poke();
+            return self.blank();
+        }
+        if out == self.view.raw {
+            return false;
+        }
         if m.len() == 6 {
             self.view.cursor = (m[2] == 1).then_some((m[0] as u16, m[1] as u16));
             self.view.size = (m[3] as u16, m[4] as u16);
@@ -676,6 +716,8 @@ impl App {
             self.view.scroll = self.view.scroll.min(self.view.history);
         }
         self.view.rows = term::parse_capture(body);
+        self.view.raw = out;
+        true
     }
 
     /// The agent's pane, if it still holds the agent's current run. Panes are cached from the
@@ -2062,7 +2104,7 @@ impl App {
                 format!("   {} …", self.keys.prefix.label()),
                 Style::default().fg(p.warn),
             ));
-        } else if !self.notice.is_empty() && self.notice_at.elapsed() < Duration::from_secs(8) {
+        } else if self.notice_live() {
             left.push(Span::styled(
                 format!("   {}", self.notice),
                 Style::default().fg(p.warn),
