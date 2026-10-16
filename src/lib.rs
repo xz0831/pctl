@@ -518,12 +518,7 @@ impl Core {
                 r.runs.is_empty(),
                 "server disconnected with existing runs; controls locked"
             );
-            // macOS permissions follow the process lineage that starts the server: only a
-            // Herdr pane carries them. A launchd/ssh/front-door caller must not create one.
-            ensure!(
-                std::env::var("HERDR_ENV").as_deref() == Ok("1"),
-                "server_start_outside_herdr: no PCTL server is running and this caller is not in a Herdr pane; start it from Herdr (pctl-server-herdr)"
-            );
+            server_start_allowed()?;
         }
         // display-message -t is a pane target: a missing session can return an empty
         // format successfully. Enumerate sessions and match the generated name exactly.
@@ -1288,7 +1283,7 @@ impl Core {
             .command_output(Command::new(&self.tmux).arg("-V"), None)
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|e| e.to_string());
-        serde_json::json!({"tmux":version,"state":self.state,"socket":self.state.join("tmux.sock"),"connection":self.server().ok(),"platform":std::env::consts::OS,"task_adapter":"generic = unknown; synthetic fixture only","security_boundary":false,"requires":"tmux >=3.0a pane options; Linux /proc process generation checks","scope":"isolated prototype; not production or RHEL certification"})
+        serde_json::json!({"tmux":version,"state":self.state,"socket":self.state.join("tmux.sock"),"connection":self.server().ok(),"platform":std::env::consts::OS,"task_adapter":"generic = unknown; synthetic fixture only","security_boundary":false,"requires":"tmux >=3.0a pane options; Linux /proc process generation checks","scope":"isolated prototype; not production certified"})
     }
     fn audit(&self, action: &str, run: &str, result: &str) -> Result<()> {
         let file = self.state.join("audit.jsonl");
@@ -1331,6 +1326,17 @@ fn ensure_terminal_input(r: &Registry, agent: &str) -> Result<()> {
     ensure!(
         a.input_mode == "terminal-line",
         "unsupported: terminal input is disabled; use the native pane or explicitly configure terminal-line while stopped"
+    );
+    Ok(())
+}
+/// macOS permissions follow the process lineage that starts the server: in a Herdr setup only a
+/// Herdr pane carries them, so a launchd/ssh/front-door caller must not create one. Hosts without
+/// Herdr opt out explicitly with PCTL_STANDALONE=1.
+pub(crate) fn server_start_allowed() -> Result<()> {
+    let on = |k| std::env::var(k).as_deref() == Ok("1");
+    ensure!(
+        on("HERDR_ENV") || on("PCTL_STANDALONE"),
+        "server_start_outside_herdr: no PCTL server is running and this caller is not in a Herdr pane; start it from Herdr (pctl-server-herdr), or set PCTL_STANDALONE=1 on a host without Herdr"
     );
     Ok(())
 }

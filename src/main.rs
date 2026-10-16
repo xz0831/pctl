@@ -53,7 +53,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PeerCmd,
     },
-    /// Name-addressed sessions for msg and Hermes: list, read, prompt, wait, restart, restore.
+    /// Name-addressed sessions: list, read, prompt, wait, restart, restore.
     Session {
         #[command(subcommand)]
         cmd: SessionCmd,

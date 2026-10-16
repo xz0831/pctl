@@ -33,6 +33,23 @@ done
 python3 tests/remote_quoting.py --bin $B; echo "remote_quoting exit $?"
 ```
 
+## Hosts without Herdr
+
+pctl starts its tmux server only for a caller in a Herdr pane (`HERDR_ENV=1`) or with `PCTL_STANDALONE=1`. On a host without Herdr, set `PCTL_STANDALONE=1`.
+
+## Lite package
+
+`scripts/package-lite.sh [target]` builds `dist/pctl-lite-<version>-<target>.zip` for offline install. The ZIP contains:
+- a static binary
+- `install.sh` (copies the binary, no network)
+- `QUICKSTART.md` and `pctl.env.example`
+- `smoke.sh` (the same file as `scripts/lite-smoke.sh`)
+- licenses, `BUILDINFO.txt` and `SHA256SUMS`
+
+The default target is `x86_64-unknown-linux-musl`. It links with the toolchain's `rust-lld` and needs `rustup target add x86_64-unknown-linux-musl`.
+
+`scripts/lite-smoke.sh target/release/pctl` runs the offline smoke test: two fake agents, session control, messages, duplicate and blocked refusals, and restart.
+
 ## Workflow
 
 1. Every change starts from an issue that says what to change, when it is done, and how to test it.

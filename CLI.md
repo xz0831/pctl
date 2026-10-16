@@ -27,7 +27,7 @@ Inbox is a read-only snapshot, default limit20, maximum100, --after-sequence for
 
 Added error codes: context_missing, context_mismatch, ambiguous_role, capability_denied, ownership_denied, launch_limit, orchestration_capacity and operator_only. Existing errors/guards still apply. Existing mailbox schema1 records without optional metadata remain readable; do not run an older binary against 0.6 state because an old write may discard new evidence. Use a separate state for this prototype. The16MiB mailbox cap reserves future retrieval/receipt/completion growth; refusal may occur before1024 messages. No implicit pruning or migration exists.
 
-Unsupported: automatic PTY/prompt delivery, remote computers/Morty routes, A2A, external messages, broadcast, network credentials, authenticated per-process actors and harness approval. Explicit local commands do not expand the user's authorization.
+Unsupported: automatic PTY/prompt delivery, remote computer routes, A2A, external messages, broadcast, network credentials, authenticated per-process actors and harness approval. Explicit local commands do not expand the user's authorization.
 
 ---
 
