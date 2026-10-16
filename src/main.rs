@@ -65,7 +65,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PeerCmd,
     },
-    /// Name-addressed sessions: list, read, prompt, wait, restart, restore.
+    /// Name-addressed sessions: list, read, prompt, keys, wait, restart, restore.
     Session {
         #[command(subcommand)]
         cmd: SessionCmd,
@@ -417,11 +417,22 @@ enum SessionCmd {
         name: String,
         text: String,
     },
-    /// Wait until the status is one of --until (default: anything but working).
+    /// Press named keys (Escape, Enter, Tab, BTab, arrows, BSpace, Space, 0-9, y, n) in order.
+    /// Answers a blocked session too (`was_blocked` in the output); pasted text never does.
+    Keys {
+        name: String,
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
+    /// Wait until the status is one of --until (default: anything but working), or until
+    /// --match TEXT shows on the screen.
     Wait {
         name: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "matched")]
         until: Vec<String>,
+        /// Wait until this text appears on the visible screen or 200 lines of scrollback.
+        #[arg(long = "match", value_name = "TEXT")]
+        matched: Option<String>,
         #[arg(long, default_value_t = 1_800_000)]
         timeout_ms: u64,
     },
@@ -903,14 +914,17 @@ fn run() -> Result<()> {
                 model.as_deref(),
             )?)?,
             SessionCmd::Prompt { name, text } => print(&core.session_prompt(&name, &text)?)?,
+            SessionCmd::Keys { name, keys } => print(&core.session_keys(&name, &keys)?)?,
             SessionCmd::Wait {
                 name,
                 until,
+                matched,
                 timeout_ms,
             } => print(&core.session_wait(
                 &name,
                 &until,
                 std::time::Duration::from_millis(timeout_ms),
+                matched.as_deref(),
             )?)?,
             SessionCmd::Read { name, lines } => println!("{}", core.session_read(&name, lines)?),
             SessionCmd::Restart { name, force, new } => {
