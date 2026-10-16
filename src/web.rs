@@ -123,7 +123,7 @@ fn api(core: &Core, path: &str, body: &[u8]) -> (u16, Value) {
     let r = match path {
         "/api/sessions" => core.session_list().map(|all| {
             all.iter()
-                .map(|s| json!({"name": s["name"], "project": s["project"], "harness": s["harness"], "status": s["status"]}))
+                .map(|s| json!({"name": s["name"], "project": s["project"], "harness": s["harness"], "status": s["status"], "branch": s["branch"]}))
                 .collect()
         }),
         "/api/screen" => {

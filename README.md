@@ -27,7 +27,7 @@ The real-tmux suites start their own servers in temporary state directories. Eac
 B=target/release/pctl T=$(command -v tmux); mkdir -p test-results
 for s in integration collaboration_integration msg_workflow_integration orchestration_integration \
          session_integration sidebar_integration sidebar_recovery snapshot_batch_integration \
-         team_context_preflight tmux_encoding_integration wake_integration web_integration; do
+         team_context_preflight tmux_encoding_integration wake_integration web_integration worktree_integration; do
   python3 tests/$s.py --bin $B --tmux $T --report test-results/$s.json >test-results/$s.out 2>&1; echo "$s exit $?"
 done
 python3 tests/remote_quoting.py --bin $B; echo "remote_quoting exit $?"
@@ -40,6 +40,10 @@ pctl starts its tmux server only for a caller in a Herdr pane (`HERDR_ENV=1`) or
 ## Web page
 
 `pctl web --listen <tailscale-ip>:<port> --token-file <0600 file>` serves a phone page to list sessions, read one screen and type a line. It refuses other addresses, needs the token for every API call and refuses input to blocked sessions. See CLI.md.
+
+## Worktree workers
+
+`pctl session add --name <name> --cwd <repo> --worktree <branch> [--base <ref>] [--model <provider/model>] -- <argv>` creates the branch, makes the worktree `<repo>-wt-<name>` and runs the session there. `--model` sets an OpenCode session's model. `pctl worktree list` shows each worktree's branch, base, dirty files, commits ahead and whether it is merged. `pctl worktree remove <name>` moves a stopped, clean, merged worktree to the trash, deletes the merged branch and unregisters the session. It refuses anything else. See CLI.md.
 
 ## Lite package
 

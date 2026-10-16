@@ -303,9 +303,42 @@ This convenience addresses an observed small-model error in the frozen0.3 test. 
 - `--listen` accepts loopback or a Tailscale address only (100.64.0.0/10, fd7a:115c:a1e0::/48). `0.0.0.0`, `::`, LAN and public addresses are refused. Port 0 picks a free port. Once bound it prints `{"listening":"<addr>"}`.
 - The token file must be a regular file with no group or other access (0600) holding at least 32 visible ASCII characters. The token is never printed or logged.
 - `GET /`, `/app.js` and `/app.css` carry no data. The API is `POST` with a JSON body and `Authorization: Bearer <token>`. A wrong or missing token gets 401 after one second.
-  - `/api/sessions` → `[{name,project,harness,status}]`
+  - `/api/sessions` → `[{name,project,harness,status,branch}]` (`branch` is null outside a worktree)
   - `/api/screen` `{name, lines}` (default 60, 1–500) → `{name,status,text}`
   - `/api/prompt` `{name, text}` → the `session prompt` result. A blocked session is refused with 409; other errors are 400 with `error` and `error_code`.
 - The page never switches sessions by itself. The log line per request is time, method, path and status only.
 - HTTP is plain: use it over Tailscale (WireGuard) or loopback only.
+
+## Worktree workers
+
+`pctl session add --name <name> --cwd <repo> --worktree <branch> [--base <ref>] [--model <provider/model>] -- <argv>` gives a worker its own branch and checkout.
+
+- The worktree is `<repo>-wt-<name>` beside the repository's main worktree. The session runs there. Its project defaults to the repository's folder name.
+- `<branch>` is new and starts at `--base`. The base defaults to the branch checked out at `--cwd`. The branch has no upstream.
+- These are refused before anything is created:
+  - an existing branch;
+  - an existing folder, or a path git still lists (locked or prunable);
+  - uncommitted or untracked changes in the `--cwd` checkout when it is the base;
+  - a detached HEAD without `--base`, or a bare repository;
+  - a session name other than letters, digits, `-`, `_` and `.`.
+- `--model` is for OpenCode. OpenCode 2's TUI has no model flag. Its shared background service ignores the caller's environment and keeps a folder's config from first use. pctl therefore launches `env OPENCODE_CONFIG_CONTENT={"model":"<model>"} <argv> --standalone`, a private OpenCode server. No file is written to the worktree. Other harnesses take their model flag in `<argv>`.
+- `session list`/`get` show `branch` for these sessions.
+
+`pctl worktree list` → `[{session,status,path,branch,base,exists,checked_out,dirty,ahead,merged,locked}]`
+- `dirty` counts changed and untracked files.
+- `ahead` counts the commits in `base..branch`.
+- `merged` means the branch is an ancestor of the base.
+
+`pctl worktree remove <name>` refuses unless all of these hold:
+- the session has no run (`agent terminate` first);
+- the worktree is unlocked, still on its branch, and clean;
+- the branch is merged into its base.
+
+It then:
+1. moves the folder to `~/.Trash/<folder>-<unix time>`;
+2. runs `git worktree prune`;
+3. deletes the branch with `git branch -d` (kept, with git's reason, if git refuses);
+4. unregisters the session.
+
+There is no `--force`. Nothing is deleted outright.
 

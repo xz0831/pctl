@@ -18,6 +18,7 @@ pub mod terminal_input;
 pub mod theme;
 pub mod ui;
 pub mod web;
+pub mod worktree;
 
 pub fn now() -> u64 {
     SystemTime::now()
@@ -58,6 +59,9 @@ pub struct Agent {
     /// Harness conversation ID (Claude session, Codex thread); starts resume it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// Set when `session add --worktree` created the session's git worktree (cwd).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<worktree::Worktree>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Run {
@@ -419,6 +423,7 @@ impl Core {
             input_mode: native_input(),
             collaboration_mode: collaboration::disabled_collaboration(),
             conversation: None,
+            worktree: None,
         };
         r.agents.push(a.clone());
         self.save(&r)?;

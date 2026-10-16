@@ -84,8 +84,8 @@ try:
         code, _, body = call(base, '/api/sessions')
         v = json.loads(body); assert code == 200, body
         assert {s['name']: s['status'] for s in v} == {'p-shell': 'idle', 'b-block': 'blocked', 'm-menu': 'blocked'}, v
-        assert all(set(s) == {'name', 'project', 'harness', 'status'} for s in v), v
-    case('lists sessions with name, project, harness and status only', listing)
+        assert all(set(s) == {'name', 'project', 'harness', 'status', 'branch'} for s in v), v
+    case('lists sessions with name, project, harness, status and branch only', listing)
     def read_and_type():
         code, _, body = call(base, '/api/screen', {'name': 'p-shell', 'lines': 5})
         assert code == 200 and json.loads(body)['status'] == 'idle' and '> ' in json.loads(body)['text'], body
