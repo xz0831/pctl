@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real tmux integration suite. Every server is isolated and removed by this script."""
 import argparse, concurrent.futures, json, os, pathlib, shutil, subprocess, tempfile, time, shlex
+os.environ['HERDR_ENV'] = '1'  # Only disposable test servers bypass the Herdr startup gate.
 parser=argparse.ArgumentParser(); parser.add_argument('--bin',required=True); parser.add_argument('--tmux',required=True);parser.add_argument('--report',default='test-results/integration.json');args=parser.parse_args()
 B=str(pathlib.Path(args.bin).resolve()); T=str(pathlib.Path(args.tmux).resolve()); root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-it-',dir=os.path.realpath('/tmp'))); state=root/'state'; results=[]
 def cli(*a,ok=True):
