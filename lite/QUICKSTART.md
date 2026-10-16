@@ -4,7 +4,7 @@ pctl runs interactive coding agents (any terminal CLI) in tmux panes, addressed 
 
 ## Requirements
 - Linux x86_64. The binary is statically linked, so it needs no glibc or other libraries.
-- tmux 3.0a or newer, on PATH or set with `PCTL_TMUX`
+- tmux 3.8 or newer, on PATH or set with `PCTL_TMUX`
 - bash, only for `smoke.sh`
 
 ## Your part (people, not pctl)
