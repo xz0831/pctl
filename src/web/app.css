@@ -1,0 +1,14 @@
+:root { color-scheme: light dark; --bg: #fff; --fg: #111; --muted: #666; --line: #ddd; --pre: #f4f4f4; }
+@media (prefers-color-scheme: dark) { :root { --bg: #111; --fg: #eee; --muted: #999; --line: #333; --pre: #1c1c1c; } }
+body { margin: 0; padding: 0 16px 16px; background: var(--bg); color: var(--fg); font: 16px/1.4 system-ui, sans-serif; }
+header { position: sticky; top: 0; display: flex; gap: 8px; align-items: center; padding: 8px 0; background: var(--bg); border-bottom: 1px solid var(--line); }
+button { min-height: 44px; padding: 8px 12px; font: inherit; }
+input, textarea { box-sizing: border-box; width: 100%; margin: 8px 0; font: 16px ui-monospace, Menlo, monospace; }
+ul { list-style: none; margin: 0; padding: 0; }
+li { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--line); }
+small, #where, #note { color: var(--muted); }
+pre { max-height: 60vh; margin: 8px 0; padding: 8px; overflow: auto; white-space: pre; background: var(--pre); font: 12px/1.35 ui-monospace, Menlo, monospace; }
+.st { padding: 2px 6px; border-radius: 4px; background: var(--line); font-size: 14px; }
+.st.idle { background: #15803d; color: #fff; }
+.st.working { background: #1d4ed8; color: #fff; }
+.st.blocked { background: #b91c1c; color: #fff; }

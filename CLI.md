@@ -295,3 +295,17 @@ Use this only when you intend to acknowledge receipt of the unique existing dire
 Zero matches returns not-found. Multiple direct replies returns ambiguous_reply, including when an older matching reply is already acknowledged. It never chooses the newest silently. Read inbox and make an explicit message-ID decision when ambiguous. Repeating a successful operation against a still-unique reply returns the same receipt; a later second reply makes it ambiguous rather than advancing to new mail. There is no wait, subscription, bulk acknowledgment, or future-mail acknowledgment. General message ack is unchanged and still requires the actual received message.id, never an outgoing ID or correlation_id.
 
 This convenience addresses an observed small-model error in the frozen0.3 test. It does not retroactively turn that failed attempt into success. Its own0.4 contract tests and any later actual harness use are separately recorded.
+
+## Optional web page (`pctl web`)
+
+`pctl web --listen <IP:PORT> --token-file <file>` serves a small phone page: the session list, one session's screen (refreshed every 3 seconds while open), and a line of input. It runs only while started and never starts the tmux server.
+
+- `--listen` accepts loopback or a Tailscale address only (100.64.0.0/10, fd7a:115c:a1e0::/48). `0.0.0.0`, `::`, LAN and public addresses are refused. Port 0 picks a free port. Once bound it prints `{"listening":"<addr>"}`.
+- The token file must be a regular file with no group or other access (0600) holding at least 32 visible ASCII characters. The token is never printed or logged.
+- `GET /`, `/app.js` and `/app.css` carry no data. The API is `POST` with a JSON body and `Authorization: Bearer <token>`. A wrong or missing token gets 401 after one second.
+  - `/api/sessions` → `[{name,project,harness,status}]`
+  - `/api/screen` `{name, lines}` (default 60, 1–500) → `{name,status,text}`
+  - `/api/prompt` `{name, text}` → the `session prompt` result. A blocked session is refused with 409; other errors are 400 with `error` and `error_code`.
+- The page never switches sessions by itself. The log line per request is time, method, path and status only.
+- HTTP is plain: use it over Tailscale (WireGuard) or loopback only.
+
