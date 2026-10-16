@@ -341,6 +341,22 @@ Shortcuts:
   - Keys look like `ctrl+b`, `alt+right`, `shift+c`, `f2` or `?`; a `prefix+` in front means after the prefix.
 - Unknown names and bad keys are reported in the status line, and the default is kept.
 
+Themes:
+- Built-in: `portal`, `garage`, `nebula`, `void`, `lab`, `classic`, `mono`. `pctl theme <name>` sets one per state (`appearance.json`); the app's `◐ Theme` button and `ctrl+b t` do the same.
+- Each theme also colours the terminal area: the default background and text, and the 16 ANSI colours. 256-colour and RGB output is left as the agent sent it. `classic` and `mono` keep the terminal's own colours.
+- Your own themes are files `$XDG_CONFIG_HOME/pctl/themes/<name>.toml` or `~/.config/pctl/themes/<name>.toml`.
+  - Names use a-z, 0-9, `-` and `_`, and must differ from the built-in themes.
+  - Each file is at most 16 KiB.
+  - The format is flat `key = "value"` lines:
+    - `base` (a built-in theme to start from)
+    - `about`
+    - `bg`, `panel`, `raised`, `text`, `muted`, `border`, `accent`, `cyan`, `warn`, `danger`, `ink`, `term_bg`, `term_fg` as `#rrggbb`, or `default` for the terminal's own colour
+    - `ansi = [16 colours]`
+  - Missing keys come from `base`. Problems are reported and the base colour is kept.
+- `pctl theme --new NAME [--from BASE]` writes a filled template and refuses to overwrite. `pctl theme --list` prints the built-in and your own themes, the folder, and any warnings.
+- A theme of your own applies to the app and is remembered in `app-view.json`. The tmux chrome of a plain `attach` keeps the state's built-in theme.
+- `[ui]` with `wit = false` in `config.toml` replaces the jokes with plain text (loading, empty screens, the stop question's last clause, tips, goodbye).
+
 Other behaviour:
 - The last project and tabs are kept in `<state>/app-view.json`.
 - Leaving the app stops nothing.

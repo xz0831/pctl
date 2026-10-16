@@ -24,12 +24,13 @@ pub enum Action {
     RestartAgent,
     ToggleSidebar,
     FocusSidebar,
+    Theme,
     Help,
     Detach,
 }
 
 /// Name in the config file, default key, and what the help screen says.
-pub const ACTIONS: [(&str, &str, Action, &str); 11] = [
+pub const ACTIONS: [(&str, &str, Action, &str); 12] = [
     (
         "new_tab",
         "prefix+c",
@@ -74,6 +75,7 @@ pub const ACTIONS: [(&str, &str, Action, &str); 11] = [
         Action::FocusSidebar,
         "Move between projects and agents with the keyboard",
     ),
+    ("theme", "prefix+t", Action::Theme, "Pick a colour theme"),
     ("help", "prefix+?", Action::Help, "Show shortcuts"),
     (
         "detach",
@@ -183,6 +185,8 @@ pub struct Keymap {
     pub prefix: Key,
     pub binds: Vec<(bool, Key, Action)>,
     pub source: String,
+    /// `[ui] wit = false` turns the jokes into plain text.
+    pub wit: bool,
 }
 impl Keymap {
     pub fn defaults() -> Self {
@@ -229,6 +233,7 @@ impl Keymap {
                 prefix,
                 binds,
                 source: String::new(),
+                wit: true,
             },
             warn,
         )
@@ -246,8 +251,11 @@ impl Keymap {
         let Ok(text) = std::fs::read_to_string(&path) else {
             return (Self::defaults(), vec![]);
         };
-        let (mut map, warn) = Self::from_pairs(&keys_section(&text));
+        let (mut map, warn) = Self::from_pairs(&section(&text, "keys"));
         map.source = path.to_string_lossy().into();
+        map.wit = !section(&text, "ui")
+            .iter()
+            .any(|(k, v)| k == "wit" && v == "false");
         (map, warn)
     }
     pub fn action(&self, prefixed: bool, e: &KeyEvent) -> Option<Action> {
@@ -271,8 +279,8 @@ impl Keymap {
     }
 }
 
-/// `name = "value"` pairs under `[keys]`; comments and other sections are skipped.
-fn keys_section(text: &str) -> Vec<(String, String)> {
+/// `name = "value"` pairs under `[name]`; comments and other sections are skipped.
+fn section(text: &str, name: &str) -> Vec<(String, String)> {
     let mut in_keys = false;
     let mut out = Vec::new();
     for line in text.lines() {
@@ -281,7 +289,7 @@ fn keys_section(text: &str) -> Vec<(String, String)> {
             continue;
         }
         if line.starts_with('[') {
-            in_keys = line == "[keys]";
+            in_keys = line == format!("[{name}]");
             continue;
         }
         if let (true, Some((k, v))) = (in_keys, line.split_once('=')) {
@@ -324,8 +332,9 @@ mod tests {
             None,
             "needs the prefix"
         );
-        let (m, warn) = Keymap::from_pairs(&keys_section(
+        let (m, warn) = Keymap::from_pairs(&section(
             "[ui]\nnext_tab = \"x\"\n[keys]\n# comment\nprefix = \"ctrl+a\"\nnext_tab = \"alt+right\" # direct\nhelp = \"prefix+f1\"\nbogus = \"x\"\nprev_tab = \"ctrl+\"\n",
+            "keys",
         ));
         assert_eq!(
             m.prefix,

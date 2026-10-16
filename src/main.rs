@@ -31,8 +31,19 @@ enum Cmd {
         cmd: pctl::orchestration::Command,
     },
     /// Inspect or save a state-local visual theme (no agent controls).
+    /// Show or set the built-in theme; --new writes your own theme file to edit; --list shows all.
     Theme {
         name: Option<pctl::theme::ThemeName>,
+        /// Write ~/.config/pctl/themes/NAME.toml (or under $XDG_CONFIG_HOME) to edit; the app's
+        /// theme picker shows it.
+        #[arg(long, value_name = "NAME", conflicts_with = "name")]
+        new: Option<String>,
+        /// The built-in theme a new file starts from (default portal).
+        #[arg(long, requires = "new")]
+        from: Option<pctl::theme::ThemeName>,
+        /// Built-in themes and your own, with any problems in the files.
+        #[arg(long, conflicts_with_all = ["name", "new"])]
+        list: bool,
     },
     Project {
         #[command(subcommand)]
@@ -688,11 +699,34 @@ fn run() -> Result<()> {
         core.set_theme(theme)?;
     }
     match cmd {
-        Cmd::Theme { name } => {
-            if let Some(theme) = name {
-                core.set_theme(theme)?;
+        Cmd::Theme {
+            name,
+            new,
+            from,
+            list,
+        } => {
+            use pctl::theme::{ThemeName, custom};
+            if let Some(n) = new {
+                let path = custom::create(&n, from.unwrap_or_default())?;
+                print(
+                    &json!({"created": path, "next": "edit the colours, then pick it from ◐ Theme in pctl"}),
+                )?;
+            } else if list {
+                let (mine, warnings) = custom::load_all();
+                print(&json!({
+                    "built_in": ThemeName::ALL.iter().map(|t| json!({"name": t.label().to_lowercase(), "about": t.about()})).collect::<Vec<_>>(),
+                    "yours": mine.iter().map(|c| json!({"name": c.name, "about": c.about})).collect::<Vec<_>>(),
+                    "folder": custom::dir(),
+                    "warnings": warnings,
+                }))?;
+            } else {
+                if let Some(theme) = name {
+                    core.set_theme(theme)?;
+                }
+                print(
+                    &json!({"theme": core.theme()?, "config": core.state.join("appearance.json")}),
+                )?;
             }
-            print(&json!({"theme": core.theme()?, "config": core.state.join("appearance.json")}))?;
         }
         Cmd::Doctor => print(&core.doctor())?,
         Cmd::Team { cmd } => print(&pctl::orchestration::run(&core, cmd)?)?,

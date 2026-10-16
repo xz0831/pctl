@@ -4,9 +4,15 @@
 //! Shortcuts come from `keys` and can be changed in a config file. tmux stays behind the app and
 //! keeps the agents running; leaving the app stops nothing.
 mod keys;
+mod quips;
 mod term;
 
-use crate::{Core, human::literal, theme::Palette, ui::TerminalGuard};
+use crate::{
+    Core,
+    human::literal,
+    theme::{Palette, ThemeName},
+    ui::TerminalGuard,
+};
 use anyhow::Result;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -17,7 +23,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
@@ -56,6 +62,7 @@ enum Hit {
     NewTab(String),
     NewProject,
     Terminal,
+    Theme,
     Help,
     Detach,
     Start(String, bool),
@@ -75,6 +82,8 @@ enum Act {
     Remove(String),
     NewAgent(String),
     NewTab(String),
+    Theme(ThemeName),
+    Custom(String),
 }
 
 struct Field {
@@ -134,6 +143,10 @@ enum SideRow {
 
 struct App {
     pal: Palette,
+    theme: ThemeName,
+    /// A theme file of the person's own (`pctl theme --new`), when one is picked.
+    custom: Option<String>,
+    customs: Vec<crate::theme::custom::Custom>,
     keys: Keymap,
     projects: Vec<(String, String)>,
     agents: Vec<Agent>,
@@ -164,7 +177,7 @@ struct App {
 /// agent goes through `session add`, which keeps its own start rules.
 pub fn run(core: &Core) -> Result<()> {
     let (keys, warnings) = Keymap::load();
-    let mut app = App::new(core.theme()?.palette(), keys);
+    let mut app = App::new(core.theme()?, keys);
     // Come back where the person left: last project and each project's tab (per viewer, not
     // shared state; a missing or bad file just means the first project).
     let place = core.state.join("app-view.json");
@@ -177,6 +190,13 @@ pub fn run(core: &Core) -> Result<()> {
                 .iter()
                 .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
                 .collect();
+        }
+        if let Some(name) = v["theme"].as_str() {
+            app.customs = crate::theme::custom::load_all().0;
+            if let Some(c) = app.customs.iter().find(|c| c.name == name) {
+                app.pal = c.palette;
+                app.custom = Some(name.to_string());
+            }
         }
     }
     if !warnings.is_empty() {
@@ -210,33 +230,40 @@ pub fn run(core: &Core) -> Result<()> {
             }
         }
     });
-    let _guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    terminal.clear()?;
-    while !app.quit {
-        while let Ok(u) = rx.try_recv() {
-            app.apply(u);
-        }
-        if app.view.next.is_none_or(|t| Instant::now() >= t) {
-            app.capture(core);
-        }
-        terminal.draw(|f| app.render(f))?;
-        if event::poll(Duration::from_millis(40))? {
-            let ev = event::read()?;
-            app.handle(core, ev);
+    {
+        let _guard = TerminalGuard::enter()?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        terminal.clear()?;
+        while !app.quit {
+            while let Ok(u) = rx.try_recv() {
+                app.apply(u);
+            }
+            if app.view.next.is_none_or(|t| Instant::now() >= t) {
+                app.capture(core);
+            }
+            terminal.draw(|f| app.render(f))?;
+            if event::poll(Duration::from_millis(40))? {
+                let ev = event::read()?;
+                app.handle(core, ev);
+            }
         }
     }
+    println!("{}", quips::goodbye(app.keys.wit));
     let _ = std::fs::write(
         &place,
-        serde_json::json!({"project": app.project, "tabs": app.tab}).to_string(),
+        serde_json::json!({"project": app.project, "tabs": app.tab, "theme": app.custom})
+            .to_string(),
     );
     Ok(())
 }
 
 impl App {
-    fn new(pal: Palette, keys: Keymap) -> Self {
+    fn new(theme: ThemeName, keys: Keymap) -> Self {
         Self {
-            pal,
+            pal: theme.palette(),
+            theme,
+            custom: None,
+            customs: vec![],
             keys,
             projects: vec![],
             agents: vec![],
@@ -564,6 +591,13 @@ impl App {
                     })
                     .unwrap_or(0);
             }
+            Action::Theme => {
+                let (w, h) = (
+                    self.term.x + self.term.width,
+                    self.term.y + self.term.height,
+                );
+                self.theme_menu(w.saturating_sub(70), h.saturating_sub(10));
+            }
             Action::Help => self.modal = Some(Modal::Help),
             Action::Detach => self.quit = true,
         }
@@ -689,6 +723,13 @@ impl App {
             Hit::NewProject => self.project_form(),
             Hit::Terminal => self.in_sidebar = false,
             Hit::Help => self.modal = Some(Modal::Help),
+            Hit::Theme => {
+                let (w, h) = (
+                    self.term.x + self.term.width,
+                    self.term.y + self.term.height,
+                );
+                self.theme_menu(w.saturating_sub(70), h.saturating_sub(9));
+            }
             Hit::Detach => self.quit = true,
             Hit::Start(a, new) => self.run_act(core, Act::Start(a, new)),
             Hit::SidebarEdge => self.drag = true,
@@ -769,11 +810,54 @@ impl App {
             other => self.run_act(core, other),
         }
     }
+    fn theme_menu(&mut self, x: u16, y: u16) {
+        // Read the theme folder again, so a file made a moment ago shows up.
+        let (customs, warnings) = crate::theme::custom::load_all();
+        self.customs = customs;
+        if !warnings.is_empty() {
+            self.say(format!("Theme files: {}", warnings.join("; ")));
+        }
+        let builtin = !self.custom.is_some();
+        let mut items: Vec<(String, Act)> = ThemeName::ALL
+            .iter()
+            .map(|t| {
+                let on = if builtin && *t == self.theme {
+                    "●"
+                } else {
+                    "○"
+                };
+                (
+                    format!("{on} {:<8} {}", t.label().to_lowercase(), t.about()),
+                    Act::Theme(*t),
+                )
+            })
+            .collect();
+        for c in &self.customs {
+            let on = if self.custom.as_deref() == Some(c.name.as_str()) {
+                "●"
+            } else {
+                "○"
+            };
+            items.push((
+                format!("{on} {:<8} {} (yours)", c.name, c.about),
+                Act::Custom(c.name.clone()),
+            ));
+        }
+        let sel = items
+            .iter()
+            .position(|(t, _)| t.starts_with('●'))
+            .unwrap_or(0);
+        self.modal = Some(Modal::Menu {
+            title: "Theme".into(),
+            items,
+            x,
+            y,
+            sel,
+        });
+    }
     fn confirm_stop(&mut self, a: &str) {
         self.modal = Some(Modal::Confirm {
-            text: format!(
-                "Stop {a}? Its process ends; Start brings it back in the same conversation."
-            ),
+            text: quips::stop_question(self.keys.wit, a),
             button: "Stop",
             act: Act::Stop(a.to_string()),
         });
@@ -800,6 +884,22 @@ impl App {
                 self.new_tab(core, p);
                 return;
             }
+            Act::Theme(t) => core.set_theme(*t).map(|_| {
+                self.theme = *t;
+                self.custom = None;
+                self.pal = t.palette();
+                format!("Theme: {} — {}", t.label().to_lowercase(), t.about())
+            }),
+            Act::Custom(name) => match self.customs.iter().find(|c| &c.name == name) {
+                Some(c) => {
+                    self.pal = c.palette;
+                    self.custom = Some(name.clone());
+                    Ok(format!("Theme: {name} — {}", c.about))
+                }
+                None => Err(anyhow::anyhow!(
+                    "theme {name} is gone from the theme folder"
+                )),
+            },
         };
         match r {
             Ok(msg) => self.say(msg),
@@ -1391,15 +1491,17 @@ impl App {
             app.hit(b, hit);
         };
         if !self.loaded {
-            center(f, vec![Line::from("Loading…")]);
+            center(f, vec![Line::from(quips::loading(self.keys.wit))]);
             return;
         }
         let Some(project) = self.project.clone() else {
+            let [hello, line] = quips::welcome(self.keys.wit);
             let mut lines = vec![
                 Line::from(Span::styled(
-                    "Welcome to pctl",
+                    hello,
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
+                Line::from(line),
                 Line::from(""),
             ];
             if !self.connected {
@@ -1410,8 +1512,6 @@ impl App {
                 lines.push(Line::from(
                     "without Herdr start pctl with PCTL_STANDALONE=1, then add a project.",
                 ));
-            } else {
-                lines.push(Line::from("Add a project, then its first agent."));
             }
             lines.push(Line::from(""));
             let y = center(f, lines);
@@ -1423,6 +1523,7 @@ impl App {
                 f,
                 vec![
                     Line::from(format!("No agents in {project} yet.")),
+                    Line::from(quips::empty_project(self.keys.wit)),
                     Line::from(""),
                 ],
             );
@@ -1461,10 +1562,19 @@ impl App {
         if self.view.pane != a.pane.clone().unwrap_or_default() {
             return;
         }
+        // The theme colours the terminal too: default background and text, and the 16 ANSI
+        // colours; 256-colour and RGB output from the agent is left as it is.
+        let (tbg, tfg, ansi) = (p.term_bg, p.term_fg, p.ansi);
+        let tone = |c: Option<Color>, default: Color| match c {
+            None | Some(Color::Reset) => default,
+            Some(Color::Indexed(n)) if n < 16 => ansi.map_or(Color::Indexed(n), |a| a[n as usize]),
+            Some(c) => c,
+        };
         let buf = f.buffer_mut();
         for y in r.y..r.y + r.height {
             for x in r.x..r.x + r.width {
                 buf[(x, y)].reset();
+                buf[(x, y)].set_style(Style::default().fg(tfg).bg(tbg));
             }
         }
         for (i, row) in self.view.rows.iter().take(r.height as usize).enumerate() {
@@ -1474,7 +1584,12 @@ impl App {
                 if x >= r.x + r.width {
                     break;
                 }
-                let (nx, _) = buf.set_stringn(x, y, text, (r.x + r.width - x) as usize, *style);
+                let style = Style {
+                    fg: Some(tone(style.fg, tfg)),
+                    bg: Some(tone(style.bg, tbg)),
+                    ..*style
+                };
+                let (nx, _) = buf.set_stringn(x, y, text, (r.x + r.width - x) as usize, style);
                 x = nx;
             }
         }
@@ -1517,13 +1632,7 @@ impl App {
             left.push(Span::styled(g, gs));
             left.push(Span::raw(format!(" {} {}", a.name, a.status)));
         }
-        let blocked = self.agents.iter().filter(|a| a.status == "blocked").count();
-        if blocked > 0 {
-            left.push(Span::styled(
-                format!("   ! {blocked} waiting for you"),
-                Style::default().fg(p.danger).add_modifier(Modifier::BOLD),
-            ));
-        }
+        // A fresh notice or the prefix hint goes first: it lasts seconds and may matter more.
         if self.prefix {
             left.push(Span::styled(
                 format!("   {} …", self.keys.prefix.label()),
@@ -1535,16 +1644,25 @@ impl App {
                 Style::default().fg(p.warn),
             ));
         }
-        let (help, leave) = (" ? Help ", " ⏏ Leave ");
-        let hw = help.chars().count() as u16;
-        let lw = leave.chars().count() as u16;
-        let buttons = r.width > hw + lw + 20;
+        let blocked = self.agents.iter().filter(|a| a.status == "blocked").count();
+        if blocked > 0 {
+            left.push(Span::styled(
+                format!("   {}", quips::waiting(self.keys.wit, blocked)),
+                Style::default().fg(p.danger).add_modifier(Modifier::BOLD),
+            ));
+        }
+        let buttons = [
+            (" ◐ Theme ", Hit::Theme),
+            (" ? Help ", Hit::Help),
+            (" ⏏ Leave ", Hit::Detach),
+        ];
+        let bw: u16 = buttons
+            .iter()
+            .map(|(t, _)| t.chars().count() as u16 + 1)
+            .sum();
+        let show = r.width > bw + 20;
         // The text stops before the buttons and ends with "…" instead of running under them.
-        let room = if buttons {
-            r.width - hw - lw - 2
-        } else {
-            r.width
-        } as usize;
+        let room = if show { r.width - bw } else { r.width } as usize;
         let total: usize = left.iter().map(|s| s.content.chars().count()).sum();
         if total > room {
             let mut kept = Vec::new();
@@ -1581,27 +1699,19 @@ impl App {
                 ..r
             },
         );
-        if buttons {
-            let lr = Rect {
-                x: r.x + r.width - lw,
-                width: lw,
-                ..r
-            };
-            let hr = Rect {
-                x: lr.x - hw - 1,
-                width: hw,
-                ..r
-            };
-            f.render_widget(
-                Paragraph::new(help).style(Style::default().fg(p.text).bg(p.raised)),
-                hr,
-            );
-            f.render_widget(
-                Paragraph::new(leave).style(Style::default().fg(p.text).bg(p.raised)),
-                lr,
-            );
-            self.hit(hr, Hit::Help);
-            self.hit(lr, Hit::Detach);
+        if show {
+            let mut x = r.x + r.width;
+            for (text, hit) in buttons.into_iter().rev() {
+                let w = text.chars().count() as u16;
+                x -= w;
+                let b = Rect { x, width: w, ..r };
+                f.render_widget(
+                    Paragraph::new(text).style(Style::default().fg(p.text).bg(p.raised)),
+                    b,
+                );
+                self.hit(b, hit);
+                x -= 1;
+            }
         }
     }
 
@@ -1669,7 +1779,7 @@ impl App {
                     Style::default().fg(p.muted),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "Any key closes this.",
+                    quips::tip(self.keys.wit),
                     Style::default().fg(p.muted),
                 )));
                 let h = lines.len() as u16 + 2;
@@ -1678,14 +1788,22 @@ impl App {
                 f.render_widget(Paragraph::new(lines), inner(r));
             }
             Modal::Confirm { text, button, .. } => {
-                let r = centered(area, (text.chars().count() as u16 + 6).clamp(40, 90), 6);
+                let w = (text.chars().count() as u16 + 6).clamp(40, 72);
+                let lines = (text.chars().count() as u16).div_ceil(w - 4).max(1);
+                let r = centered(area, w, lines + 5);
                 boxed(f, r, "Confirm");
                 let i = inner(r);
-                f.render_widget(Paragraph::new(text.clone()), Rect { height: 1, ..i });
+                f.render_widget(
+                    Paragraph::new(text.clone()).wrap(ratatui::widgets::Wrap { trim: true }),
+                    Rect {
+                        height: lines + 1,
+                        ..i
+                    },
+                );
                 self.buttons(
                     f,
                     Rect {
-                        y: i.y + 2,
+                        y: i.y + lines + 1,
                         height: 1,
                         ..i
                     },

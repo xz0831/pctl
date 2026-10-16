@@ -37,7 +37,7 @@ def app(st=None, env=None):
     envs = ' '.join(f'{k}={v}' for k, v in (env or {}).items())
     cmd = f"env -u TMUX -u HERDR_ENV {envs} {B} --state {st or state} --tmux {T}; echo EXITED $?; sleep 600"
     subprocess.run([T, '-S', str(V), '-f', '/dev/null', 'new-session', '-d', '-x', '110', '-y', '26', '-s', 'view', cmd], env=ENV, check=True, timeout=10)
-    assert until(lambda: 'PROJECTS' in screen() and 'Loading' not in screen()), screen()
+    assert until(lambda: '+ agent' in screen() or 'Welcome to pctl' in screen()), screen()
 def find(text, row=None, start=0):
     """1-based (column, row) of the middle of `text`; columns count characters as tmux shows them."""
     for i, line in enumerate(lines()):
@@ -152,6 +152,39 @@ try:
         before = status()
         keys('M-Right'); assert until(lambda: status() != before and 'a-main' in status()), (before, status())
     case('shortcuts come from the config file; bad names are reported', config)
+    def themes():
+        app()
+        click(*find('◐ Theme'))
+        assert until(lambda: 'Theme' in screen() and 'nebula' in screen() and 'mono' in screen()), screen()
+        click(*find('nebula'))
+        assert until(lambda: 'Theme: nebula' in status()), status()
+        assert json.loads((state / 'appearance.json').read_text())['theme'] == 'nebula'
+        colored = vt('capture-pane', '-p', '-e', '-t', 'view')
+        assert '48;2;24;18;42' in colored, 'the terminal area takes the theme background'
+        keys('C-b', 't'); assert until(lambda: '● nebula' in screen()), screen()
+        keys('Escape')
+        cli('theme', 'portal')
+    case('the Theme button and ctrl+b t pick a theme; the terminal area follows it', themes)
+    def own_theme():
+        env = dict(ENV, XDG_CONFIG_HOME=str(cfg))
+        q = subprocess.run([B, '--state', str(state), '--tmux', T, 'theme', '--new', 'sunrise', '--from', 'garage'], text=True, capture_output=True, env=env, timeout=30)
+        made = pathlib.Path(json.loads(q.stdout)['created'])
+        assert made == cfg / 'pctl' / 'themes' / 'sunrise.toml' and 'term_bg' in made.read_text() and 'ansi = [' in made.read_text(), q
+        made.write_text(made.read_text().replace('term_bg  = "#1b1612"', 'term_bg  = "#203040"').replace('made from garage; say what makes it yours', 'early light'))
+        q = subprocess.run([B, '--state', str(state), '--tmux', T, 'theme', '--list'], text=True, capture_output=True, env=env, timeout=30)
+        listed = json.loads(q.stdout)
+        assert {'name': 'sunrise', 'about': 'early light'} in listed['yours'] and not listed['warnings'], listed
+        assert 'already exists' in subprocess.run([B, 'theme', '--new', 'sunrise'], text=True, capture_output=True, env=env).stderr
+        app(env={'XDG_CONFIG_HOME': cfg})
+        click(*find('◐ Theme'))
+        assert until(lambda: 'sunrise' in screen() and '(yours)' in screen()), screen()
+        click(*find('sunrise'))
+        assert until(lambda: 'Theme: sunrise' in status()), status()
+        assert '48;2;32;48;64' in vt('capture-pane', '-p', '-e', '-t', 'view'), 'the file colours the terminal'
+        click(*find('⏏ Leave')); assert until(lambda: 'EXITED 0' in screen())
+        app(env={'XDG_CONFIG_HOME': cfg})
+        assert until(lambda: '48;2;32;48;64' in vt('capture-pane', '-p', '-e', '-t', 'view')), 'still chosen after reopening'
+    case('pctl theme --new writes a theme file; edited, it shows in the picker and stays chosen', own_theme)
     def empty():
         other = root / 'e'
         app(st=other)

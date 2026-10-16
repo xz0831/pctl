@@ -77,6 +77,17 @@ next_tab = "alt+right"   # a key without the prefix
 new_agent = "prefix+g"
 ```
 
+Themes: `◐ Theme` (or `ctrl+b t`) picks one of the built-in themes:
+- `portal` (green), `garage` (amber), `nebula` (violet), `void` (deep blue)
+- `lab` (light)
+- `classic` (your terminal's own colours), `mono`
+
+The terminal area follows the chosen theme too.
+
+Make your own: `pctl theme --new mine --from garage` writes `~/.config/pctl/themes/mine.toml`, with every colour and a comment saying where it shows. Change the colours and pick `mine` from `◐ Theme`. `pctl theme --list` shows all themes and any problems in your files. Agents can make themes the same way. Keep your own themes in your own config folder; do not commit them here.
+
+A little dry humour shows up where nothing is at stake: loading, empty screens, tips, goodbye. It never appears in errors or anything agents read. `[ui]` with `wit = false` in the config file turns it off.
+
 `pctl` reopens on the project and tab you left. It never starts a server by itself; adding the first agent follows the same rule as `session add` (a Herdr pane or `PCTL_STANDALONE=1`). tmux still keeps the processes behind the app. `pctl attach [--project <name>]` opens a plain tmux client instead.
 
 ## Hosts without Herdr
