@@ -18,7 +18,7 @@ struct Args {
     /// Save a state-local appearance preset; existing UIs refresh automatically.
     #[arg(long, global = true)]
     theme: Option<pctl::theme::ThemeName>,
-    /// Without a command on an interactive terminal: open the running workspace (like herdr).
+    /// Without a command on an interactive terminal: open the pctl app (like herdr).
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -89,10 +89,11 @@ enum Cmd {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Attach to a project's tmux session at its manager window. Project name or ID.
+    /// Attach a plain tmux client: to a project's manager window (name or ID), or without
+    /// --project to the most recently used project. `pctl` alone opens the app instead.
     Attach {
         #[arg(long)]
-        project: String,
+        project: Option<String>,
     },
     /// Phone page: list sessions, read one screen, type a line. Off unless started; loopback or
     /// Tailscale address only; needs the token from a 0600 file.
@@ -642,8 +643,8 @@ fn run() -> Result<()> {
         }
     });
     let Some(cmd) = args.cmd.take() else {
-        // A person typed `pctl` alone: open the running workspace, like `herdr`. Agents and
-        // scripts have no terminal and keep getting the usage error.
+        // A person typed `pctl` alone: open the app, like `herdr`. Agents and scripts have no
+        // terminal and keep getting the usage error.
         use std::io::IsTerminal;
         if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
             <Args as clap::CommandFactory>::command()
@@ -657,7 +658,7 @@ fn run() -> Result<()> {
         if let Some(theme) = args.theme {
             core.set_theme(theme)?;
         }
-        if let Err(e) = core.open_default() {
+        if let Err(e) = pctl::app::run(&core) {
             eprintln!("pctl: {e:#}");
             std::process::exit(1);
         }
@@ -1085,7 +1086,10 @@ fn run() -> Result<()> {
                 print(&json!({"ok":true,"result":"client detached; agents retained"}))?
             }
         },
-        Cmd::Attach { project } => core.attach(&core.resolve_project(&project)?)?,
+        Cmd::Attach { project } => match project {
+            Some(p) => core.attach(&core.resolve_project(&p)?)?,
+            None => core.open_default()?,
+        },
         Cmd::Worktree { cmd } => match cmd {
             WorktreeCmd::List => print(&core.worktree_list()?)?,
             WorktreeCmd::Remove { name } => print(&core.worktree_remove(&name)?)?,

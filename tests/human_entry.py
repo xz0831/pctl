@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""The Herdr-like human entry over real tmux, driven through a pseudo-terminal: `pctl` alone is a
-usage error without a terminal and opens nothing without a server; on a terminal it attaches to the
-most recently used project at its last window; `attach --project` takes a name; tabs and the status
+"""The human entry over real tmux, driven through a pseudo-terminal: `pctl` alone is a usage error
+without a terminal (on one it opens the app: tests/app_integration.py); `pctl attach` without
+--project opens nothing without a server and otherwise attaches to the most recently used project at
+its last window; `attach --project` takes a name; tabs and the status
 line carry agent names and states (`session marks`), including a name ending in ';'; ^b s and ^b q
 are bound; inside another tmux it refuses instead of nesting."""
 import argparse, fcntl, json, os, pathlib, pty, struct, subprocess, tempfile, termios, threading, time
@@ -71,10 +72,10 @@ try:
         assert subprocess.run([T, '-S', str(other / 'tmux.sock'), 'ls'], capture_output=True).returncode != 0
     case('without a terminal, pctl alone is the usage error and starts nothing', no_terminal)
     def no_server():
-        t = Tty(st=other)
-        assert t.wait() == 1 and b'no PCTL server is running' in t.out, t.out
+        t = Tty('attach', st=other)
+        assert t.wait() == 2 and b'no PCTL server is running' in t.out, t.out
         assert subprocess.run([T, '-S', str(other / 'tmux.sock'), 'ls'], capture_output=True).returncode != 0, 'no server started'
-    case('on a terminal with no server it explains and starts none', no_server)
+    case('attach without a server explains and starts none', no_server)
     s = {n: add(n, p, f) for n, p, f in [('w-a1', 'alpha', None), ('w-a2', 'alpha', 'b-block'), ('w-semi;', 'alpha', 'semi'), ('w-b1', 'beta', None)]}
     assert until(lambda: cli('session', 'get', 'w-a2')['status'] == 'blocked')
     def names():
@@ -109,19 +110,19 @@ try:
         assert until(lambda: clients()[0][3] == win)
         detach(t, c)
         time.sleep(1.1)  # session_last_attached has one-second resolution
-        t = Tty(); c = attached(t)
+        t = Tty('attach'); c = attached(t)
         assert c[1] == 'alpha' and c[3] == win, ('most recent project, last window', c)
         detach(t, c)
         time.sleep(1.1)
         t = Tty('attach', '--project', 'beta'); detach(t, attached(t))
         time.sleep(1.1)
-        t = Tty(); c = attached(t)
+        t = Tty('attach'); c = attached(t)
         assert c[1] == 'beta', c
         detach(t, c)
-    case('pctl alone attaches to the most recently used project at its last window', alone)
+    case('attach without --project goes to the most recently used project at its last window', alone)
     def nested():
-        t = Tty(env={'TMUX': str(root / 'elsewhere.sock') + ',1,0'})
-        assert t.wait() == 1 and b'already inside another tmux' in t.out, t.out
+        t = Tty('attach', env={'TMUX': str(root / 'elsewhere.sock') + ',1,0'})
+        assert t.wait() == 2 and b'already inside another tmux' in t.out, t.out
         assert not clients()
     case('inside another tmux it refuses instead of nesting', nested)
     pathlib.Path(a.report).write_text(json.dumps({'results': results, 'passed': len(results)}, indent=1))

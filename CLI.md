@@ -309,22 +309,49 @@ This convenience addresses an observed small-model error in the frozen0.3 test. 
 - The page never switches sessions by itself. The log line per request is time, method, path and status only.
 - HTTP is plain: use it over Tailscale (WireGuard) or loopback only.
 
-## Human entry (`pctl` alone)
+## Human entry: the pctl app (`pctl` alone)
 
-`pctl` with no command, on an interactive terminal:
-- It attaches to the running PCTL server at the most recently attached project session (tmux `session_last_attached`, then activity), in that session's current window.
-- It never starts a server. Without one it exits 1 with how to start it.
-- Inside a pane of the same PCTL server, it switches the client. Inside any other tmux (`TMUX` set to another socket), it exits 1 instead of nesting.
-- Without a terminal on stdin and stdout, it is the usual missing-command usage error (exit 2).
+`pctl` with no command, on an interactive terminal, opens the pctl app. It is a full-screen TUI and not a tmux client. Without a terminal on stdin and stdout, `pctl` alone is the usual missing-command usage error (exit 2), so agents and scripts see no change.
 
-`pctl attach --project <name|id>` takes a project name or ID and opens that project's manager window.
+Screen:
+- **Sidebar:** projects and their sessions with states.
+- **Tab bar:** the current project's sessions, then `+`.
+- **Terminal:** tmux's own screen of the selected session, read with `capture-pane -e` about 8 times a second and redrawn. Its window is resized to the view. Keys go back with `send-keys` (text with `-l`, other keys by tmux name); a paste goes through a bracketed `paste-buffer`.
+- **Status line:** state, the number of sessions waiting for a person, notices, `? Help` and `⏏ Leave`.
 
-Display:
-- Agent windows carry `@pctl_tab` (the session name) and `@pctl_status`. Project sessions carry `@pctl_name`.
-- Window and session names are not changed, so no identity check changes.
-- The status line shows the project name and tabs `#I:<mark><name>`. Marks: `!` blocked, `*` working, `x` exited.
-- The status line reruns `pctl session marks` every 5 seconds, and only while a client is attached. That hidden command writes the window options and prints the totals across all projects.
-- Keys: `^b s` is `choose-tree` with names and states, `^b q` detaches, `^b m` opens the manager. Mouse stays on.
+Mouse (SGR mouse reporting):
+- Click opens a project, session or tab.
+- `+` opens a bash tab right away. It is a `session add` named `<project>-bash<n>` in the project folder, running bash with `-l`. bash is `$SHELL` when that is bash, else `/opt/homebrew/bin/bash`, `/usr/local/bin/bash` or `/bin/bash`.
+- `+ agent` opens the new-agent form:
+  - name and folder
+  - kind: bash, Claude Code, Codex, OpenCode or Command
+  - optional model: `--model` for Claude Code, `-m` for Codex, pctl's `--model` for OpenCode
+  - command (for Command)
+  - optional worktree branch
+- `[+]` adds a project.
+- Right-click on a session offers: restart in the same conversation, stop (asks first), start, start a new conversation, remove (asks first). Right-click on a project offers a new bash tab or a new agent.
+- An open dialog takes every click; nothing behind it reacts.
+- The wheel over the terminal scrolls back (`capture-pane -S/-E`). Any key returns to live.
+- Dragging the sidebar edge resizes it.
+
+Shortcuts:
+- Defaults are a prefix (`ctrl+b`) and a key: `c` new bash tab, `a` new agent, `shift+c` new project, `n`/`p` tabs, `1`–`9` tab N, `x` stop, `r` restart, `b` sidebar, `w` keyboard sidebar, `?` help, `q` leave. Prefix twice sends the prefix to the session.
+- Override them in `$XDG_CONFIG_HOME/pctl/config.toml` or `~/.config/pctl/config.toml`, under `[keys]`, with `name = "key"`.
+  - Names: `prefix`, `new_tab`, `new_agent`, `new_project`, `next_tab`, `prev_tab`, `stop_agent`, `restart_agent`, `toggle_sidebar`, `focus_sidebar`, `help`, `detach`.
+  - Keys look like `ctrl+b`, `alt+right`, `shift+c`, `f2` or `?`; a `prefix+` in front means after the prefix.
+- Unknown names and bad keys are reported in the status line, and the default is kept.
+
+Other behaviour:
+- The last project and tabs are kept in `<state>/app-view.json`.
+- Leaving the app stops nothing.
+- The app never starts a server. Adding a session goes through `session add`, which keeps its own server-start rule.
+
+`pctl attach --project <name|id>` attaches a plain tmux client at that project's manager window. Without `--project` it attaches at the most recently used project and window: it never starts a server, switches the client inside the same PCTL server, and refuses inside another tmux.
+
+tmux display for plain clients:
+- Agent windows carry `@pctl_tab` and `@pctl_status`. Project sessions carry `@pctl_name`.
+- The status line reruns the hidden `pctl session marks` every 5 seconds while a client is attached.
+- `^b s` is a names-and-state `choose-tree`, and `^b q` detaches.
 
 ## Worktree workers
 
