@@ -288,9 +288,11 @@ impl Core {
             "has_run: {name} still has a run; stop it first (pctl agent terminate)"
         );
         let (repo, path) = (Path::new(&w.repo), Path::new(&a.cwd));
+        // Any symlink on the way (the folder itself or a parent): git would answer for wherever it
+        // points, so the wrong folder's record could move.
         ensure!(
-            !fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()),
-            "symlink: {} is a symbolic link now; git would answer for wherever it points, so nothing is removed",
+            fs::canonicalize(path).map_or(true, |c| c == path),
+            "symlink: {} now goes through a symbolic link; nothing removed",
             a.cwd
         );
         ensure!(

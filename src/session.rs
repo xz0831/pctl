@@ -213,6 +213,10 @@ fn activity(raw: &str, title: &str) -> &'static str {
                 "approve",
                 "enter to confirm",
                 "esc to cancel",
+                "trust this folder",
+                // OpenCode's permission dialog: "Allow once / Always allow / Reject", no ❯ row.
+                "permission required",
+                "enter confirm",
             ]
             .iter()
             .any(|k| l.contains(k))
@@ -701,6 +705,22 @@ mod tests {
         // Claude Code's folder-trust dialog (2.1.x, captured): unnumbered, coloured choices.
         let trust = " Quick safety check: Is this a project you created or one you trust?\n \x1b[38;5;153m❯\x1b[39m \x1b[38;5;153mNo,\x1b[39m \x1b[38;5;153mexit\x1b[39m\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel\n";
         assert_eq!(activity(trust, ""), "blocked");
+        let no_footer = trust.replace(" Enter to confirm · Esc to cancel\n", "");
+        assert_eq!(
+            activity(&no_footer, ""),
+            "blocked",
+            "the trust question alone"
+        );
+        // OpenCode's permission dialog (strings from the installed binary): Enter picks Allow once.
+        let opencode = "  △ Permission required\n  ┃ bash: rm -rf build\n  Allow once   Always allow   Reject\n  enter confirm  esc reject\n";
+        assert_eq!(activity(opencode, ""), "blocked");
+        assert_eq!(
+            activity(
+                "  △ Permission required\n  Allow once   Always allow   Reject\n",
+                ""
+            ),
+            "blocked"
+        );
         // Prose above a free input row is not a question (an idle lead reporting "approves").
         let report = "⏺ I merge if the reviewer approves. Do you want to see the diff?\n────\n❯ \n────\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n";
         assert_eq!(activity(report, "✳ t"), "idle");

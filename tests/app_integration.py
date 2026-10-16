@@ -194,6 +194,27 @@ try:
         assert st('show-options', '-wv', '-t', pane, 'window-size') == '', 'a killed app leaves no manual size behind'
         app(); assert until(lambda: 'alpha / ● a-shell' in status()), status()
     case('Leave exits the app and stops nothing, never leaves window-size manual; pctl reopens where it was left', leave)
+    def attached():
+        pane = cli('session', 'get', 'a-shell')['pane']; sess = st('display-message', '-p', '-t', pane, '#{session_name}')
+        size = lambda f: int(st('display-message', '-p', '-t', pane, '#{' + f + '}'))
+        C = root / 'c.sock'  # a person's `pctl attach`: a real tmux client, 100x40, showing a-shell's window
+        subprocess.run([T, '-S', str(C), '-f', '/dev/null', 'new-session', '-d', '-x', '100', '-y', '40', '-s', 'c',
+                        f"env -u TMUX {T} -S {state / 'tmux.sock'} attach -t {sess}"], env=ENV, check=True, timeout=10)
+        try:
+            assert until(lambda: size('session_attached') == 1), 'the client attached'
+            st('select-window', '-t', pane)
+            assert until(lambda: size('window_width') == 100 and size('pane_height') > 30), 'the client took the window'
+            text('echo BOTTOM-MARK'); keys('Enter')
+            assert until(lambda: 'BOTTOM-MARK' in screen()), 'a taller pane shows its bottom rows (input line in sight)'
+            click(*side('a-main')); click(*side('a-shell'))  # opening it again asks for the app's size
+            assert until(lambda: st('show-options', '-wv', '-t', pane, 'window-size') == 'manual' and size('window_width') < 100), 'with a client attached the size holds'
+            w = size('window_width'); time.sleep(1.5); assert size('window_width') == w, 'and stays'
+            click(*find('⏏ Leave')); assert until(lambda: 'EXITED 0' in screen()), screen()
+            assert until(lambda: st('show-options', '-wv', '-t', pane, 'window-size') == '' and size('window_width') == 100), 'leaving hands the window back to the client'
+        finally:
+            subprocess.run([T, '-S', str(C), 'kill-server'], capture_output=True)
+        app(); assert until(lambda: 'alpha / ● a-shell' in status()), status()
+    case('with a client attached the app keeps its size while open, shows the bottom rows, and leaving hands the window back', attached)
     def agents_refused():
         for env in ({'PCTL_AGENT_ID': 'x'}, {'PCTL_RUN_ID': 'x'}, {'TMUX': f'{state}/tmux.sock,1,0'}):
             app(env=env, ready=False)
