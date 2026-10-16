@@ -403,6 +403,10 @@ impl Core {
             !self.registry()?.agents.iter().any(|a| a.name == name),
             "conflict: a session named {name} already exists"
         );
+        // Refused before registering, so a refused add leaves no stopped profile behind.
+        if self.server().is_err() {
+            crate::server_start_allowed()?;
+        }
         let pname = match project {
             Some(p) => p.to_string(),
             None => cwd
@@ -493,10 +497,7 @@ impl Core {
             let panes = match self.server() {
                 Err(_) => {
                     // Checked before touching the registry, so a refused restore loses nothing.
-                    ensure!(
-                        std::env::var("HERDR_ENV").as_deref() == Ok("1"),
-                        "server_start_outside_herdr: no PCTL server is running and this caller is not in a Herdr pane; start it from Herdr (pctl-server-herdr)"
-                    );
+                    crate::server_start_allowed()?;
                     vec![]
                 }
                 Ok(m) if m.is_empty() || m == r.server_instance => self.panes()?,
