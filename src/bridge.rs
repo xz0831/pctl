@@ -1,7 +1,8 @@
 //! The remote bridge and its client. `pctl bridge` serves JSON lines on stdin and stdout; `Remote`
-//! is the client the app will use to drive the bridges of other computers. Nothing here starts a
-//! tmux server or the pctl app. The tmux logic is a copy of the app's for now; part 2 of the
-//! "other computers" brief makes the app call these functions and deletes the copies.
+//! is the client the app uses to drive the bridges of other computers. The tmux-level pieces the
+//! app shows an agent with (read a screen, type, paste, act, list) live here once: the app calls
+//! them for its own computer and a bridge calls them for the app of another. Nothing here starts a
+//! tmux server or the pctl app.
 use crate::{Core, human::literal};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::{Map, Value, json};
@@ -23,8 +24,7 @@ const MAX_LINE: usize = 1 << 20;
 /// The hello must arrive this quickly, and one answer within `ANSWER`.
 const HELLO_WITHIN: Duration = Duration::from_secs(10);
 const ANSWER_WITHIN: Duration = Duration::from_secs(5);
-const CURSOR_FORMAT: &str =
-    "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_width} #{pane_height} #{history_size}";
+const CURSOR_FORMAT: &str = "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_width} #{pane_height} #{history_size} #{@pctl_run}";
 
 /// `pctl bridge` (hidden): answer requests on stdin with one JSON object per line on stdout, until
 /// stdin closes. The hello goes out first, unasked, so a client knows who answered.
@@ -78,13 +78,14 @@ fn op(core: &Core, req: &Value, asked: &mut HashMap<String, (u16, u16)>) -> Resu
         "screen" => screen(core, text("agent")?, text("run")?, req, asked),
         "keys" => send_keys(core, text("agent")?, text("run")?, req),
         "paste" => paste(core, text("agent")?, text("run")?, req),
+        "act" => act(core, req),
         other => bail!("unknown op {other}"),
     }
 }
 
-/// What the observer thread in `App::run` collects: every session, the projects, and whether a
-/// server owns this state.
-// shortcut: copy of App::run's observer body; part 2 makes the app use this
+/// What the app's observer collects: every session, the projects, and whether a server owns this
+/// state. The app calls this for its own computer and asks it of the others over the bridge. A
+/// failing session read is `error`, with the projects and the server still listed.
 pub fn list(core: &Core) -> Result<Value> {
     let projects: Vec<Value> = core
         .registry()
@@ -95,8 +96,10 @@ pub fn list(core: &Core) -> Result<Value> {
                 .collect()
         })
         .unwrap_or_default();
+    let sessions = core.session_list();
     Ok(json!({
-        "sessions": core.session_list()?,
+        "error": sessions.as_ref().err().map(|e| format!("{e:#}")),
+        "sessions": sessions.unwrap_or_default(),
         "projects": projects,
         "connected": core.server().is_ok_and(|m| !m.is_empty()),
     }))
@@ -112,12 +115,18 @@ fn screen(
     let (w, h) = (small(req, "width")?, small(req, "height")?);
     let scroll = usize::try_from(number(req, "scroll")?).context("scroll is too large")?;
     let pane = pane_of(core, agent, run)?;
-    verified(core, &pane, run)?;
     if w >= 2 && h >= 2 && asked.get(&pane) != Some(&(w, h)) {
+        verified(core, &pane, run)?;
         asked.insert(pane.clone(), (w, h));
         resize(core, &pane, w, h)?;
     }
-    capture(core, &pane, h, scroll)
+    let Some(s) = read_screen(core, &pane, run, h, scroll)? else {
+        bail!("changed: pane {pane} no longer holds run {run}; touch nothing");
+    };
+    Ok(json!({
+        "rows": s.text, "history": s.history,
+        "cursor": s.cursor.map(|(x, y)| json!([x, y])), "size": [s.size.0, s.size.1],
+    }))
 }
 
 /// The pane a run is on, from the registry. The run must exist and belong to the agent asked for.
@@ -142,8 +151,8 @@ fn pane_of(core: &Core, agent: &str, run: &str) -> Result<String> {
 }
 
 /// The pane still holds this run. Panes are cached from the last list; after a restart or a new
-/// tmux server the same pane id can belong to another process, and nothing must be typed into it.
-// shortcut: copy of App::verified; part 2 makes the app use this
+/// tmux server the same pane id can belong to another process, and nothing must be touched in it.
+/// Used before a resize; typing, pasting and reading check inside the call that does them.
 pub fn verified(core: &Core, pane: &str, run: &str) -> Result<()> {
     match core.tm(&["display-message", "-p", "-t", pane, "#{@pctl_run}"]) {
         Ok(found) if found.trim() == run => Ok(()),
@@ -153,8 +162,10 @@ pub fn verified(core: &Core, pane: &str, run: &str) -> Result<()> {
 }
 
 /// Resize the pane's window to the viewer, then hand the size back to tmux when nobody is attached
-/// to it. `resize-window` sets `window-size` to manual; with no client attached, unset it at once.
-// shortcut: copy of App::capture's resize step; part 2 makes the app use this
+/// to it. `resize-window` sets `window-size` to manual; with no client attached, unset it at once:
+/// tmux 3.8 keeps the size and nothing is left behind however the viewer ends. With a client
+/// attached, unsetting would hand the window straight back to that client's size, so it stays
+/// manual until the viewer leaves.
 pub fn resize(core: &Core, pane: &str, w: u16, h: u16) -> Result<()> {
     let unset = format!("set-option -wu -t {pane} window-size");
     core.tm(&[
@@ -176,9 +187,42 @@ pub fn resize(core: &Core, pane: &str, w: u16, h: u16) -> Result<()> {
     Ok(())
 }
 
-/// The raw screen text, the cursor when it is visible, the pane size and the history size.
-// shortcut: copy of App::capture; part 2 makes the app use this
-pub fn capture(core: &Core, pane: &str, h: u16, scroll: usize) -> Result<Value> {
+/// A pane's screen as the viewer needs it: the raw text, the cursor when it is visible, the pane
+/// size and the history size.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Screen {
+    pub text: String,
+    pub cursor: Option<(u16, u16)>,
+    pub size: (u16, u16),
+    pub history: usize,
+}
+
+impl Screen {
+    /// A screen from a `screen` answer.
+    pub fn from_answer(v: &Value) -> Screen {
+        let pair = |k: &str| {
+            let a = v.get(k).and_then(Value::as_array);
+            let n = |i: usize| a.and_then(|a| a.get(i)).and_then(Value::as_u64);
+            Some((n(0)? as u16, n(1)? as u16))
+        };
+        Screen {
+            text: v["rows"].as_str().unwrap_or_default().to_string(),
+            cursor: pair("cursor"),
+            size: pair("size").unwrap_or_default(),
+            history: v["history"].as_u64().unwrap_or(0) as usize,
+        }
+    }
+}
+
+/// Read the pane's screen, `h` rows ending `scroll` lines above the bottom. The same call reads
+/// the pane's run: None when it is not `run` (or the pane is gone), and what was read is dropped.
+pub fn read_screen(
+    core: &Core,
+    pane: &str,
+    run: &str,
+    h: u16,
+    scroll: usize,
+) -> Result<Option<Screen>> {
     let (start, end) = (
         format!("-{scroll}"),
         format!("{}", h as i64 - 1 - scroll as i64),
@@ -188,23 +232,81 @@ pub fn capture(core: &Core, pane: &str, h: u16, scroll: usize) -> Result<Value> 
         args.extend(["-S", &start, "-E", &end]);
     }
     args.extend([";", "display-message", "-p", "-t", pane, CURSOR_FORMAT]);
-    let out = core.tm(&args)?;
-    let (body, last) = out.rsplit_once('\n').unwrap_or(("", out.as_str()));
-    let m: Vec<u64> = last.split(' ').filter_map(|v| v.parse().ok()).collect();
-    let (cursor, size, history) = if m.len() == 6 {
-        (
-            (m[2] == 1).then(|| json!([m[0], m[1]])),
-            json!([m[3], m[4]]),
-            json!(m[5]),
-        )
-    } else {
-        (None, json!([0, 0]), json!(0))
+    let out = match core.tm(&args) {
+        Ok(out) => out,
+        Err(e) if e.to_string().contains("can't find") => return Ok(None),
+        Err(e) => return Err(e),
     };
-    Ok(json!({"rows": body, "cursor": cursor, "size": size, "history": history}))
+    let (body, last) = out.rsplit_once('\n').unwrap_or(("", out.as_str()));
+    let mut fields = last.splitn(7, ' ');
+    let m: Vec<u64> = fields
+        .by_ref()
+        .take(6)
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    if fields.next() != Some(run) {
+        return Ok(None);
+    }
+    let mut screen = Screen {
+        text: body.to_string(),
+        ..Screen::default()
+    };
+    if m.len() == 6 {
+        screen.cursor = (m[2] == 1).then_some((m[0] as u16, m[1] as u16));
+        screen.size = (m[3] as u16, m[4] as u16);
+        screen.history = m[5] as usize;
+    }
+    Ok(Some(screen))
 }
 
-// shortcut: copy of App::send_key; part 2 makes the app use this
-pub fn send_keys(core: &Core, agent: &str, run: &str, req: &Value) -> Result<Value> {
+/// `s` as one tmux command argument, for a command inside another command.
+fn quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// What `while_run` prints when the run changed.
+const RUN_CHANGED: &str = "pctl-run-changed";
+
+/// Run the tmux command `then` only while `pane` still holds `run`, else `otherwise`. Check and
+/// act are one tmux call, so a restart cannot slip in between. Ok(false): the run changed.
+/// `otherwise` is a command with its own leading " ; ", or empty.
+fn while_run(core: &Core, pane: &str, run: &str, then: &str, otherwise: &str) -> Result<bool> {
+    // The run goes into a format; an id with a format character is not one of ours.
+    if !run
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    {
+        return Ok(false);
+    }
+    let out = core.tm(&[
+        "if-shell",
+        "-F",
+        "-t",
+        pane,
+        &format!("#{{==:#{{@pctl_run}},{run}}}"),
+        then,
+        &format!("display-message -p {RUN_CHANGED}{otherwise}"),
+    ])?;
+    Ok(!out.contains(RUN_CHANGED))
+}
+
+/// Type the keys (text to send with `-l`, or key names) into the pane, in one tmux call that also
+/// checks the run. Ok(false): the run changed and nothing was typed.
+pub fn type_keys(core: &Core, pane: &str, run: &str, keys: &[(bool, String)]) -> Result<bool> {
+    let send: Vec<String> = keys
+        .iter()
+        .map(|(lit, key)| {
+            format!(
+                "send-keys -t {pane} {}-- {}",
+                if *lit { "-l " } else { "" },
+                quote(key)
+            )
+        })
+        .collect();
+    while_run(core, pane, run, &send.join(" ; "), "")
+}
+
+fn send_keys(core: &Core, agent: &str, run: &str, req: &Value) -> Result<Value> {
     let asked = req
         .get("keys")
         .and_then(Value::as_array)
@@ -220,43 +322,53 @@ pub fn send_keys(core: &Core, agent: &str, run: &str, req: &Value) -> Result<Val
                 .get("key")
                 .and_then(Value::as_str)
                 .context("key needs key")?;
-            Ok((lit, literal(key)))
+            Ok((lit, key.to_string()))
         })
         .collect::<Result<_>>()?;
     let pane = pane_of(core, agent, run)?;
-    verified(core, &pane, run)?;
-    for (lit, key) in keys {
-        if lit {
-            core.tm(&["send-keys", "-t", &pane, "-l", "--", &key])?;
-        } else {
-            core.tm(&["send-keys", "-t", &pane, "--", &key])?;
-        }
-    }
+    ensure!(
+        type_keys(core, &pane, run, &keys)?,
+        "changed: pane {pane} no longer holds run {run}; touch nothing"
+    );
     Ok(json!({}))
 }
 
-// shortcut: copy of App::paste; part 2 makes the app use this
-pub fn paste(core: &Core, agent: &str, run: &str, req: &Value) -> Result<Value> {
-    let text = req
-        .get("text")
-        .and_then(Value::as_str)
-        .context("missing text")?;
-    let pane = pane_of(core, agent, run)?;
-    verified(core, &pane, run)?;
+/// Paste `text` into the pane as one bracketed paste, checking the run in the call that pastes.
+/// Ok(false): the run changed and nothing was pasted.
+pub fn paste_text(core: &Core, pane: &str, run: &str, text: &str) -> Result<bool> {
     // One tmux command carries about 16 KB; a longer paste goes in 8 KB pieces into one buffer,
-    // then out as one bracketed paste. One buffer per bridge: two clients must not mix their text.
-    let buffer = format!("pctl-bridge-{}", std::process::id());
+    // then out as one bracketed paste. One buffer per process: two viewers must not mix their text.
+    let buffer = format!("pctl-app-{}", std::process::id());
     let mut r = Ok(String::new());
     for (i, piece) in chunks(text, 8192).into_iter().enumerate() {
         let append = if i == 0 { "-b" } else { "-ab" };
         r = r.and_then(|_| core.tm(&["set-buffer", append, &buffer, "--", &literal(piece)]));
     }
-    r.and_then(|_| core.tm(&["paste-buffer", "-p", "-d", "-b", &buffer, "-t", &pane]))?;
+    r?;
+    while_run(
+        core,
+        pane,
+        run,
+        &format!("paste-buffer -p -d -b {buffer} -t {pane}"),
+        &format!(" ; delete-buffer -b {buffer}"),
+    )
+}
+
+fn paste(core: &Core, agent: &str, run: &str, req: &Value) -> Result<Value> {
+    let text = req
+        .get("text")
+        .and_then(Value::as_str)
+        .context("missing text")?;
+    let pane = pane_of(core, agent, run)?;
+    ensure!(
+        paste_text(core, &pane, run, text)?,
+        "changed: pane {pane} no longer holds run {run}; touch nothing"
+    );
     Ok(json!({}))
 }
 
-// shortcut: copy of app::chunks; part 2 makes the app use this
-fn chunks(s: &str, max: usize) -> Vec<&str> {
+/// `s` in pieces of at most `max` bytes, cut on character boundaries.
+pub(crate) fn chunks(s: &str, max: usize) -> Vec<&str> {
     let mut out = vec![];
     let mut rest = s;
     while rest.len() > max {
@@ -271,12 +383,125 @@ fn chunks(s: &str, max: usize) -> Vec<&str> {
     out
 }
 
+/// bash, as Ghostty starts it here: `$SHELL` when that is bash, else a Homebrew or system bash.
+pub fn bash() -> String {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    if std::path::Path::new(&shell)
+        .file_name()
+        .is_some_and(|n| n == "bash")
+    {
+        return shell;
+    }
+    ["/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file())
+        .unwrap_or("bash")
+        .to_string()
+}
+
+/// The agent kinds of the new-agent form.
+pub const KINDS: [&str; 5] = ["bash", "Claude Code", "Codex", "OpenCode", "Command"];
+
+/// The command line (and the OpenCode model) of a new agent of `kind`, built on the computer that
+/// runs it: `bash` is that computer's bash.
+pub fn agent_argv(kind: &str, model: &str, command: &str) -> Result<(Vec<String>, Option<String>)> {
+    let model = (!model.is_empty()).then(|| model.to_string());
+    let with = |bin: &str, flag: &str| -> Vec<String> {
+        std::iter::once(bin.to_string())
+            .chain(model.iter().flat_map(|m| [flag.to_string(), m.clone()]))
+            .collect()
+    };
+    let argv = match kind {
+        "Claude Code" => with("claude", "--model"),
+        "Codex" => with("codex", "-m"),
+        "OpenCode" => vec!["opencode".into()],
+        "bash" => vec![bash(), "-l".into()],
+        _ => crate::parse_command(command)?,
+    };
+    Ok((argv, model.filter(|_| kind == "OpenCode")))
+}
+
+/// One action on an agent or project: the calls the app makes for its own computer, the same
+/// ones for another computer's app over the bridge. `action` is restart, stop (with the `run` that
+/// was shown), start (`new` for a new conversation), remove, new_tab (a bash tab named `name` in
+/// `project`) or new_agent (the new-agent form's fields).
+pub fn act(core: &Core, req: &Value) -> Result<Value> {
+    let text = |name: &str| -> Result<&str> {
+        req.get(name)
+            .and_then(Value::as_str)
+            .with_context(|| format!("missing {name}"))
+    };
+    let optional = |name: &str| {
+        req.get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+    };
+    match text("action")? {
+        "restart" => {
+            core.session_restart(text("agent")?, false, false)?;
+        }
+        "start" => {
+            let new = req.get("new").and_then(Value::as_bool).unwrap_or(false);
+            core.session_start(text("agent")?, new)?;
+        }
+        "remove" => {
+            core.session_remove(text("agent")?)?;
+        }
+        "stop" => {
+            let s = core.session_get(text("agent")?)?;
+            let id = s["agent_id"].as_str().unwrap_or_default();
+            let run = req
+                .get("run")
+                .and_then(Value::as_str)
+                .or(s["run_id"].as_str())
+                .unwrap_or_default();
+            core.terminate(id, run)?;
+        }
+        "new_tab" => {
+            let project = text("project")?;
+            let root = core
+                .registry()?
+                .projects
+                .iter()
+                .find(|p| p.name == project)
+                .map(|p| p.root.clone())
+                .unwrap_or_default();
+            core.session_add(
+                text("name")?,
+                std::path::Path::new(&root),
+                Some(project),
+                vec![bash(), "-l".into()],
+                None,
+                None,
+                None,
+            )?;
+        }
+        "new_agent" => {
+            let (argv, opencode_model) =
+                agent_argv(optional("kind"), optional("model"), optional("command"))?;
+            let branch = optional("branch");
+            core.session_add(
+                text("name")?,
+                std::path::Path::new(text("folder")?),
+                Some(text("project")?),
+                argv,
+                None,
+                (!branch.is_empty()).then_some((branch, None)),
+                opencode_model.as_deref(),
+            )?;
+        }
+        other => bail!("unknown action {other}"),
+    }
+    Ok(json!({}))
+}
+
 /// The hello line, sent as soon as the bridge starts.
 fn hello() -> Value {
     json!({"ev": "hello", "protocol": 1, "host": hostname(), "version": env!("CARGO_PKG_VERSION")})
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     Command::new("hostname")
         .arg("-s")
         .output()
@@ -416,6 +641,8 @@ struct Inner {
 struct Pending {
     tx: mpsc::Sender<Result<Value>>,
     started: Instant,
+    /// How long this request may wait; None: the usual `ANSWER_WITHIN`.
+    within: Option<Duration>,
 }
 
 /// A mutex we own: a thread that panicked while holding it cannot have left our simple values in a
@@ -467,7 +694,12 @@ impl Remote {
     /// (whose `ok` may be false) arrives on the returned channel within 5 s, else the request fails
     /// with `timeout`. A connection already down fails at once.
     pub fn request(&self, op: Value) -> mpsc::Receiver<Result<Value>> {
-        current(&self.inner).request(op)
+        current(&self.inner).request(op, None)
+    }
+
+    /// Like `request`, for an op that may take longer than 5 s (restarting an agent waits for it).
+    pub fn request_within(&self, op: Value, within: Duration) -> mpsc::Receiver<Result<Value>> {
+        current(&self.inner).request(op, Some(within))
     }
 
     /// Start a new connection over the same target. Pending requests on the old one fail.
@@ -566,7 +798,7 @@ impl Inner {
         matches!(*lock(&self.state), RemoteState::Down(_))
     }
 
-    fn request(&self, op: Value) -> mpsc::Receiver<Result<Value>> {
+    fn request(&self, op: Value, within: Option<Duration>) -> mpsc::Receiver<Result<Value>> {
         let (tx, rx) = mpsc::channel();
         if let RemoteState::Down(reason) = lock(&self.state).clone() {
             let _ = tx.send(Err(anyhow!("down: {reason}")));
@@ -578,6 +810,7 @@ impl Inner {
             Pending {
                 tx,
                 started: Instant::now(),
+                within,
             },
         );
         if !self.write(id, op) {
@@ -616,7 +849,7 @@ impl Inner {
         let now = Instant::now();
         let old: Vec<u64> = lock(&self.pending)
             .iter()
-            .filter(|(_, e)| now.duration_since(e.started) >= after)
+            .filter(|(_, e)| now.duration_since(e.started) >= e.within.unwrap_or(after))
             .map(|(id, _)| *id)
             .collect();
         for id in old {
@@ -946,8 +1179,8 @@ mod tests {
     #[test]
     fn answers_match_their_ids_in_any_order() {
         let (inner, sent) = bare();
-        let first = inner.request(json!({"op": "list"}));
-        let second = inner.request(json!({"op": "paste", "text": "hi"}));
+        let first = inner.request(json!({"op": "list"}), None);
+        let second = inner.request(json!({"op": "paste", "text": "hi"}), None);
         let lines: Vec<String> = sent.try_iter().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("\"id\":1"), "{}", lines[0]);
@@ -967,7 +1200,7 @@ mod tests {
     #[test]
     fn an_unanswered_request_times_out_and_nothing_waits_forever() {
         let (inner, _sent) = bare();
-        let waiting = inner.request(json!({"op": "list"}));
+        let waiting = inner.request(json!({"op": "list"}), None);
         {
             let mut pending = lock(&inner.pending);
             for e in pending.values_mut() {
@@ -983,12 +1216,12 @@ mod tests {
     #[test]
     fn a_down_connection_fails_pending_and_new_requests() {
         let (inner, _sent) = bare();
-        let waiting = inner.request(json!({"op": "list"}));
+        let waiting = inner.request(json!({"op": "list"}), None);
         inner.down("eof");
         assert!(waiting.try_recv().expect("failed").is_err());
         assert!(
             inner
-                .request(json!({"op": "list"}))
+                .request(json!({"op": "list"}), None)
                 .try_recv()
                 .expect("failed")
                 .is_err()
@@ -999,7 +1232,7 @@ mod tests {
     #[test]
     fn a_reconnect_goes_down_a_fresh_connection_and_fails_the_old_one() {
         let (old, _sent) = bare();
-        let waiting = old.request(json!({"op": "list"}));
+        let waiting = old.request(json!({"op": "list"}), None);
         let remote = Remote {
             target: "somewhere".into(),
             inner: Mutex::new(old.clone()),
@@ -1031,5 +1264,52 @@ mod tests {
         assert!(pieces.iter().all(|p| p.len() <= 8192));
         assert!(pieces.iter().all(|p| !p.is_empty()));
         assert_eq!(pieces.concat(), text);
+    }
+
+    #[test]
+    fn a_new_agent_command_is_built_where_it_runs() {
+        let (argv, model) = agent_argv("Claude Code", "claude-x", "").expect("claude");
+        assert_eq!(
+            (argv, model),
+            (
+                vec!["claude".into(), "--model".into(), "claude-x".into()],
+                None
+            )
+        );
+        let (argv, _) = agent_argv("Codex", "", "").expect("codex");
+        assert_eq!(argv, ["codex"]);
+        let (argv, model) = agent_argv("OpenCode", "m1", "").expect("opencode");
+        assert_eq!(
+            (argv, model.as_deref()),
+            (vec!["opencode".into()], Some("m1"))
+        );
+        let (argv, _) = agent_argv("bash", "", "").expect("bash");
+        assert_eq!(argv.last().map(String::as_str), Some("-l"));
+        let (argv, model) = agent_argv("Command", "m", "sh -c 'echo hi'").expect("command");
+        assert_eq!(
+            (argv, model),
+            (vec!["sh".into(), "-c".into(), "echo hi".into()], None)
+        );
+        assert!(
+            agent_argv("Command", "", "").is_err(),
+            "an empty command is refused"
+        );
+    }
+
+    #[test]
+    fn a_screen_answer_round_trips_into_a_screen() {
+        let s = Screen {
+            text: "a\nb".into(),
+            cursor: Some((3, 1)),
+            size: (80, 24),
+            history: 7,
+        };
+        let answer = json!({
+            "rows": s.text, "history": s.history,
+            "cursor": [3, 1], "size": [80, 24],
+        });
+        assert_eq!(Screen::from_answer(&answer), s);
+        let hidden = json!({"rows": "", "history": 0, "cursor": null, "size": [1, 1]});
+        assert_eq!(Screen::from_answer(&hidden).cursor, None);
     }
 }

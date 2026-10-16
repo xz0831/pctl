@@ -2,14 +2,17 @@
 //! the left, the project's agents as tabs on top, the selected agent's live terminal in the
 //! middle, and the mouse for everything (click to open, `+` to add, right-click for actions).
 //! Shortcuts come from `keys` and can be changed in a config file. tmux stays behind the app and
-//! keeps the agents running; leaving the app stops nothing.
+//! keeps the agents running; leaving the app stops nothing. With saved machines (`pctl machine
+//! add`) the sidebar shows this computer first and each of them after it, and everything works on
+//! their agents too, through the bridge on that computer.
 pub(crate) mod keys;
+mod machines;
 mod quips;
 mod term;
 
 use crate::{
     Core,
-    human::literal,
+    bridge::{self, KINDS, Screen},
     theme::{Palette, ThemeName},
     ui::TerminalGuard,
 };
@@ -19,6 +22,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use keys::{ACTIONS, Action, Keymap};
+use machines::{ACT_WITHIN, Id, Mach};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -27,17 +31,15 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     io::{self, Write},
-    path::Path,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
-const KINDS: [&str; 5] = ["bash", "Claude Code", "Codex", "OpenCode", "Command"];
 /// A drag longer than this is refused: an OSC 52 sequence this size is more than a terminal reads.
 const MAX_COPY: usize = 100_000;
 /// At most one notification per agent in this long.
@@ -50,13 +52,17 @@ fn capture_every(quiet: u32) -> Duration {
         _ => 250,
     })
 }
-/// What `while_run` prints when the run changed.
-const RUN_CHANGED: &str = "pctl-run-changed";
 /// Typed text waits for the end of a burst of events, but never grows past this many bytes.
 const TYPED_MAX: usize = 2048;
+/// A paste to another computer travels in one bridge line of at most 1 MiB, escapes included.
+const REMOTE_PASTE_MAX: usize = 400_000;
+/// While an answer from another computer is on its way, look for it this often.
+const SOON: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug)]
 struct Agent {
+    /// "" is this computer.
+    machine: String,
     name: String,
     project: String,
     status: String,
@@ -67,21 +73,28 @@ impl Agent {
     fn running(&self) -> bool {
         self.pane.is_some() && !matches!(self.status.as_str(), "stopped" | "lost")
     }
+    fn id(&self) -> Id {
+        Id::new(&self.machine, &self.name)
+    }
+    fn project_id(&self) -> Id {
+        Id::new(&self.machine, &self.project)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Hit {
-    Project(String),
-    Agent(String),
-    Tab(String),
-    NewAgent(String),
-    NewTab(String),
+    Machine(String),
+    Project(Id),
+    Agent(Id),
+    Tab(Id),
+    NewAgent(Id),
+    NewTab(Id),
     NewProject,
     Terminal,
     Theme,
     Help,
     Detach,
-    Start(String, bool),
+    Start(Id, bool),
     SidebarEdge,
     Menu(usize),
     Field(usize),
@@ -92,15 +105,17 @@ enum Hit {
 
 #[derive(Clone, Debug)]
 enum Act {
-    Restart(String),
+    Restart(Id),
     /// The agent and the run shown when Stop was asked.
-    Stop(String, Option<String>),
-    Start(String, bool),
-    Remove(String),
-    NewAgent(String),
-    NewTab(String),
+    Stop(Id, Option<String>),
+    Start(Id, bool),
+    Remove(Id),
+    /// The project.
+    NewAgent(Id),
+    NewTab(Id),
     Theme(ThemeName),
     Custom(String),
+    Reconnect(String),
 }
 
 struct Field {
@@ -111,10 +126,12 @@ struct Field {
 }
 struct Form {
     /// None: a new project; Some(project): a new agent in it.
-    project: Option<String>,
+    project: Option<Id>,
     fields: Vec<Field>,
     focus: usize,
     error: String,
+    /// Sent to another computer and not answered yet.
+    busy: bool,
 }
 enum Modal {
     Form(Form),
@@ -135,7 +152,8 @@ enum Modal {
 
 #[derive(Default)]
 struct View {
-    pane: String,
+    /// The computer and pane the rows below were read from.
+    owner: (String, String),
     rows: Vec<term::Row>,
     cursor: Option<(u16, u16)>,
     size: (u16, u16),
@@ -145,24 +163,91 @@ struct View {
     scroll: usize,
     history: usize,
     next: Option<Instant>,
-    /// The last capture as tmux printed it; an equal one needs no parsing and no redraw.
-    raw: String,
+    /// The last screen read; an equal one needs no parsing and no redraw.
+    last: Option<Screen>,
     /// Captures in a row that found the screen unchanged.
     quiet: u32,
+    /// The one screen request to another computer in flight.
+    pending: Option<mpsc::Receiver<Result<Value>>>,
 }
 
 struct Update {
+    machine: String,
     agents: std::result::Result<Vec<Value>, String>,
     projects: Vec<(String, String)>,
     connected: bool,
+}
+impl Update {
+    /// From a `list` answer (`bridge::list`, here or over the bridge).
+    fn from_list(machine: &str, answer: Result<Value>) -> Update {
+        let list = answer.and_then(|v| {
+            if v["ok"] == json!(false) {
+                anyhow::bail!("{}", v["error"].as_str().unwrap_or("list failed"));
+            }
+            Ok(v)
+        });
+        match list {
+            Ok(v) => Update {
+                machine: machine.into(),
+                agents: match v["error"].as_str() {
+                    Some(e) => Err(e.to_string()),
+                    None => Ok(v["sessions"].as_array().cloned().unwrap_or_default()),
+                },
+                projects: v["projects"]
+                    .as_array()
+                    .map(|ps| {
+                        ps.iter()
+                            .map(|p| {
+                                (
+                                    p["name"].as_str().unwrap_or_default().to_string(),
+                                    p["root"].as_str().unwrap_or_default().to_string(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                connected: v["connected"].as_bool().unwrap_or(false),
+            },
+            Err(e) => Update {
+                machine: machine.into(),
+                agents: Err(format!("{e:#}")),
+                projects: vec![],
+                connected: false,
+            },
+        }
+    }
 }
 
 /// Rows of the sidebar, for drawing and for keyboard moves.
 #[derive(Clone, Debug, PartialEq)]
 enum SideRow {
-    Project(String),
-    Agent(String),
-    Add(String),
+    Machine(String),
+    /// A muted line under a machine: no server here, or why it is down.
+    Note(String),
+    Project(Id),
+    Agent(Id),
+    Add(Id),
+}
+
+/// What an answer from another computer was for.
+enum Task {
+    /// Typed keys, or a paste, for this agent.
+    Keys(Agent),
+    Paste(Agent),
+    /// An action; on success say `ok` and then do `then`.
+    Act {
+        machine: String,
+        ok: String,
+        then: Then,
+    },
+}
+/// What follows a successful action.
+enum Then {
+    Nothing,
+    /// A new agent or tab in this project: show it.
+    Opened(Id, String),
+    /// The new-agent form's: also close the form.
+    Form(Id, String),
 }
 
 struct App {
@@ -172,13 +257,13 @@ struct App {
     custom: Option<String>,
     customs: Vec<crate::theme::custom::Custom>,
     keys: Keymap,
-    projects: Vec<(String, String)>,
+    /// This computer first, then the enabled saved machines in file order.
+    machines: Vec<Mach>,
     agents: Vec<Agent>,
-    loaded: bool,
-    connected: bool,
-    project: Option<String>,
-    tab: HashMap<String, String>,
-    collapsed: HashSet<String>,
+    project: Option<Id>,
+    tab: HashMap<Id, String>,
+    collapsed: HashSet<Id>,
+    collapsed_machines: HashSet<String>,
     sidebar: bool,
     sidebar_w: u16,
     in_sidebar: bool,
@@ -194,7 +279,7 @@ struct App {
     quit: bool,
     refresh: Option<mpsc::Sender<()>>,
     /// Agents added here that a refresh started earlier may not list yet.
-    fresh: HashMap<String, (Agent, Instant)>,
+    fresh: HashMap<Id, (Agent, Instant)>,
     /// Panes whose window this app resized; a window with a client attached stays manual.
     touched: HashSet<String>,
     /// The last left click, to tell a double-click.
@@ -202,58 +287,12 @@ struct App {
     /// The selection in the terminal view: where the drag began and where it is now.
     sel: Option<(term::Cell, term::Cell)>,
     /// When each agent was last announced, for the 10-second limit.
-    notified: HashMap<String, Instant>,
+    notified: HashMap<Id, Instant>,
     /// Keys typed in the events just read, for the agent they were typed to: text to send with
     /// `-l` (true) or a key name. They go out as one tmux call, see `flush_typed`.
     typed: Option<(Agent, Vec<(bool, String)>)>,
-}
-
-/// `s` as one tmux command argument, for a command inside another command.
-fn quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// Run the tmux command `then` only while `pane` still holds `run`, else `otherwise`. Check and
-/// act are one tmux call, so a restart cannot slip in between. Ok(false): the run changed.
-/// `otherwise` is a command with its own leading " ; ", or empty.
-fn while_run(core: &Core, pane: &str, run: &str, then: &str, otherwise: &str) -> Result<bool> {
-    // The run goes into a format; an id with a format character is not one of ours.
-    if !run
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
-    {
-        return Ok(false);
-    }
-    let out = core.tm(&[
-        "if-shell",
-        "-F",
-        "-t",
-        pane,
-        &format!("#{{==:#{{@pctl_run}},{run}}}"),
-        then,
-        &format!("display-message -p {RUN_CHANGED}{otherwise}"),
-    ])?;
-    Ok(!out.contains(RUN_CHANGED))
-}
-
-/// A launched agent, or anything inside this server's tmux (a bash tab of the app itself), must not
-/// open the app: its keys skip the blocked-question refusals of `msg` and `session prompt`, and an
-/// app showing itself fights over the window size. Same rule as orchestration's operator_only;
-/// not a security boundary.
-/// `s` in pieces of at most `max` bytes, cut on character boundaries.
-fn chunks(s: &str, max: usize) -> Vec<&str> {
-    let mut out = vec![];
-    let mut rest = s;
-    while rest.len() > max {
-        let cut = (1..=max)
-            .rev()
-            .find(|&i| rest.is_char_boundary(i))
-            .unwrap_or(rest.len());
-        out.push(&rest[..cut]);
-        rest = &rest[cut..];
-    }
-    out.push(rest);
-    out
+    /// Requests to other computers whose answer is still to come.
+    tasks: Vec<(mpsc::Receiver<Result<Value>>, Task)>,
 }
 
 /// Write a complete escape sequence (a clipboard write, a notification) to the same terminal the
@@ -298,20 +337,18 @@ fn may_notify(last: Option<Instant>, now: Instant) -> bool {
 /// The notifications for states this app watched change: an agent it saw `working` that is now
 /// idle or blocked, never one it sees for the first time and never the one on screen.
 fn notifications(
-    before: &HashMap<String, String>,
+    before: &HashMap<Id, String>,
     now: &[Agent],
-    shown: Option<&str>,
-) -> Vec<(String, &'static str, bool)> {
+    shown: Option<&Id>,
+) -> Vec<(Id, &'static str, bool)> {
     let mut out = vec![];
     for a in now {
-        if before.get(&a.name).map(String::as_str) != Some("working")
-            || shown == Some(a.name.as_str())
-        {
+        if before.get(&a.id()).map(String::as_str) != Some("working") || shown == Some(&a.id()) {
             continue;
         }
         match a.status.as_str() {
-            "idle" => out.push((a.name.clone(), "done", false)),
-            "blocked" => out.push((a.name.clone(), "needs you", true)),
+            "idle" => out.push((a.id(), "done", false)),
+            "blocked" => out.push((a.id(), "needs you", true)),
             _ => {}
         }
     }
@@ -330,8 +367,8 @@ pub(crate) fn agent_caller(core: &Core) -> bool {
         })
 }
 
-/// Open the app until the person leaves it. Never starts a server by itself: adding the first
-/// agent goes through `session add`, which keeps its own start rules.
+/// Open the app until the person leaves it. Never starts a server by itself, here or on another
+/// computer: adding the first agent goes through `session add`, which keeps its own start rules.
 pub fn run(core: &Core) -> Result<()> {
     anyhow::ensure!(
         !agent_caller(core),
@@ -339,18 +376,35 @@ pub fn run(core: &Core) -> Result<()> {
     );
     let (keys, warnings) = Keymap::load();
     let mut app = App::new(core.theme()?, keys);
+    match crate::machine::load() {
+        Ok(saved) => app.machines.extend(
+            saved
+                .iter()
+                .filter(|m| m.enabled)
+                .map(|m| Mach::remote(&m.label, &m.target)),
+        ),
+        Err(e) => app.say(format!("Machines: {e:#}")),
+    }
     // Come back where the person left: last project and each project's tab (per viewer, not
     // shared state; a missing or bad file just means the first project).
     let place = core.state.join("app-view.json");
     if let Ok(v) =
         std::fs::read(&place).map(|b| serde_json::from_slice::<Value>(&b).unwrap_or_default())
     {
-        app.project = v["project"].as_str().map(String::from);
+        let machine = v["machine"].as_str().unwrap_or_default();
+        app.project = v["project"].as_str().map(|p| Id::new(machine, p));
         if let Some(tabs) = v["tabs"].as_object() {
             app.tab = tabs
                 .iter()
-                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .filter_map(|(k, v)| Some((Id::new("", k), v.as_str()?.to_string())))
                 .collect();
+        }
+        for t in v["remote_tabs"].as_array().into_iter().flatten() {
+            if let [m, p, a] = &t.as_array().cloned().unwrap_or_default()[..]
+                && let (Some(m), Some(p), Some(a)) = (m.as_str(), p.as_str(), a.as_str())
+            {
+                app.tab.insert(Id::new(m, p), a.to_string());
+            }
         }
         if let Some(name) = v["theme"].as_str() {
             app.customs = crate::theme::custom::load_all().0;
@@ -369,20 +423,10 @@ pub fn run(core: &Core) -> Result<()> {
     let observer = core.clone();
     thread::spawn(move || {
         loop {
-            let update = Update {
-                agents: observer.session_list().map_err(|e| format!("{e:#}")),
-                projects: observer
-                    .registry()
-                    .map(|r| {
-                        r.projects
-                            .iter()
-                            .map(|p| (p.name.clone(), p.root.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                connected: observer.server().is_ok_and(|m| !m.is_empty()),
-            };
-            if tx.send(update).is_err() {
+            if tx
+                .send(Update::from_list("", bridge::list(&observer)))
+                .is_err()
+            {
                 return;
             }
             match req_rx.recv_timeout(Duration::from_millis(1500)) {
@@ -402,6 +446,7 @@ pub fn run(core: &Core) -> Result<()> {
                 app.apply(u);
                 dirty = true;
             }
+            dirty |= app.tick();
             if app.view.next.is_none_or(|t| Instant::now() >= t) {
                 dirty |= app.capture(core);
             }
@@ -413,6 +458,7 @@ pub fn run(core: &Core) -> Result<()> {
             let wait = (app.view.next).map_or(Duration::ZERO, |t| {
                 t.saturating_duration_since(Instant::now())
             });
+            let wait = if app.waiting() { wait.min(SOON) } else { wait };
             if event::poll(wait)? {
                 // Everything already waiting goes in one go, so fast typing is one tmux call.
                 loop {
@@ -435,10 +481,25 @@ pub fn run(core: &Core) -> Result<()> {
     }
     shown?;
     println!("{}", quips::goodbye(app.keys.wit));
+    let remote_tabs: Vec<Value> = app
+        .tab
+        .iter()
+        .filter(|(p, _)| !p.machine.is_empty())
+        .map(|(p, a)| json!([p.machine, p.name, a]))
+        .collect();
+    let tabs: HashMap<&str, &str> = app
+        .tab
+        .iter()
+        .filter(|(p, _)| p.machine.is_empty())
+        .map(|(p, a)| (p.name.as_str(), a.as_str()))
+        .collect();
     let _ = std::fs::write(
         &place,
-        serde_json::json!({"project": app.project, "tabs": app.tab, "theme": app.custom})
-            .to_string(),
+        json!({
+            "machine": app.project.as_ref().map(|p| &p.machine), "project": app.project.as_ref().map(|p| &p.name),
+            "tabs": tabs, "remote_tabs": remote_tabs, "theme": app.custom,
+        })
+        .to_string(),
     );
     Ok(())
 }
@@ -451,13 +512,12 @@ impl App {
             custom: None,
             customs: vec![],
             keys,
-            projects: vec![],
+            machines: vec![Mach::local(bridge::hostname())],
             agents: vec![],
-            loaded: false,
-            connected: false,
             project: None,
             tab: HashMap::new(),
             collapsed: HashSet::new(),
+            collapsed_machines: HashSet::new(),
             sidebar: true,
             sidebar_w: 26,
             in_sidebar: false,
@@ -478,6 +538,7 @@ impl App {
             sel: None,
             notified: HashMap::new(),
             typed: None,
+            tasks: vec![],
         }
     }
     fn say(&mut self, text: impl Into<String>) {
@@ -488,9 +549,143 @@ impl App {
     fn notice_live(&self) -> bool {
         !self.notice.is_empty() && self.notice_at.elapsed() < Duration::from_secs(8)
     }
+    /// Ask this computer's observer for a fresh list.
     fn poke(&self) {
         if let Some(r) = &self.refresh {
             let _ = r.send(());
+        }
+    }
+    /// Ask that computer for a fresh list.
+    fn poke_machine(&mut self, machine: &str) {
+        match self.machines.iter_mut().find(|m| m.id == machine) {
+            Some(m) if !m.is_local() => m.poke(),
+            _ => self.poke(),
+        }
+    }
+
+    fn mach(&self, machine: &str) -> Option<&Mach> {
+        self.machines.iter().find(|m| m.id == machine)
+    }
+    /// Whether the sidebar shows machines: only when some are saved.
+    fn multi(&self) -> bool {
+        self.machines.len() > 1
+    }
+    fn local_connected(&self) -> bool {
+        self.machines[0].connected
+    }
+    /// The machine's name as the person sees it.
+    fn label(&self, machine: &str) -> String {
+        self.mach(machine)
+            .map_or(machine.to_string(), |m| m.label.clone())
+    }
+    /// Why that computer cannot be used right now: "<label> is down: …", or None.
+    fn refused(&self, machine: &str) -> Option<String> {
+        let m = self.mach(machine)?;
+        m.unusable().map(|why| {
+            if why == "connecting" {
+                format!("{} is still connecting", m.label)
+            } else {
+                format!("{} is down: {why}", m.label)
+            }
+        })
+    }
+    /// Send one request to a computer; the refusal is said and None returned when it cannot be.
+    fn request(
+        &mut self,
+        machine: &str,
+        op: Value,
+        within: Option<Duration>,
+    ) -> Option<mpsc::Receiver<Result<Value>>> {
+        if let Some(why) = self.refused(machine) {
+            self.say(why);
+            return None;
+        }
+        match self.mach(machine)?.request(op, within) {
+            Ok(rx) => Some(rx),
+            Err(why) => {
+                self.say(why);
+                None
+            }
+        }
+    }
+
+    /// Keep the other computers going and collect the answers that came in. Whether to redraw.
+    fn tick(&mut self) -> bool {
+        let mut dirty = false;
+        let mut updates = vec![];
+        for m in &mut self.machines {
+            let (changed, update) = m.tick();
+            dirty |= changed;
+            updates.extend(update);
+        }
+        for u in updates {
+            self.apply(u);
+        }
+        let mut done = vec![];
+        let mut i = 0;
+        while i < self.tasks.len() {
+            match self.tasks[i].0.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => i += 1,
+                answer => {
+                    let (_, task) = self.tasks.remove(i);
+                    done.push((
+                        task,
+                        answer.unwrap_or_else(|_| Err(anyhow::anyhow!("no answer"))),
+                    ));
+                }
+            }
+        }
+        dirty |= !done.is_empty();
+        for (task, answer) in done {
+            self.finish(task, answer);
+        }
+        dirty
+    }
+    /// Something is in flight, so the loop looks again soon.
+    fn waiting(&self) -> bool {
+        self.view.pending.is_some()
+            || !self.tasks.is_empty()
+            || self.machines.iter().any(Mach::waiting)
+    }
+    /// An answer for a task: nothing to say when it went well; why it did not otherwise.
+    fn finish(&mut self, task: Task, answer: Result<Value>) {
+        let failed = match &answer {
+            Ok(v) if v["ok"] == json!(true) => None,
+            Ok(v) => Some(v["error"].as_str().unwrap_or("failed").to_string()),
+            Err(e) => Some(format!("{e:#}")),
+        };
+        let paste = matches!(task, Task::Paste(_));
+        match task {
+            Task::Keys(a) | Task::Paste(a) => match failed {
+                Some(e) if e.starts_with("changed:") => self.changed(&a),
+                Some(e) if paste => self.say(format!("Could not paste: {e}")),
+                Some(e) => self.say(format!("Could not type into {}: {e}", a.name)),
+                None => {}
+            },
+            Task::Act { machine, ok, then } => {
+                let form = matches!(then, Then::Form(..));
+                match failed {
+                    Some(e) => {
+                        if form && let Some(Modal::Form(f)) = &mut self.modal {
+                            f.busy = false;
+                            f.error = e;
+                        } else {
+                            self.say(e);
+                        }
+                    }
+                    None => {
+                        if form {
+                            self.modal = None;
+                        }
+                        self.say(ok);
+                        if let Then::Opened(p, name) | Then::Form(p, name) = then {
+                            self.opened(&p, &name);
+                        }
+                    }
+                }
+                self.view.next = None;
+                self.poke_machine(&machine);
+            }
         }
     }
 
@@ -536,65 +731,113 @@ impl App {
     }
 
     fn apply(&mut self, u: Update) {
+        let Some(mi) = self.machines.iter().position(|m| m.id == u.machine) else {
+            return;
+        };
         // The statuses this app watched before this update, for the notifications below.
-        let before: HashMap<String, String> = self
+        let before: HashMap<Id, String> = self
             .agents
             .iter()
-            .map(|a| (a.name.clone(), a.status.clone()))
+            .filter(|a| a.machine == u.machine)
+            .map(|a| (a.id(), a.status.clone()))
             .collect();
-        let watched = self.loaded;
-        self.loaded = true;
-        self.connected = u.connected;
-        self.projects = u.projects;
+        let watched = self.machines[mi].loaded;
+        self.machines[mi].loaded = true;
+        self.machines[mi].connected = u.connected;
+        self.machines[mi].projects = u.projects;
         match u.agents {
             Ok(rows) => {
-                self.agents = rows
-                    .iter()
-                    .map(|s| Agent {
-                        name: s["name"].as_str().unwrap_or_default().into(),
-                        project: s["project"].as_str().unwrap_or_default().into(),
-                        status: s["status"].as_str().unwrap_or("unknown").into(),
-                        pane: s["pane"].as_str().map(String::from),
-                        run: s["run_id"].as_str().map(String::from),
-                    })
-                    .collect();
+                self.agents.retain(|a| a.machine != u.machine);
+                self.agents.extend(rows.iter().map(|s| Agent {
+                    machine: u.machine.clone(),
+                    name: s["name"].as_str().unwrap_or_default().into(),
+                    project: s["project"].as_str().unwrap_or_default().into(),
+                    status: s["status"].as_str().unwrap_or("unknown").into(),
+                    pane: s["pane"].as_str().map(String::from),
+                    run: s["run_id"].as_str().map(String::from),
+                }));
             }
-            Err(e) => self.say(format!("Could not read sessions: {e}")),
+            Err(e) => {
+                let label = self.machines[mi].label.clone();
+                self.say(if self.multi() {
+                    format!("Could not read sessions on {label}: {e}")
+                } else {
+                    format!("Could not read sessions: {e}")
+                })
+            }
         }
-        self.fresh.retain(|name, (_, at)| {
-            at.elapsed() < Duration::from_secs(10) && !self.agents.iter().any(|a| &a.name == name)
+        self.fresh.retain(|id, (_, at)| {
+            at.elapsed() < Duration::from_secs(10) && !self.agents.iter().any(|a| a.id() == *id)
         });
-        self.agents
-            .extend(self.fresh.values().map(|(a, _)| a.clone()));
-        let names: Vec<String> = self.projects.iter().map(|(n, _)| n.clone()).collect();
-        if self.project.as_ref().is_none_or(|p| !names.contains(p)) {
-            self.project = names
-                .iter()
-                .find(|p| self.agents.iter().any(|a| &a.project == *p && a.running()))
-                .or(names.first())
-                .cloned();
+        self.agents.extend(
+            self.fresh
+                .values()
+                .filter(|(a, _)| a.machine == u.machine)
+                .map(|(a, _)| a.clone()),
+        );
+        let names: Vec<String> = self.machines[mi]
+            .projects
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        // The project on screen is gone: from a machine no longer listed, or from its list.
+        if self.project.as_ref().is_some_and(|p| {
+            self.mach(&p.machine).is_none() || (p.machine == u.machine && !names.contains(&p.name))
+        }) {
+            self.project = None;
+        }
+        if self.project.is_none() {
+            let running = |m: &Mach| {
+                m.projects
+                    .iter()
+                    .find(|(p, _)| {
+                        self.agents
+                            .iter()
+                            .any(|a| a.machine == m.id && &a.project == p && a.running())
+                    })
+                    .or(m.projects.first())
+                    .map(|(p, _)| Id::new(&m.id, p))
+            };
+            self.project = self.machines.iter().find_map(running);
         }
         for p in &names {
-            let mine: Vec<&Agent> = self.agents.iter().filter(|a| &a.project == p).collect();
+            let pid = Id::new(&u.machine, p);
+            let mine = self.project_agents(&pid);
             let keep = self
                 .tab
-                .get(p)
+                .get(&pid)
                 .is_some_and(|t| mine.iter().any(|a| &a.name == t));
+            let pick = mine
+                .iter()
+                .find(|a| a.running())
+                .or(mine.first())
+                .map(|a| a.name.clone());
             if !keep {
-                match mine.iter().find(|a| a.running()).or(mine.first()) {
-                    Some(a) => self.tab.insert(p.clone(), a.name.clone()),
-                    None => self.tab.remove(p),
+                match pick {
+                    Some(name) => self.tab.insert(pid, name),
+                    None => self.tab.remove(&pid),
                 };
             }
         }
         self.notified
-            .retain(|name, _| self.agents.iter().any(|a| &a.name == name));
+            .retain(|id, _| self.agents.iter().any(|a| a.id() == *id));
         if watched {
-            let shown = self.current().map(|a| a.name.clone());
-            for (name, text, bell) in notifications(&before, &self.agents, shown.as_deref()) {
-                let now = Instant::now();
-                if may_notify(self.notified.get(&name).copied(), now) {
-                    self.notified.insert(name.clone(), now);
+            let shown = self.current().map(Agent::id);
+            let now: Vec<Agent> = self
+                .agents
+                .iter()
+                .filter(|a| a.machine == u.machine)
+                .cloned()
+                .collect();
+            for (id, text, bell) in notifications(&before, &now, shown.as_ref()) {
+                let at = Instant::now();
+                if may_notify(self.notified.get(&id).copied(), at) {
+                    self.notified.insert(id.clone(), at);
+                    let name = if id.machine.is_empty() {
+                        id.name.clone()
+                    } else {
+                        format!("{}/{}", self.label(&id.machine), id.name)
+                    };
                     write_out(&notice_sequence(&name, text, bell));
                 }
             }
@@ -603,151 +846,142 @@ impl App {
     fn current(&self) -> Option<&Agent> {
         let p = self.project.as_ref()?;
         let name = self.tab.get(p)?;
-        self.agents.iter().find(|a| &a.name == name)
-    }
-    fn project_agents(&self, project: &str) -> Vec<&Agent> {
         self.agents
             .iter()
-            .filter(|a| a.project == project)
+            .find(|a| a.machine == p.machine && &a.name == name)
+    }
+    fn project_agents(&self, project: &Id) -> Vec<&Agent> {
+        self.agents
+            .iter()
+            .filter(|a| a.machine == project.machine && a.project == project.name)
             .collect()
     }
-    fn open_agent(&mut self, name: &str) {
-        if let Some(a) = self.agents.iter().find(|a| a.name == name).cloned() {
-            self.project = Some(a.project.clone());
-            self.collapsed.remove(&a.project);
-            self.tab.insert(a.project, a.name);
+    fn open_agent(&mut self, id: &Id) {
+        if let Some(a) = self
+            .agents
+            .iter()
+            .find(|a| a.machine == id.machine && a.name == id.name)
+            .cloned()
+        {
+            let project = a.project_id();
+            self.collapsed.remove(&project);
+            self.project = Some(project.clone());
+            self.tab.insert(project, a.name);
             self.view.scroll = 0;
             self.view.next = None;
             self.sel = None;
         }
     }
 
-    /// Show nothing for the agent (its pane is gone or holds another run). Whether that changed the screen.
+    /// Show nothing for the agent (its pane is gone, holds another run, or its computer is down).
+    /// Whether that changed the screen.
     fn blank(&mut self) -> bool {
-        self.view.raw.clear();
+        self.view.last = None;
+        self.view.pending = None;
         !std::mem::take(&mut self.view.rows).is_empty()
     }
     /// Read the current agent's screen and schedule the next read. Whether the screen changed.
     fn capture(&mut self, core: &Core) -> bool {
-        let changed = self.read_screen(core);
+        let Some(changed) = self.read_screen(core) else {
+            // The answer from another computer is on its way.
+            self.view.next = Some(Instant::now() + SOON);
+            return false;
+        };
         self.view.quiet = if changed { 0 } else { self.view.quiet + 1 };
         self.view.next = Some(Instant::now() + capture_every(self.view.quiet));
         changed
     }
-    /// Read the current agent's screen from tmux, resizing its window to the view first. Whether
-    /// the screen changed.
-    fn read_screen(&mut self, core: &Core) -> bool {
+    /// Read the current agent's screen, resizing its window to the view first. Whether the screen
+    /// changed; None while the answer of another computer is still to come.
+    fn read_screen(&mut self, core: &Core) -> Option<bool> {
         let Some(a) = self.current().filter(|a| a.running()).cloned() else {
-            self.view.pane.clear();
-            return self.blank();
+            self.view.owner = Default::default();
+            return Some(self.blank());
         };
         let (Some(pane), Some(run)) = (a.pane.clone(), a.run.clone()) else {
-            return self.blank();
+            return Some(self.blank());
         };
-        if self.view.pane != pane {
+        let owner = (a.machine.clone(), pane.clone());
+        if self.view.owner != owner {
             self.view = View {
-                pane: pane.clone(),
+                owner,
                 ..View::default()
             };
         }
         let (w, h) = (self.term.width, self.term.height);
         if w < 2 || h < 2 {
-            return false;
+            return Some(false);
+        }
+        if !a.machine.is_empty() {
+            return self.read_remote(&a, &run, (w, h));
         }
         if self.view.asked != (w, h) {
             // The pane comes from the last list; check it still holds this run before resizing it.
-            // The capture below checks it again, in its own call.
-            if self.verified(core, &a).is_none() {
-                return self.blank();
+            // The read below checks it again, in its own call.
+            if bridge::verified(core, &pane, &run).is_err() {
+                self.poke();
+                return Some(self.blank());
             }
             self.view.asked = (w, h);
             self.touched.insert(pane.clone());
-            // resize-window sets window-size to manual. With no client attached, unset it at once:
-            // tmux 3.8 keeps the size and nothing is left behind however the app ends. With a
-            // client attached, unsetting would hand the window straight back to that client's
-            // size, so it stays manual until the app leaves.
-            let unset = format!("set-option -wu -t {pane} window-size");
-            let _ = core.tm(&[
-                "resize-window",
-                "-t",
-                &pane,
-                "-x",
-                &w.to_string(),
-                "-y",
-                &h.to_string(),
-                ";",
-                "if-shell",
-                "-F",
-                "-t",
-                &pane,
-                "#{==:#{session_attached},0}",
-                &unset,
-            ]);
+            let _ = bridge::resize(core, &pane, w, h);
         }
-        let (start, end) = (
-            format!("-{}", self.view.scroll),
-            format!("{}", h as i64 - 1 - self.view.scroll as i64),
-        );
-        let mut args = vec!["capture-pane", "-p", "-e", "-t", &pane];
-        if self.view.scroll > 0 {
-            args.extend(["-S", &start, "-E", &end]);
+        Some(
+            match bridge::read_screen(core, &pane, &run, h, self.view.scroll) {
+                Ok(Some(s)) => self.show(s),
+                Ok(None) => {
+                    self.poke();
+                    self.blank()
+                }
+                Err(_) => false,
+            },
+        )
+    }
+    /// The screen of an agent on another computer: one request at a time, the answer taken up on a
+    /// later pass. The bridge there does the resizing.
+    fn read_remote(&mut self, a: &Agent, run: &str, (w, h): (u16, u16)) -> Option<bool> {
+        if self.refused(&a.machine).is_some() {
+            return Some(self.blank());
         }
-        args.extend([
-            ";",
-            "display-message",
-            "-p",
-            "-t",
-            &pane,
-            "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_width} #{pane_height} #{history_size} #{@pctl_run}",
-        ]);
-        let out = match core.tm(&args) {
-            Ok(out) => out,
-            Err(e) if e.to_string().contains("can't find") => {
-                self.poke();
-                return self.blank();
-            }
-            Err(_) => return false,
-        };
-        let (body, last) = out.rsplit_once('\n').unwrap_or(("", out.as_str()));
-        let mut fields = last.splitn(7, ' ');
-        let m: Vec<u64> = fields
-            .by_ref()
-            .take(6)
-            .filter_map(|v| v.parse().ok())
-            .collect();
-        // What was read belongs to the pane's run now; if that is not the agent's, show none of it.
-        if fields.next() != Some(run.as_str()) {
-            self.poke();
-            return self.blank();
+        if let Some(rx) = self.view.pending.take() {
+            return match rx.try_recv() {
+                Ok(Ok(v)) if v["ok"] == json!(true) => Some(self.show(Screen::from_answer(&v))),
+                Ok(Ok(v))
+                    if v["error"]
+                        .as_str()
+                        .is_some_and(|e| e.starts_with("changed:")) =>
+                {
+                    self.poke_machine(&a.machine);
+                    Some(self.blank())
+                }
+                Ok(_) | Err(mpsc::TryRecvError::Disconnected) => Some(false),
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.view.pending = Some(rx);
+                    None
+                }
+            };
         }
-        if out == self.view.raw {
+        let op = json!({
+            "op": "screen", "agent": a.name, "run": run,
+            "width": w, "height": h, "scroll": self.view.scroll,
+        });
+        self.view.pending = self.request(&a.machine, op, None);
+        None
+    }
+    /// Take a screen as the view. Whether it differs from the one shown.
+    fn show(&mut self, s: Screen) -> bool {
+        if self.view.last.as_ref() == Some(&s) {
             return false;
         }
-        if m.len() == 6 {
-            self.view.cursor = (m[2] == 1).then_some((m[0] as u16, m[1] as u16));
-            self.view.size = (m[3] as u16, m[4] as u16);
-            self.view.history = m[5] as usize;
-            self.view.scroll = self.view.scroll.min(self.view.history);
-        }
-        self.view.rows = term::parse_capture(body);
-        self.view.raw = out;
+        self.view.cursor = s.cursor;
+        self.view.size = s.size;
+        self.view.history = s.history;
+        self.view.scroll = self.view.scroll.min(s.history);
+        self.view.rows = term::parse_capture(&s.text);
+        self.view.last = Some(s);
         true
     }
 
-    /// The agent's pane, if it still holds the agent's current run. Panes are cached from the
-    /// last list (every 1.5 s); after a restart or a new tmux server the same pane id can belong
-    /// to another process, and nothing must be typed into it. Used before resizing; typing and
-    /// pasting check inside the call that sends (`while_run`).
-    fn verified(&mut self, core: &Core, a: &Agent) -> Option<String> {
-        let (pane, run) = (a.pane.clone()?, a.run.clone()?);
-        match core.tm(&["display-message", "-p", "-t", &pane, "#{@pctl_run}"]) {
-            Ok(r) if r.trim() == run => Some(pane),
-            _ => {
-                self.poke();
-                None
-            }
-        }
-    }
     /// Something was typed: the echo is on its way, so look at once and often.
     fn read_soon(&mut self) {
         self.view.next = Some(Instant::now());
@@ -758,7 +992,7 @@ impl App {
             "{} changed (restarted or moved); not typing until the list catches up",
             a.name
         ));
-        self.poke();
+        self.poke_machine(&a.machine);
     }
     fn send_key(&mut self, core: &Core, k: &KeyEvent) {
         let Some(a) = self.current().filter(|a| a.running()).cloned() else {
@@ -767,11 +1001,12 @@ impl App {
         let Some((lit, key)) = term::key_args(k) else {
             return;
         };
-        if self
-            .typed
-            .as_ref()
-            .is_some_and(|(t, _)| (&t.pane, &t.run) != (&a.pane, &a.run))
-        {
+        if let Some(why) = self.refused(&a.machine) {
+            return self.say(format!("{why}; not typing"));
+        }
+        if self.typed.as_ref().is_some_and(|(t, _)| {
+            (&t.machine, &t.name, &t.pane, &t.run) != (&a.machine, &a.name, &a.pane, &a.run)
+        }) {
             self.flush_typed(core);
         }
         let (_, parts) = self.typed.get_or_insert_with(|| (a, vec![]));
@@ -784,7 +1019,7 @@ impl App {
             self.flush_typed(core);
         }
     }
-    /// Send the typed keys: one tmux call checks the run and types them all.
+    /// Send the typed keys: one call checks the run and types them all.
     fn flush_typed(&mut self, core: &Core) {
         let Some((a, parts)) = self.typed.take() else {
             return;
@@ -792,17 +1027,18 @@ impl App {
         let (Some(pane), Some(run)) = (&a.pane, &a.run) else {
             return self.changed(&a);
         };
-        let send: Vec<String> = parts
-            .iter()
-            .map(|(lit, key)| {
-                format!(
-                    "send-keys -t {pane} {}-- {}",
-                    if *lit { "-l " } else { "" },
-                    quote(key)
-                )
-            })
-            .collect();
-        match while_run(core, pane, run, &send.join(" ; "), "") {
+        if !a.machine.is_empty() {
+            let keys: Vec<Value> = parts
+                .iter()
+                .map(|(literal, key)| json!({"literal": literal, "key": key}))
+                .collect();
+            let op = json!({"op": "keys", "agent": a.name, "run": run, "keys": keys});
+            if let Some(rx) = self.request(&a.machine, op, None) {
+                self.tasks.push((rx, Task::Keys(a)));
+            }
+            return self.read_soon();
+        }
+        match bridge::type_keys(core, pane, run, &parts) {
             Ok(true) => {}
             Ok(false) => self.changed(&a),
             Err(e) => self.say(format!("Could not type into {}: {e:#}", a.name)),
@@ -817,25 +1053,20 @@ impl App {
         let (Some(pane), Some(run)) = (&a.pane, &a.run) else {
             return self.changed(&a);
         };
-        // One tmux command carries about 16 KB; a longer paste goes in 8 KB pieces into one buffer,
-        // then out as one bracketed paste.
-        // One buffer per app: two apps pasting at once must not mix their text.
-        let buffer = format!("pctl-app-{}", std::process::id());
-        let mut r = Ok(String::new());
-        for (i, piece) in chunks(text, 8192).into_iter().enumerate() {
-            let append = if i == 0 { "-b" } else { "-ab" };
-            r = r.and_then(|_| core.tm(&["set-buffer", append, &buffer, "--", &literal(piece)]));
+        if !a.machine.is_empty() {
+            if text.len() > REMOTE_PASTE_MAX {
+                return self.say(format!(
+                    "Could not paste: {} characters is too much to send to another computer",
+                    text.chars().count()
+                ));
+            }
+            let op = json!({"op": "paste", "agent": a.name, "run": run, "text": text});
+            if let Some(rx) = self.request(&a.machine, op, None) {
+                self.tasks.push((rx, Task::Paste(a)));
+            }
+            return self.read_soon();
         }
-        let r = r.and_then(|_| {
-            while_run(
-                core,
-                pane,
-                run,
-                &format!("paste-buffer -p -d -b {buffer} -t {pane}"),
-                &format!(" ; delete-buffer -b {buffer}"),
-            )
-        });
-        match r {
+        match bridge::paste_text(core, pane, run, text) {
             Ok(true) => {}
             Ok(false) => self.changed(&a),
             Err(e) => self.say(format!("Could not paste: {e:#}")),
@@ -873,18 +1104,13 @@ impl App {
             }
             if let KeyCode::Char(d @ '1'..='9') = k.code {
                 let n = d as usize - '1' as usize;
-                let tabs: Vec<String> = self
+                let tabs: Vec<Id> = self
                     .project
-                    .as_deref()
-                    .map(|p| {
-                        self.project_agents(p)
-                            .iter()
-                            .map(|a| a.name.clone())
-                            .collect()
-                    })
+                    .as_ref()
+                    .map(|p| self.project_agents(p).iter().map(|a| a.id()).collect())
                     .unwrap_or_default();
-                if let Some(name) = tabs.get(n) {
-                    self.open_agent(&name.clone());
+                if let Some(id) = tabs.get(n) {
+                    self.open_agent(&id.clone());
                 }
                 return;
             }
@@ -920,7 +1146,7 @@ impl App {
 
     fn action(&mut self, core: &Core, a: Action) {
         self.flush_typed(core);
-        let current = self.current().map(|a| a.name.clone());
+        let current = self.current().map(Agent::id);
         match a {
             Action::NewTab => match self.project.clone() {
                 Some(p) => self.new_tab(core, &p),
@@ -935,11 +1161,7 @@ impl App {
                 let Some(p) = self.project.clone() else {
                     return;
                 };
-                let tabs: Vec<String> = self
-                    .project_agents(&p)
-                    .iter()
-                    .map(|a| a.name.clone())
-                    .collect();
+                let tabs: Vec<Id> = self.project_agents(&p).iter().map(|a| a.id()).collect();
                 if tabs.is_empty() {
                     return;
                 }
@@ -996,13 +1218,31 @@ impl App {
 
     fn side_rows(&self) -> Vec<SideRow> {
         let mut rows = vec![];
-        for (p, _) in &self.projects {
-            rows.push(SideRow::Project(p.clone()));
-            if !self.collapsed.contains(p) {
-                for a in self.project_agents(p) {
-                    rows.push(SideRow::Agent(a.name.clone()));
+        for m in &self.machines {
+            if self.multi() {
+                rows.push(SideRow::Machine(m.id.clone()));
+                if self.collapsed_machines.contains(&m.id) {
+                    continue;
                 }
-                rows.push(SideRow::Add(p.clone()));
+            }
+            if let Some(why) = m.unusable().filter(|_| !m.is_local()) {
+                rows.push(SideRow::Note(if why == "connecting" {
+                    "connecting…".into()
+                } else {
+                    format!("down: {why}")
+                }));
+            } else if self.multi() && m.is_local() && m.loaded && !m.connected {
+                rows.push(SideRow::Note("no pctl server here".into()));
+            }
+            for (p, _) in &m.projects {
+                let pid = Id::new(&m.id, p);
+                rows.push(SideRow::Project(pid.clone()));
+                if !self.collapsed.contains(&pid) {
+                    for a in self.project_agents(&pid) {
+                        rows.push(SideRow::Agent(a.id()));
+                    }
+                    rows.push(SideRow::Add(pid));
+                }
             }
         }
         rows
@@ -1013,30 +1253,40 @@ impl App {
             KeyCode::Up => self.side_sel = self.side_sel.saturating_sub(1),
             KeyCode::Down => self.side_sel = (self.side_sel + 1).min(rows.len().saturating_sub(1)),
             KeyCode::Esc | KeyCode::Right => self.in_sidebar = false,
-            KeyCode::Left => {
-                if let Some(SideRow::Project(p)) = rows.get(self.side_sel) {
+            KeyCode::Left => match rows.get(self.side_sel) {
+                Some(SideRow::Project(p)) => {
                     self.collapsed.insert(p.clone());
                 }
-            }
+                Some(SideRow::Machine(m)) => {
+                    self.collapsed_machines.insert(m.clone());
+                }
+                _ => {}
+            },
             KeyCode::Enter => match rows.get(self.side_sel).cloned() {
+                Some(SideRow::Machine(m)) => self.click_machine(&m),
                 Some(SideRow::Project(p)) => self.click_project(&p),
                 Some(SideRow::Agent(a)) => {
                     self.open_agent(&a);
                     self.in_sidebar = false;
                 }
                 Some(SideRow::Add(p)) => self.agent_form(&p),
-                None => {}
+                Some(SideRow::Note(_)) | None => {}
             },
             _ => {}
         }
     }
-    fn click_project(&mut self, p: &str) {
-        if self.project.as_deref() == Some(p) && !self.collapsed.contains(p) {
-            self.collapsed.insert(p.to_string());
+    fn click_project(&mut self, p: &Id) {
+        if self.project.as_ref() == Some(p) && !self.collapsed.contains(p) {
+            self.collapsed.insert(p.clone());
         } else {
             self.collapsed.remove(p);
-            self.project = Some(p.to_string());
+            self.project = Some(p.clone());
             self.view.next = None;
+        }
+    }
+    fn click_machine(&mut self, m: &str) {
+        if !self.collapsed_machines.remove(m) {
+            self.collapsed_machines.insert(m.to_string());
         }
     }
 
@@ -1098,11 +1348,20 @@ impl App {
                 Some(Hit::Agent(a) | Hit::Tab(a)) => self.agent_menu(&a, m.column, m.row),
                 Some(Hit::Project(p) | Hit::NewAgent(p) | Hit::NewTab(p)) => {
                     self.modal = Some(Modal::Menu {
-                        title: p.clone(),
+                        title: p.name.clone(),
                         items: vec![
                             ("New bash tab".into(), Act::NewTab(p.clone())),
                             ("New agent…".into(), Act::NewAgent(p)),
                         ],
+                        x: m.column,
+                        y: m.row,
+                        sel: 0,
+                    })
+                }
+                Some(Hit::Machine(id)) if self.mach(&id).is_some_and(|m| !m.is_local()) => {
+                    self.modal = Some(Modal::Menu {
+                        title: self.label(&id),
+                        items: vec![("Reconnect".into(), Act::Reconnect(id))],
                         x: m.column,
                         y: m.row,
                         sel: 0,
@@ -1138,6 +1397,7 @@ impl App {
     }
     fn click(&mut self, core: &Core, h: Hit) {
         match h {
+            Hit::Machine(m) => self.click_machine(&m),
             Hit::Project(p) => self.click_project(&p),
             Hit::Agent(a) | Hit::Tab(a) => {
                 self.open_agent(&a);
@@ -1183,31 +1443,32 @@ impl App {
         }
     }
 
-    fn agent_menu(&mut self, name: &str, x: u16, y: u16) {
-        let Some(a) = self.agents.iter().find(|a| a.name == name) else {
+    fn agent_menu(&mut self, id: &Id, x: u16, y: u16) {
+        let Some(a) = self
+            .agents
+            .iter()
+            .find(|a| a.machine == id.machine && a.name == id.name)
+        else {
             return;
         };
         let mut items = vec![];
         if a.running() {
             items.push((
                 "Restart (same conversation)".to_string(),
-                Act::Restart(a.name.clone()),
+                Act::Restart(a.id()),
             ));
-            items.push(("Stop…".to_string(), Act::Stop(a.name.clone(), None)));
+            items.push(("Stop…".to_string(), Act::Stop(a.id(), None)));
         } else {
-            items.push(("Start".to_string(), Act::Start(a.name.clone(), false)));
+            items.push(("Start".to_string(), Act::Start(a.id(), false)));
             items.push((
                 "Start a new conversation…".to_string(),
-                Act::Start(a.name.clone(), true),
+                Act::Start(a.id(), true),
             ));
-            items.push((
-                "Remove from the list…".to_string(),
-                Act::Remove(a.name.clone()),
-            ));
+            items.push(("Remove from the list…".to_string(), Act::Remove(a.id())));
         }
         items.push((
             "New agent in this project".to_string(),
-            Act::NewAgent(a.project.clone()),
+            Act::NewAgent(a.project_id()),
         ));
         self.modal = Some(Modal::Menu {
             title: a.name.clone(),
@@ -1229,7 +1490,10 @@ impl App {
             Act::Start(a, true) => self.confirm_new(&a),
             Act::Remove(a) => {
                 self.modal = Some(Modal::Confirm {
-                    text: format!("Remove {a} from the list? Its conversation is not deleted."),
+                    text: format!(
+                        "Remove {} from the list? Its conversation is not deleted.",
+                        a.name
+                    ),
                     button: "Remove",
                     act: Act::Remove(a),
                 })
@@ -1282,42 +1546,83 @@ impl App {
             sel,
         });
     }
-    fn confirm_stop(&mut self, a: &str) {
+    fn confirm_stop(&mut self, a: &Id) {
         // Stop the run the person saw when asked, not whatever runs by the time they confirm.
         let run = self
             .agents
             .iter()
-            .find(|x| x.name == a)
+            .find(|x| x.machine == a.machine && x.name == a.name)
             .and_then(|x| x.run.clone());
         self.modal = Some(Modal::Confirm {
-            text: quips::stop_question(self.keys.wit, a),
+            text: quips::stop_question(self.keys.wit, &a.name),
             button: "Stop",
-            act: Act::Stop(a.to_string(), run),
+            act: Act::Stop(a.clone(), run),
         });
     }
-    fn confirm_new(&mut self, a: &str) {
+    fn confirm_new(&mut self, a: &Id) {
         self.modal = Some(Modal::Confirm {
             text: format!(
-                "Start {a} in a new conversation? pctl forgets the saved one, so Start and Restart no longer resume it."
+                "Start {} in a new conversation? pctl forgets the saved one, so Start and Restart no longer resume it.",
+                a.name
             ),
             button: "Start new",
-            act: Act::Start(a.to_string(), true),
+            act: Act::Start(a.clone(), true),
         });
     }
+    /// Do one action on an agent or project: here at once, on another computer as a request whose
+    /// answer is taken up later (`finish`), so a slow or down computer never holds up the app.
+    fn act_on(&mut self, core: &Core, machine: &str, req: Value, ok: String, then: Then) {
+        if machine.is_empty() {
+            match bridge::act(core, &req) {
+                Ok(_) => {
+                    self.say(ok);
+                    if let Then::Opened(p, name) | Then::Form(p, name) = then {
+                        self.opened(&p, &name);
+                    }
+                }
+                Err(e) => self.say(format!("{e:#}")),
+            }
+            self.view.next = None;
+            self.poke();
+            return;
+        }
+        let mut op = req;
+        op["op"] = json!("act");
+        if let Some(rx) = self.request(machine, op, Some(ACT_WITHIN)) {
+            self.tasks.push((
+                rx,
+                Task::Act {
+                    machine: machine.into(),
+                    ok,
+                    then,
+                },
+            ));
+        } else if let Some(Modal::Form(f)) = &mut self.modal {
+            f.busy = false;
+        }
+    }
     fn run_act(&mut self, core: &Core, act: Act) {
-        let r: Result<String> = match &act {
-            Act::Restart(a) => core
-                .session_restart(a, false, false)
-                .map(|_| format!("Restarted {a}")),
-            Act::Start(a, new) => core.session_start(a, *new).map(|_| format!("Started {a}")),
-            Act::Remove(a) => core.session_remove(a).map(|_| format!("Removed {a}")),
-            Act::Stop(a, seen) => core.session_get(a).and_then(|s| {
-                let (id, run) = (
-                    s["agent_id"].as_str().unwrap_or_default(),
-                    seen.as_deref().or(s["run_id"].as_str()).unwrap_or_default(),
-                );
-                core.terminate(id, run).map(|_| format!("Stopped {a}"))
-            }),
+        let (machine, req, ok) = match &act {
+            Act::Restart(a) => (
+                &a.machine,
+                json!({"action": "restart", "agent": a.name}),
+                format!("Restarted {}", a.name),
+            ),
+            Act::Start(a, new) => (
+                &a.machine,
+                json!({"action": "start", "agent": a.name, "new": new}),
+                format!("Started {}", a.name),
+            ),
+            Act::Remove(a) => (
+                &a.machine,
+                json!({"action": "remove", "agent": a.name}),
+                format!("Removed {}", a.name),
+            ),
+            Act::Stop(a, seen) => (
+                &a.machine,
+                json!({"action": "stop", "agent": a.name, "run": seen}),
+                format!("Stopped {}", a.name),
+            ),
             Act::NewAgent(p) => {
                 self.agent_form(p);
                 return;
@@ -1326,23 +1631,41 @@ impl App {
                 self.new_tab(core, p);
                 return;
             }
-            Act::Theme(t) => core.set_theme(*t).map(|_| {
-                self.theme = *t;
-                self.custom = None;
-                self.pal = t.palette();
-                format!("Theme: {} — {}", t.label().to_lowercase(), t.about())
-            }),
-            Act::Custom(name) => match self.customs.iter().find(|c| &c.name == name) {
-                Some(c) => {
-                    self.pal = c.palette;
-                    self.custom = Some(name.clone());
-                    Ok(format!("Theme: {name} — {}", c.about))
+            Act::Reconnect(m) => {
+                let label = self.label(m);
+                if let Some(m) = self.machines.iter_mut().find(|x| &x.id == m) {
+                    m.reconnect();
                 }
-                None => Err(anyhow::anyhow!(
-                    "theme {name} is gone from the theme folder"
-                )),
-            },
+                self.say(format!("Reconnecting {label}…"));
+                return;
+            }
+            Act::Theme(t) => {
+                let r = core.set_theme(*t).map(|_| {
+                    self.theme = *t;
+                    self.custom = None;
+                    self.pal = t.palette();
+                    format!("Theme: {} — {}", t.label().to_lowercase(), t.about())
+                });
+                return self.themed(r);
+            }
+            Act::Custom(name) => {
+                let r = match self.customs.iter().find(|c| &c.name == name) {
+                    Some(c) => {
+                        self.pal = c.palette;
+                        self.custom = Some(name.clone());
+                        Ok(format!("Theme: {name} — {}", c.about))
+                    }
+                    None => Err(anyhow::anyhow!(
+                        "theme {name} is gone from the theme folder"
+                    )),
+                };
+                return self.themed(r);
+            }
         };
+        let machine = machine.clone();
+        self.act_on(core, &machine, req, ok, Then::Nothing);
+    }
+    fn themed(&mut self, r: Result<String>) {
         match r {
             Ok(msg) => self.say(msg),
             Err(e) => self.say(format!("{e:#}")),
@@ -1353,49 +1676,49 @@ impl App {
 
     /// A new bash tab right away, like a new tab in a terminal app: named
     /// `<project>-bash<n>`, in the project's folder.
-    fn new_tab(&mut self, core: &Core, project: &str) {
-        let root = self
-            .projects
-            .iter()
-            .find(|(n, _)| n == project)
-            .map(|(_, r)| r.clone())
-            .unwrap_or_default();
+    fn new_tab(&mut self, core: &Core, project: &Id) {
         let name = (1..)
-            .map(|n| format!("{project}-bash{n}"))
-            .find(|c| !self.agents.iter().any(|a| &a.name == c))
+            .map(|n| format!("{}-bash{n}", project.name))
+            .find(|c| {
+                !self
+                    .agents
+                    .iter()
+                    .any(|a| a.machine == project.machine && &a.name == c)
+            })
             .unwrap_or_default();
-        match core.session_add(
-            &name,
-            Path::new(&root),
-            Some(project),
-            vec![bash(), "-l".into()],
-            None,
-            None,
-            None,
-        ) {
-            Ok(_) => {
-                self.added(&name, project);
-                self.project = Some(project.into());
-                self.tab.insert(project.into(), name.clone());
-                self.say(format!("Opened {name}"));
-            }
-            Err(e) => self.say(format!("{e:#}")),
-        }
-        self.view.next = None;
-        self.poke();
+        let req = json!({"action": "new_tab", "project": project.name, "name": name});
+        let ok = format!("Opened {name}");
+        self.act_on(
+            core,
+            &project.machine,
+            req,
+            ok,
+            Then::Opened(project.clone(), name),
+        );
     }
-    fn added(&mut self, name: &str, project: &str) {
+    /// An agent just added: listed at once, even if the next refresh does not have it yet, and
+    /// shown in its project.
+    fn opened(&mut self, project: &Id, name: &str) {
         let a = Agent {
+            machine: project.machine.clone(),
             name: name.into(),
-            project: project.into(),
+            project: project.name.clone(),
             status: "starting".into(),
             pane: None,
             run: None,
         };
         self.agents.push(a.clone());
-        self.fresh.insert(name.into(), (a, Instant::now()));
+        self.fresh.insert(a.id(), (a, Instant::now()));
+        self.project = Some(project.clone());
+        self.tab.insert(project.clone(), name.into());
+        self.view.next = None;
+        self.poke_machine(&project.machine);
     }
     fn project_form(&mut self) {
+        // Projects are made on this computer; with others shown, it needs a server of its own.
+        if self.multi() && !self.local_connected() {
+            return self.say("No pctl server runs on this computer, so it cannot hold a project");
+        }
         self.modal = Some(Modal::Form(Form {
             project: None,
             fields: vec![
@@ -1414,17 +1737,21 @@ impl App {
             ],
             focus: 0,
             error: String::new(),
+            busy: false,
         }));
     }
-    fn agent_form(&mut self, project: &str) {
+    fn agent_form(&mut self, project: &Id) {
+        if let Some(why) = self.refused(&project.machine) {
+            return self.say(why);
+        }
+        // On another computer the folder is a path there; the form only holds the text typed.
         let root = self
-            .projects
-            .iter()
-            .find(|(n, _)| n == project)
+            .mach(&project.machine)
+            .and_then(|m| m.projects.iter().find(|(n, _)| *n == project.name))
             .map(|(_, r)| r.clone())
             .unwrap_or_default();
         self.modal = Some(Modal::Form(Form {
-            project: Some(project.to_string()),
+            project: Some(project.clone()),
             fields: vec![
                 Field {
                     label: "Name",
@@ -1465,6 +1792,7 @@ impl App {
             ],
             focus: 0,
             error: String::new(),
+            busy: false,
         }));
     }
     fn modal_key(&mut self, core: &Core, k: KeyEvent) {
@@ -1495,6 +1823,7 @@ impl App {
                 let field = &mut f.fields[f.focus];
                 match k.code {
                     KeyCode::Esc => self.modal = None,
+                    KeyCode::Enter if f.busy => {}
                     KeyCode::Enter => self.submit(core),
                     KeyCode::Tab | KeyCode::Down => f.focus = (f.focus + 1) % n,
                     KeyCode::BackTab | KeyCode::Up => f.focus = (f.focus + n - 1) % n,
@@ -1527,6 +1856,9 @@ impl App {
         let Some(Modal::Form(f)) = &mut self.modal else {
             return;
         };
+        if f.busy {
+            return;
+        }
         let v = |i: usize| f.fields[i].value.trim().to_string();
         let mut new_root = String::new();
         let result: Result<String> = match f.project.clone() {
@@ -1540,7 +1872,7 @@ impl App {
                     f.error = "Use letters, digits, '-', '_' or '.' in the name (it is also a msg address).".into();
                     return;
                 }
-                core.register_project(&name, Path::new(&folder))
+                core.register_project(&name, std::path::Path::new(&folder))
                     .map(|pr| {
                         new_root = pr.root;
                     })
@@ -1557,68 +1889,37 @@ impl App {
                     f.error = "Use letters, digits, '-', '_' or '.' in the name (it is also a msg address).".into();
                     return;
                 }
-                let model = (!model.is_empty()).then_some(model);
-                let argv: Result<Vec<String>> = match kind.as_str() {
-                    "Claude Code" => Ok(["claude".to_string()]
-                        .into_iter()
-                        .chain(
-                            model
-                                .clone()
-                                .map(|m| ["--model".into(), m])
-                                .into_iter()
-                                .flatten(),
-                        )
-                        .collect()),
-                    "Codex" => Ok(["codex".to_string()]
-                        .into_iter()
-                        .chain(
-                            model
-                                .clone()
-                                .map(|m| ["-m".into(), m])
-                                .into_iter()
-                                .flatten(),
-                        )
-                        .collect()),
-                    "OpenCode" => Ok(vec!["opencode".into()]),
-                    "bash" => Ok(vec![bash(), "-l".into()]),
-                    _ => crate::parse_command(&command),
-                };
-                let opencode_model = if kind == "OpenCode" {
-                    model.as_deref()
-                } else {
-                    None
-                };
-                argv.and_then(|argv| {
-                    core.session_add(
-                        &name,
-                        Path::new(&folder),
-                        Some(&project),
-                        argv,
-                        None,
-                        (!branch.is_empty()).then_some((branch.as_str(), None)),
-                        opencode_model,
-                    )
-                })
-                .map(|_| name)
+                let req = json!({
+                    "action": "new_agent", "project": project.name, "name": name, "folder": folder,
+                    "kind": kind, "model": model, "command": command, "branch": branch,
+                });
+                if !project.machine.is_empty() {
+                    f.busy = true;
+                    f.error = String::new();
+                    let ok = format!("Started {name}");
+                    let machine = project.machine.clone();
+                    return self.act_on(core, &machine, req, ok, Then::Form(project, name));
+                }
+                bridge::act(core, &req).map(|_| name)
             }
         };
         match result {
             Ok(name) => {
                 let new_project = f.project.is_none();
+                let project = f.project.clone();
                 self.modal = None;
                 if new_project {
-                    self.project = Some(name.clone());
-                    self.projects.push((name.clone(), new_root));
+                    let id = Id::new("", &name);
+                    self.project = Some(id.clone());
+                    self.machines[0].projects.push((name.clone(), new_root));
                     self.say(format!("Added project {name}. Now add its first agent."));
                     self.poke();
-                    self.agent_form(&name);
+                    self.agent_form(&id);
                 } else {
                     self.say(format!("Started {name}"));
                     self.poke();
-                    let project = self.project.clone().unwrap_or_default();
-                    self.added(&name, &project);
-                    self.tab.insert(project, name);
-                    self.view.next = None;
+                    let project = project.unwrap_or_default();
+                    self.opened(&project, &name);
                 }
             }
             Err(e) => {
@@ -1740,20 +2041,24 @@ impl App {
             )],
             p.body(),
         );
-        let plus = Rect {
-            x: r.x + r.width.saturating_sub(4),
-            y,
-            width: 3,
-            height: 1,
-        };
-        f.render_widget(
-            Paragraph::new("[+]").style(Style::default().fg(p.accent)),
-            plus,
-        );
-        self.hit(plus, Hit::NewProject);
+        // Projects are made on this computer: with others shown, only where a server runs.
+        if !self.multi() || self.local_connected() {
+            let plus = Rect {
+                x: r.x + r.width.saturating_sub(4),
+                y,
+                width: 3,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new("[+]").style(Style::default().fg(p.accent)),
+                plus,
+            );
+            self.hit(plus, Hit::NewProject);
+        }
         y += 1;
-        if self.projects.is_empty() {
-            if self.loaded {
+        let rows = self.side_rows();
+        if rows.is_empty() {
+            if self.machines[0].loaded {
                 line(
                     f,
                     y + 1,
@@ -1774,7 +2079,9 @@ impl App {
             }
             return;
         }
-        let rows = self.side_rows();
+        // With machines shown, their projects sit one step in.
+        let step = u16::from(self.multi());
+        let pad = |n: u16| " ".repeat((n + step) as usize);
         for (i, row) in rows.iter().enumerate() {
             if y >= r.y + r.height {
                 break;
@@ -1791,20 +2098,61 @@ impl App {
                 width: r.width,
                 height: 1,
             };
+            let muted = |machine: &str| self.refused(machine).is_some();
             match row {
-                SideRow::Project(name) => {
-                    let open = !self.collapsed.contains(name);
-                    let mine = self.project_agents(name);
+                SideRow::Machine(id) => {
+                    let open = !self.collapsed_machines.contains(id);
+                    let blocked = self
+                        .agents
+                        .iter()
+                        .filter(|a| &a.machine == id && a.status == "blocked")
+                        .count();
+                    let st = if muted(id) {
+                        Style::default().fg(p.muted).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+                    };
+                    let mut spans = vec![
+                        Span::raw(if open { " ▾ " } else { " ▸ " }),
+                        Span::styled(fit(&self.label(id), r.width.saturating_sub(7) as usize), st),
+                    ];
+                    if blocked > 0 {
+                        spans.push(Span::styled(
+                            format!(" !{blocked}"),
+                            Style::default().fg(p.danger).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    line(f, y, spans, base);
+                    self.hit(rect, Hit::Machine(id.clone()));
+                }
+                SideRow::Note(text) => {
+                    let text = fit(text, r.width.saturating_sub(4 + step) as usize);
+                    line(
+                        f,
+                        y,
+                        vec![Span::raw(format!("{}{text}", pad(2)))],
+                        Style::default().fg(p.muted),
+                    );
+                }
+                SideRow::Project(id) => {
+                    let open = !self.collapsed.contains(id);
+                    let mine = self.project_agents(id);
                     let blocked = mine.iter().filter(|a| a.status == "blocked").count();
-                    let mut spans = vec![Span::raw(if open { " ▾ " } else { " ▸ " })];
-                    let current = self.project.as_deref() == Some(name);
-                    let st = if current {
+                    let mut spans = vec![Span::raw(format!(
+                        "{}{}",
+                        pad(0),
+                        if open { " ▾ " } else { " ▸ " }
+                    ))];
+                    let current = self.project.as_ref() == Some(id);
+                    let st = if muted(&id.machine) {
+                        Style::default().fg(p.muted)
+                    } else if current {
                         Style::default().fg(p.text).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(p.text)
                     };
                     spans.push(Span::styled(
-                        fit(name, r.width.saturating_sub(7) as usize),
+                        fit(&id.name, r.width.saturating_sub(7 + step) as usize),
                         st,
                     ));
                     if blocked > 0 {
@@ -1814,31 +2162,40 @@ impl App {
                         ));
                     }
                     line(f, y, spans, base);
-                    self.hit(rect, Hit::Project(name.clone()));
+                    self.hit(rect, Hit::Project(id.clone()));
                 }
-                SideRow::Agent(name) => {
-                    let a = self.agents.iter().find(|a| &a.name == name).cloned();
+                SideRow::Agent(id) => {
+                    let a = self
+                        .agents
+                        .iter()
+                        .find(|a| a.machine == id.machine && a.name == id.name)
+                        .cloned();
                     let (g, gs) = self.glyph(a.as_ref().map_or("", |a| a.status.as_str()));
-                    let current = self.current().is_some_and(|c| &c.name == name);
+                    let current = self.current().is_some_and(|c| c.id() == *id);
                     let st = if current && !selected_row {
                         Style::default().fg(p.ink).bg(p.accent)
+                    } else if muted(&id.machine) {
+                        Style::default().fg(p.muted).bg(base.bg.unwrap_or(p.bg))
                     } else {
                         base
                     };
                     let spans = vec![
-                        Span::raw("   "),
+                        Span::raw(pad(3)),
                         Span::styled(g, gs),
                         Span::raw(" "),
-                        Span::raw(fit(name, r.width.saturating_sub(6) as usize)),
+                        Span::raw(fit(&id.name, r.width.saturating_sub(6 + step) as usize)),
                     ];
                     line(f, y, spans, st);
-                    self.hit(rect, Hit::Agent(name.clone()));
+                    self.hit(rect, Hit::Agent(id.clone()));
                 }
                 SideRow::Add(project) => {
                     line(
                         f,
                         y,
-                        vec![Span::styled("   + agent", Style::default().fg(p.muted))],
+                        vec![Span::styled(
+                            format!("{}+ agent", pad(3)),
+                            Style::default().fg(p.muted),
+                        )],
                         base,
                     );
                     self.hit(rect, Hit::NewAgent(project.clone()));
@@ -1854,7 +2211,7 @@ impl App {
         let Some(project) = self.project.clone() else {
             return;
         };
-        let current = self.current().map(|a| a.name.clone());
+        let current = self.current().map(Agent::id);
         let tabs: Vec<Agent> = self.project_agents(&project).into_iter().cloned().collect();
         let mut x = r.x;
         for a in &tabs {
@@ -1864,7 +2221,7 @@ impl App {
             if x + w + 3 > r.x + r.width {
                 break;
             }
-            let on = current.as_deref() == Some(a.name.as_str());
+            let on = current.as_ref() == Some(&a.id());
             let st = if on {
                 Style::default()
                     .fg(p.text)
@@ -1886,7 +2243,7 @@ impl App {
                 ])),
                 rect,
             );
-            self.hit(rect, Hit::Tab(a.name.clone()));
+            self.hit(rect, Hit::Tab(a.id()));
             x += w + 1;
         }
         let plus = Rect {
@@ -1934,11 +2291,28 @@ impl App {
             );
             app.hit(b, hit);
         };
-        if !self.loaded {
+        if !self.machines[0].loaded {
             center(f, vec![Line::from(quips::loading(self.keys.wit))]);
             return;
         }
         let Some(project) = self.project.clone() else {
+            if self.multi() {
+                // Machines are saved, so this is not a first run: say where each stands.
+                let mut lines = vec![Line::from("Nothing to show yet."), Line::from("")];
+                for m in &self.machines {
+                    lines.push(Line::from(match m.unusable() {
+                        Some(why) if !m.is_local() => format!("{}: {why}", m.label),
+                        _ if !m.connected => format!("{}: no pctl server", m.label),
+                        _ => format!("{}: no projects", m.label),
+                    }));
+                }
+                lines.push(Line::from(""));
+                let y = center(f, lines);
+                if self.local_connected() {
+                    button(self, f, y, " + Project ", Hit::NewProject);
+                }
+                return;
+            }
             let [hello, line] = quips::welcome(self.keys.wit);
             let mut lines = vec![
                 Line::from(Span::styled(
@@ -1948,7 +2322,7 @@ impl App {
                 Line::from(line),
                 Line::from(""),
             ];
-            if !self.connected {
+            if !self.local_connected() {
                 lines.push(Line::from("No PCTL server is running yet."));
                 lines.push(Line::from(
                     "Start pctl with PCTL_STANDALONE=1 (or where [server] start_env allows it),",
@@ -1960,11 +2334,23 @@ impl App {
             button(self, f, y, " + Project ", Hit::NewProject);
             return;
         };
+        if let Some(why) = self.refused(&project.machine) {
+            // The last list stays in the sidebar; the screen says why there is none.
+            center(
+                f,
+                vec![
+                    Line::from(why),
+                    Line::from(""),
+                    Line::from("It is tried again on its own. Right-click the machine to try now."),
+                ],
+            );
+            return;
+        }
         let Some(a) = self.current().cloned() else {
             let y = center(
                 f,
                 vec![
-                    Line::from(format!("No agents in {project} yet.")),
+                    Line::from(format!("No agents in {} yet.", project.name)),
                     Line::from(quips::empty_project(self.keys.wit)),
                     Line::from(""),
                 ],
@@ -1991,17 +2377,17 @@ impl App {
                     Line::from(""),
                 ],
             );
-            button(self, f, y, " Start ", Hit::Start(a.name.clone(), false));
+            button(self, f, y, " Start ", Hit::Start(a.id(), false));
             button(
                 self,
                 f,
                 y + 2,
                 " Start a new conversation… ",
-                Hit::Start(a.name.clone(), true),
+                Hit::Start(a.id(), true),
             );
             return;
         }
-        if self.view.pane != a.pane.clone().unwrap_or_default() {
+        if self.view.owner != (a.machine.clone(), a.pane.clone().unwrap_or_default()) {
             return;
         }
         // The theme colours the terminal too: default background and text, and the 16 ANSI
@@ -2113,7 +2499,12 @@ impl App {
         )];
         if let Some(a) = self.current() {
             let (g, gs) = self.glyph(&a.status);
-            left.push(Span::raw(format!(" {} / ", a.project)));
+            let on = if self.multi() {
+                format!(" {} · {} / ", self.label(&a.machine), a.project)
+            } else {
+                format!(" {} / ", a.project)
+            };
+            left.push(Span::raw(on));
             left.push(Span::styled(g, gs));
             left.push(Span::raw(format!(" {} {}", a.name, a.status)));
         }
@@ -2346,7 +2737,12 @@ impl App {
                     if form.project.is_none() {
                         "New project".into()
                     } else {
-                        format!("New agent in {}", form.project.clone().unwrap_or_default())
+                        let p = form.project.clone().unwrap_or_default();
+                        if p.machine.is_empty() {
+                            format!("New agent in {}", p.name)
+                        } else {
+                            format!("New agent in {} on {}", p.name, self.label(&p.machine))
+                        }
                     }
                     .as_str(),
                 );
@@ -2482,18 +2878,6 @@ fn plain_name(n: &str) -> bool {
         && n.chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
 }
-/// bash, as Ghostty starts it here: `$SHELL` when that is bash, else a Homebrew or system bash.
-fn bash() -> String {
-    let shell = std::env::var("SHELL").unwrap_or_default();
-    if Path::new(&shell).file_name().is_some_and(|n| n == "bash") {
-        return shell;
-    }
-    ["/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash"]
-        .into_iter()
-        .find(|p| Path::new(p).is_file())
-        .unwrap_or("bash")
-        .to_string()
-}
 fn fit(s: &str, w: usize) -> String {
     if s.chars().count() <= w {
         s.to_string()
@@ -2526,8 +2910,9 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn agent(name: &str, status: &str) -> Agent {
+    fn agent_on(machine: &str, name: &str, status: &str) -> Agent {
         Agent {
+            machine: machine.into(),
             name: name.into(),
             project: "p".into(),
             status: status.into(),
@@ -2535,11 +2920,17 @@ mod tests {
             run: Some("r".into()),
         }
     }
-    fn statuses(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    fn agent(name: &str, status: &str) -> Agent {
+        agent_on("", name, status)
+    }
+    fn statuses(pairs: &[(&str, &str)]) -> HashMap<Id, String> {
         pairs
             .iter()
-            .map(|(n, s)| (n.to_string(), s.to_string()))
+            .map(|(n, s)| (Id::new("", n), s.to_string()))
             .collect()
+    }
+    fn a_id(name: &str) -> Id {
+        Id::new("", name)
     }
     #[test]
     fn only_an_agent_this_app_saw_working_is_announced() {
@@ -2555,7 +2946,7 @@ mod tests {
         );
         assert_eq!(
             notifications(&statuses(&[("a", "working")]), &[agent("a", "idle")], None),
-            vec![("a".to_string(), "done", false)]
+            vec![(a_id("a"), "done", false)]
         );
         assert_eq!(
             notifications(
@@ -2563,7 +2954,7 @@ mod tests {
                 &[agent("a", "blocked")],
                 None
             ),
-            vec![("a".to_string(), "needs you", true)]
+            vec![(a_id("a"), "needs you", true)]
         );
         // Idle to idle, and anything that was not working, says nothing.
         assert!(notifications(&statuses(&[("a", "idle")]), &[agent("a", "idle")], None).is_empty());
@@ -2575,10 +2966,23 @@ mod tests {
             notifications(
                 &statuses(&[("a", "working")]),
                 &[agent("a", "idle")],
-                Some("a")
+                Some(&a_id("a"))
             )
             .is_empty()
         );
+    }
+    #[test]
+    fn the_same_name_on_two_computers_is_two_agents() {
+        // "a" was working here and on morty; only morty's finished.
+        let mut before = statuses(&[("a", "working")]);
+        before.insert(Id::new("morty", "a"), "working".into());
+        let now = [agent_on("", "a", "working"), agent_on("morty", "a", "idle")];
+        assert_eq!(
+            notifications(&before, &now, None),
+            vec![(Id::new("morty", "a"), "done", false)]
+        );
+        // Looking at this computer's "a" does not hide morty's.
+        assert_eq!(notifications(&before, &now, Some(&a_id("a"))).len(), 1);
     }
     #[test]
     fn notices_are_rate_limited_per_agent() {
@@ -2613,15 +3017,6 @@ mod tests {
         assert_eq!(view_cell(t, 0, 0, 99, 99), (0, 9), "with no rows yet");
     }
     #[test]
-    fn long_pastes_split_on_character_boundaries() {
-        let s = "가".repeat(10); // 3 bytes each
-        let parts = super::chunks(&s, 7);
-        assert_eq!(parts.concat(), s);
-        assert!(parts.iter().all(|p| p.len() <= 7 && !p.is_empty()));
-        assert_eq!(super::chunks("", 8), [""]);
-        assert_eq!(super::chunks("abc", 8), ["abc"]);
-    }
-    #[test]
     fn names_typed_in_the_app_are_plain() {
         for ok in ["panel-main", "54_Agent_Panel", "a.b"] {
             assert!(super::plain_name(ok), "{ok}");
@@ -2629,5 +3024,24 @@ mod tests {
         for bad in ["PS1='$ '; clear", "a b", "-x", ".hidden", "a/b", "한글"] {
             assert!(!super::plain_name(bad), "{bad}");
         }
+    }
+    #[test]
+    fn a_list_answer_becomes_an_update() {
+        let ok = json!({"ok": true, "sessions": [{"name": "a"}], "projects": [{"name": "p", "root": "/r"}], "connected": true});
+        let u = Update::from_list("rm", Ok(ok));
+        assert_eq!(u.machine, "rm");
+        assert_eq!(u.agents.expect("agents").len(), 1);
+        assert_eq!(u.projects, [("p".to_string(), "/r".to_string())]);
+        assert!(u.connected);
+        // Sessions that could not be read still list the projects and the server.
+        let part = json!({"sessions": [], "error": "no registry", "projects": [{"name": "p", "root": "/r"}], "connected": true});
+        let u = Update::from_list("", Ok(part));
+        assert_eq!(u.agents.expect_err("error"), "no registry");
+        assert_eq!(u.projects.len(), 1);
+        // A bridge that answered "not ok", and one that did not answer at all.
+        let bad = Update::from_list("rm", Ok(json!({"ok": false, "error": "boom"})));
+        assert_eq!(bad.agents.expect_err("error"), "boom");
+        let gone = Update::from_list("rm", Err(anyhow::anyhow!("down: eof")));
+        assert!(gone.agents.is_err() && !gone.connected);
     }
 }
