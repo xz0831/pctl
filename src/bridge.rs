@@ -29,6 +29,12 @@ const CURSOR_FORMAT: &str =
 /// `pctl bridge` (hidden): answer requests on stdin with one JSON object per line on stdout, until
 /// stdin closes. The hello goes out first, unasked, so a client knows who answered.
 pub fn run(core: &Core) -> Result<()> {
+    // Same rule as the app: it types into any pane. Over ssh the caller's variables do not arrive,
+    // so this only stops local agents; ssh access already reaches tmux directly anyway.
+    anyhow::ensure!(
+        !crate::app::agent_caller(core),
+        "agent_caller: the bridge serves the app of a person on another computer; agents use `pctl session` and `msg`"
+    );
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     writeln!(out, "{}", hello())?;

@@ -30,6 +30,8 @@ PCTL_STATE={state2} exec /bin/sh -c "$line"
 ''')
 ssh.chmod(0o700)
 env = dict(os.environ, PATH=f'{bindir}:{os.environ["PATH"]}', PCTL_SSH=str(ssh), PCTL_REMOTE_BIN=B, PCTL_TMUX=T, XDG_CONFIG_HOME=str(config), PCTL_STATE=str(state))
+for k in ('PCTL_AGENT_ID', 'PCTL_RUN_ID', 'TMUX'):  # ssh does not carry them; this suite may run in an agent's pane
+    env.pop(k, None)
 results = []
 
 def case(name, fn):
@@ -188,6 +190,11 @@ try:
         b.close()
         assert not (state3/'tmux.sock').exists(), 'the bridge must not start a server'
     case('bridge list with no server says connected: false and starts nothing', bridge_without_a_server)
+
+    def bridge_refuses_an_agent():
+        p = subprocess.run([B, '--state', str(state2), '--tmux', T, 'bridge'], input='', text=True, capture_output=True, timeout=30, env=dict(env, PCTL_AGENT_ID='some-agent'))
+        assert p.returncode == 2 and 'agent_caller' in p.stderr and p.stdout == '', (p.returncode, p.stdout, p.stderr)
+    case('an agent of this computer is refused before the hello', bridge_refuses_an_agent)
 
     def bridge_screen_keys_paste():
         b = Bridge()
