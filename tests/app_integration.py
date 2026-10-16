@@ -75,6 +75,19 @@ try:
         assert until(lambda: 'got: hello app' in cli('session', 'read', 'a-main', '--lines', '10'))
         assert until(lambda: 'got: hello app' in screen()), screen()
     case('typing goes to the agent on screen', typing)
+    def identity():
+        s0 = cli('session', 'get', 'a-main')
+        sock = str(state / 'tmux.sock')
+        subprocess.run([T, '-S', sock, 'set-option', '-p', '-t', s0['pane'], '@pctl_run', 'someone-else'], check=True)
+        text('should not arrive'); keys('Enter')
+        time.sleep(1.5)
+        raw = subprocess.run([T, '-S', sock, 'capture-pane', '-p', '-t', s0['pane']], text=True, capture_output=True).stdout
+        assert 'should not arrive' not in raw, 'nothing is typed into a pane whose run changed (pctl itself now calls it lost)'
+        subprocess.run([T, '-S', sock, 'set-option', '-p', '-t', s0['pane'], '@pctl_run', s0['run_id']], check=True)
+        assert until(lambda: 'a-main idle' in status(), 10), status()
+        text('after restore'); keys('Enter')
+        assert until(lambda: 'got: after restore' in cli('session', 'read', 'a-main', '--lines', '10'))
+    case('a pane whose run changed gets no typing; it works again once the run matches', identity)
     def switching():
         click(*side('a-block'))
         assert until(lambda: 'a-block blocked' in status() and 'Do you want to proceed?' in screen()), screen()

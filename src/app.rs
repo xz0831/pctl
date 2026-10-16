@@ -46,6 +46,7 @@ struct Agent {
     project: String,
     status: String,
     pane: Option<String>,
+    run: Option<String>,
 }
 impl Agent {
     fn running(&self) -> bool {
@@ -312,6 +313,7 @@ impl App {
                         project: s["project"].as_str().unwrap_or_default().into(),
                         status: s["status"].as_str().unwrap_or("unknown").into(),
                         pane: s["pane"].as_str().map(String::from),
+                        run: s["run_id"].as_str().map(String::from),
                     })
                     .collect();
             }
@@ -373,7 +375,11 @@ impl App {
             self.view.pane.clear();
             return;
         };
-        let pane = a.pane.clone().unwrap_or_default();
+        // The pane comes from the last list; check it still holds this run before touching it.
+        let Some(pane) = self.verified(core, &a, false) else {
+            self.view.rows.clear();
+            return;
+        };
         if self.view.pane != pane {
             self.view = View {
                 pane: pane.clone(),
@@ -426,6 +432,27 @@ impl App {
         self.view.rows = term::parse_capture(body);
     }
 
+    /// The agent's pane, if it still holds the agent's current run. Panes are cached from the
+    /// last list (every 1.5 s); after a restart or a new tmux server the same pane id can belong
+    /// to another process, and nothing must be typed into it.
+    /// shortcut: check and send are two tmux calls; a restart in the milliseconds between them
+    /// could slip through. Use one `if-shell -F` command if that ever matters.
+    fn verified(&mut self, core: &Core, a: &Agent, loud: bool) -> Option<String> {
+        let (pane, run) = (a.pane.clone()?, a.run.clone()?);
+        match core.tm(&["display-message", "-p", "-t", &pane, "#{@pctl_run}"]) {
+            Ok(r) if r.trim() == run => Some(pane),
+            _ => {
+                if loud {
+                    self.say(format!(
+                        "{} changed (restarted or moved); not typing until the list catches up",
+                        a.name
+                    ));
+                }
+                self.poke();
+                None
+            }
+        }
+    }
     fn send_key(&mut self, core: &Core, k: &KeyEvent) {
         let Some(a) = self.current().filter(|a| a.running()).cloned() else {
             return;
@@ -433,7 +460,9 @@ impl App {
         let Some((lit, key)) = term::key_args(k) else {
             return;
         };
-        let pane = a.pane.unwrap_or_default();
+        let Some(pane) = self.verified(core, &a, true) else {
+            return;
+        };
         let key = literal(&key);
         let r = if lit {
             core.tm(&["send-keys", "-t", &pane, "-l", "--", &key])
@@ -450,7 +479,9 @@ impl App {
         let Some(a) = self.current().filter(|a| a.running()).cloned() else {
             return;
         };
-        let pane = a.pane.unwrap_or_default();
+        let Some(pane) = self.verified(core, &a, true) else {
+            return;
+        };
         let r = core
             .tm(&["set-buffer", "-b", "pctl-app", "--", &literal(text)])
             .and_then(|_| core.tm(&["paste-buffer", "-p", "-d", "-b", "pctl-app", "-t", &pane]));
@@ -948,6 +979,7 @@ impl App {
             project: project.into(),
             status: "starting".into(),
             pane: None,
+            run: None,
         };
         self.agents.push(a.clone());
         self.fresh.insert(name.into(), (a, Instant::now()));
@@ -1740,6 +1772,10 @@ impl App {
                     Line::from(
                         "restart, stop, start and remove; drag the sidebar edge; wheel scrolls the terminal.",
                     ),
+                    Line::from(
+                        "States (● idle or working, ! waiting for you, × exited, ○ stopped) are read from",
+                    ),
+                    Line::from("the screen: a best guess that can lag a moment."),
                     Line::from(""),
                 ];
                 for (_, _, action, text) in ACTIONS {
