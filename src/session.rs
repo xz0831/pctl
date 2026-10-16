@@ -207,11 +207,21 @@ fn activity(raw: &str, title: &str) -> &'static str {
         ]
         .iter()
         .any(|k| l.contains(k))
-    }) {
+    }) || tail.iter().any(|(_, l)| menu_row(l))
+    {
         "blocked"
     } else {
         "idle"
     }
+}
+/// A numbered choice under the cursor ("› 1. Update now", "❯ 2. No") waits for a person: Codex
+/// update and trust menus carry none of the question words, and Enter would pick the choice.
+fn menu_row(l: &str) -> bool {
+    l.strip_prefix(['›', '❯']).is_some_and(|r| {
+        let r = r.trim_start();
+        let digits = r.len() - r.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        digits > 0 && r[digits..].starts_with('.')
+    })
 }
 fn codex_root() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".codex/sessions")
@@ -639,6 +649,11 @@ mod tests {
             activity("> \n? for shortcuts\n", "Remember | codex"),
             "idle"
         );
+        let update = "Update available · 0.162.0 → 0.163.0\n› 1. Update now (runs `sh -c ...`)\n  2. Skip\n  enter continue · esc skip\n";
+        assert_eq!(activity(update, ""), "blocked");
+        assert_eq!(activity("  1. Update now\n› 2. Skip\n", ""), "blocked");
+        assert_eq!(activity("› Ask Codex to do anything\n", ""), "idle");
+        assert_eq!(activity("❯ 10 items left\n", ""), "idle");
     }
     #[test]
     fn launch_argv_assigns_then_resumes() {
