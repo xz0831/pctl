@@ -123,7 +123,7 @@ fn api(core: &Core, path: &str, body: &[u8]) -> (u16, Value) {
     let r = match path {
         "/api/sessions" => core.session_list().map(|all| {
             all.iter()
-                .map(|s| json!({"name": s["name"], "project": s["project"], "harness": s["harness"], "status": s["status"]}))
+                .map(|s| json!({"name": s["name"], "project": s["project"], "harness": s["harness"], "status": s["status"], "branch": s["branch"]}))
                 .collect()
         }),
         "/api/screen" => {
@@ -154,6 +154,11 @@ fn handle(core: &Core, token: &str, s: &mut TcpStream) -> (u16, String) {
         Ok(r) => r,
         Err(_) => {
             let _ = respond(s, 400, "text/plain", b"bad request");
+            // Closing with unread input (an oversized body) sends a reset that can reach the
+            // client before the 400; drain a bounded amount first.
+            let _ = s.shutdown(std::net::Shutdown::Write);
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = std::io::copy(&mut Read::take(&*s, 1 << 20), &mut std::io::sink());
             return (400, "-".into());
         }
     };

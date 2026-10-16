@@ -40,7 +40,7 @@ async function list() {
     st.className = 'st ' + s.status;
     st.textContent = s.status;
     const p = document.createElement('small');
-    p.textContent = (s.project || '') + ' · ' + (s.harness || '-');
+    p.textContent = [s.project || '', s.harness || '-', s.branch].filter(Boolean).join(' · ');
     li.append(b, st, p);
     return li;
   }));

@@ -232,7 +232,7 @@ fn codex_root() -> PathBuf {
 }
 
 impl Core {
-    fn by_name<'a>(&self, r: &'a Registry, name: &str) -> Result<&'a Agent> {
+    pub(crate) fn by_name<'a>(&self, r: &'a Registry, name: &str) -> Result<&'a Agent> {
         let found: Vec<_> = r.agents.iter().filter(|a| a.name == name).collect();
         match found[..] {
             [a] => Ok(a),
@@ -270,6 +270,7 @@ impl Core {
             "name": a.name, "agent_id": a.id, "project": project.map(|p| &p.name),
             "cwd": a.cwd, "harness": harness(&a.argv), "conversation": a.conversation,
             "run_id": run.map(|x| &x.id), "pane": run.map(|x| &x.pane),
+            "branch": a.worktree.as_ref().map(|w| &w.branch),
             "process": process, "status": status,
         })
     }
@@ -391,6 +392,9 @@ impl Core {
     }
     /// Register (project by name, default the cwd's folder name), opt in to terminal input
     /// and the mailbox, and start. Names are unique across the whole state: they are msg addresses.
+    /// With `worktree` (branch, base) the session runs in a new git worktree of the cwd's repo
+    /// (project default: the repo's folder name); `model` sets an OpenCode session's model.
+    #[allow(clippy::too_many_arguments)]
     pub fn session_add(
         &self,
         name: &str,
@@ -398,6 +402,8 @@ impl Core {
         project: Option<&str>,
         argv: Vec<String>,
         conversation: Option<&str>,
+        worktree: Option<(&str, Option<&str>)>,
+        model: Option<&str>,
     ) -> Result<Value> {
         // Moving a Herdr session: start it already resuming its conversation.
         if let Some(c) = conversation {
@@ -421,9 +427,24 @@ impl Core {
         if self.server().is_err() {
             crate::server_start_allowed()?;
         }
+        let argv = match model {
+            Some(m) => crate::worktree::with_model(argv, m)?,
+            None => argv,
+        };
+        crate::validate_name(name)?;
+        crate::validate_argv(&argv)?;
+        // Last check-and-create step: everything that can refuse runs before it.
+        let (cwd, wt) = match worktree {
+            Some((branch, base)) => {
+                let (path, w) = crate::worktree::create(&cwd, name, branch, base)?;
+                (path, Some(w))
+            }
+            None => (cwd, None),
+        };
+        let folder = wt.as_ref().map_or(cwd.as_path(), |w| Path::new(&w.repo));
         let pname = match project {
             Some(p) => p.to_string(),
-            None => cwd
+            None => folder
                 .file_name()
                 .and_then(|n| n.to_str())
                 .context("cwd has no folder name; pass --project")?
@@ -439,11 +460,12 @@ impl Core {
             None => self.register_project(&pname, &cwd)?.id,
         };
         let a = self.register_agent(&pid, name, &cwd, argv, "generic")?;
-        if let Some(c) = conversation {
+        if conversation.is_some() || wt.is_some() {
             let _lock = self.lock()?;
             let mut r = self.registry()?;
             if let Some(x) = r.agents.iter_mut().find(|x| x.id == a.id) {
-                x.conversation = Some(c.to_string());
+                x.conversation = conversation.map(str::to_string);
+                x.worktree = wt;
             }
             self.save(&r)?;
         }
@@ -684,6 +706,7 @@ mod tests {
             input_mode: "terminal-line".into(),
             collaboration_mode: "mailbox".into(),
             conversation: None,
+            worktree: None,
         };
         r.agents.push(mk("c", &["/x/claude", "--model", "m"]));
         r.agents.push(mk("x", &["codex", "-m", "g"]));
@@ -731,6 +754,7 @@ mod tests {
             input_mode: "native".into(),
             collaboration_mode: "disabled".into(),
             conversation: None,
+            worktree: None,
         };
         let mut b = a.clone();
         b.id = "b".into();

@@ -58,6 +58,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
+    /// Worktrees made by `session add --worktree`: list, and remove when merged.
+    Worktree {
+        #[command(subcommand)]
+        cmd: WorktreeCmd,
+    },
     /// Short role-name mailbox workflow, bound to the launcher PCTL_* context.
     Msg {
         #[command(subcommand)]
@@ -353,6 +358,14 @@ enum MessageCmd {
     },
 }
 #[derive(Subcommand)]
+enum WorktreeCmd {
+    /// Session, status, path, branch, base, dirty files, commits ahead, merged, locked.
+    List,
+    /// Move a stopped session's clean, merged worktree to ~/.Trash, prune it, delete the merged
+    /// branch and unregister the session. Refused otherwise; there is no --force.
+    Remove { name: String },
+}
+#[derive(Subcommand)]
 enum SessionCmd {
     /// Every registered session with process, screen status and conversation ID.
     List,
@@ -371,6 +384,17 @@ enum SessionCmd {
         /// Resume this existing conversation (moving a Herdr session) instead of a new one.
         #[arg(long)]
         conversation: Option<String>,
+        /// Create this new branch in a new worktree beside the cwd's repo (<repo>-wt-<name>) and
+        /// run there. Refused for an existing branch or folder, or a dirty base checkout.
+        #[arg(long, value_name = "BRANCH")]
+        worktree: Option<String>,
+        /// Start point of the branch and where it should merge back (default: the cwd's branch).
+        #[arg(long, requires = "worktree")]
+        base: Option<String>,
+        /// OpenCode model (provider/model) for this session only: a private OpenCode server
+        /// started with OPENCODE_CONFIG_CONTENT. No file is written.
+        #[arg(long)]
+        model: Option<String>,
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
@@ -803,6 +827,9 @@ fn run() -> Result<()> {
                 cwd,
                 project,
                 conversation,
+                worktree,
+                base,
+                model,
                 argv,
             } => print(&core.session_add(
                 &name,
@@ -810,6 +837,8 @@ fn run() -> Result<()> {
                 project.as_deref(),
                 argv,
                 conversation.as_deref(),
+                worktree.as_deref().map(|b| (b, base.as_deref())),
+                model.as_deref(),
             )?)?,
             SessionCmd::Prompt { name, text } => print(&core.session_prompt(&name, &text)?)?,
             SessionCmd::Wait {
@@ -1029,6 +1058,10 @@ fn run() -> Result<()> {
             }
         },
         Cmd::Attach { project } => core.attach(&project)?,
+        Cmd::Worktree { cmd } => match cmd {
+            WorktreeCmd::List => print(&core.worktree_list()?)?,
+            WorktreeCmd::Remove { name } => print(&core.worktree_remove(&name)?)?,
+        },
         Cmd::Web { listen, token_file } => pctl::web::serve(&core, &listen, &token_file)?,
         Cmd::Ui { project } => pctl::ui::run(&core, project)?,
         Cmd::Demo => {
