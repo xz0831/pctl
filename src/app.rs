@@ -30,7 +30,7 @@ use ratatui::{
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
-    io,
+    io::{self, Write},
     path::Path,
     sync::mpsc,
     thread,
@@ -39,6 +39,10 @@ use std::{
 
 const KINDS: [&str; 5] = ["bash", "Claude Code", "Codex", "OpenCode", "Command"];
 const CAPTURE_EVERY: Duration = Duration::from_millis(120);
+/// A drag longer than this is refused: an OSC 52 sequence this size is more than a terminal reads.
+const MAX_COPY: usize = 100_000;
+/// At most one notification per agent in this long.
+const NOTICE_EVERY: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 struct Agent {
@@ -180,6 +184,10 @@ struct App {
     touched: HashSet<String>,
     /// The last left click, to tell a double-click.
     last_click: Option<(Instant, Hit)>,
+    /// The selection in the terminal view: where the drag began and where it is now.
+    sel: Option<(term::Cell, term::Cell)>,
+    /// When each agent was last announced, for the 10-second limit.
+    notified: HashMap<String, Instant>,
 }
 
 /// A launched agent, or anything inside this server's tmux (a bash tab of the app itself), must not
@@ -199,6 +207,68 @@ fn chunks(s: &str, max: usize) -> Vec<&str> {
         rest = &rest[cut..];
     }
     out.push(rest);
+    out
+}
+
+/// Write a complete escape sequence (a clipboard write, a notification) to the same terminal the
+/// drawing goes to. Called between frames, so it cannot corrupt a half-written one.
+fn write_out(sequence: &str) {
+    let mut out = io::stdout();
+    let _ = out.write_all(sequence.as_bytes());
+    let _ = out.flush();
+}
+
+/// The view cell a mouse position points at: `skip` is how many of the pane's own rows the view
+/// holds above the first drawn one (a taller pane shows its bottom rows, scrolled back the older).
+fn view_cell(term: Rect, skip: u16, rows: usize, column: u16, row: u16) -> term::Cell {
+    let col = column
+        .saturating_sub(term.x)
+        .min(term.width.saturating_sub(1));
+    let r = row.saturating_sub(term.y) as usize + skip as usize;
+    (r.min(rows.saturating_sub(1)) as u16, col)
+}
+
+/// The agent name as it goes into an escape sequence: no control characters, no `;`.
+fn sanitize(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control() && *c != ';')
+        .collect()
+}
+
+/// The notification for one agent: `done` when it went idle, `needs you` when it is blocked.
+fn notice_sequence(name: &str, text: &str, bell: bool) -> String {
+    let mut s = format!("\x1b]777;notify;pctl;{}: {text}\x07", sanitize(name));
+    if bell {
+        s.push('\x07');
+    }
+    s
+}
+
+/// At most one notice per agent per `NOTICE_EVERY`.
+fn may_notify(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|t| now.duration_since(t) >= NOTICE_EVERY)
+}
+
+/// The notifications for states this app watched change: an agent it saw `working` that is now
+/// idle or blocked, never one it sees for the first time and never the one on screen.
+fn notifications(
+    before: &HashMap<String, String>,
+    now: &[Agent],
+    shown: Option<&str>,
+) -> Vec<(String, &'static str, bool)> {
+    let mut out = vec![];
+    for a in now {
+        if before.get(&a.name).map(String::as_str) != Some("working")
+            || shown == Some(a.name.as_str())
+        {
+            continue;
+        }
+        match a.status.as_str() {
+            "idle" => out.push((a.name.clone(), "done", false)),
+            "blocked" => out.push((a.name.clone(), "needs you", true)),
+            _ => {}
+        }
+    }
     out
 }
 
@@ -342,6 +412,8 @@ impl App {
             fresh: HashMap::new(),
             touched: HashSet::new(),
             last_click: None,
+            sel: None,
+            notified: HashMap::new(),
         }
     }
     fn say(&mut self, text: impl Into<String>) {
@@ -354,7 +426,55 @@ impl App {
         }
     }
 
+    /// How many of the pane's own rows the view holds above the first drawn one.
+    fn rows_skip(&self) -> u16 {
+        if self.view.scroll == 0 {
+            self.view.size.1.saturating_sub(self.term.height)
+        } else {
+            0
+        }
+    }
+    fn cell_at(&self, column: u16, row: u16) -> term::Cell {
+        view_cell(
+            self.term,
+            self.rows_skip(),
+            self.view.rows.len(),
+            column,
+            row,
+        )
+    }
+    /// Copy what the drag covers to the person's clipboard: an OSC 52 write on our own stdout,
+    /// which every modern terminal turns into a clipboard (and tmux with `set-clipboard on` into
+    /// a paste buffer). A plain click, or a drag over nothing, copies nothing.
+    fn copy_selection(&mut self) {
+        let Some((a, b)) = self.sel else {
+            return;
+        };
+        if a == b {
+            self.sel = None;
+            return;
+        }
+        let text = term::selection_text(&self.view.rows, a, b);
+        if text.is_empty() {
+            return;
+        }
+        let count = text.chars().count();
+        if text.len() >= MAX_COPY {
+            self.say(format!("Selection too long to copy ({count} characters)"));
+            return;
+        }
+        write_out(&format!("\x1b]52;c;{}\x07", term::base64(text.as_bytes())));
+        self.say(format!("Copied {count} characters"));
+    }
+
     fn apply(&mut self, u: Update) {
+        // The statuses this app watched before this update, for the notifications below.
+        let before: HashMap<String, String> = self
+            .agents
+            .iter()
+            .map(|a| (a.name.clone(), a.status.clone()))
+            .collect();
+        let watched = self.loaded;
         self.loaded = true;
         self.connected = u.connected;
         self.projects = u.projects;
@@ -399,6 +519,18 @@ impl App {
                 };
             }
         }
+        self.notified
+            .retain(|name, _| self.agents.iter().any(|a| &a.name == name));
+        if watched {
+            let shown = self.current().map(|a| a.name.clone());
+            for (name, text, bell) in notifications(&before, &self.agents, shown.as_deref()) {
+                let now = Instant::now();
+                if may_notify(self.notified.get(&name).copied(), now) {
+                    self.notified.insert(name.clone(), now);
+                    write_out(&notice_sequence(&name, text, bell));
+                }
+            }
+        }
     }
     fn current(&self) -> Option<&Agent> {
         let p = self.project.as_ref()?;
@@ -418,6 +550,7 @@ impl App {
             self.tab.insert(a.project, a.name);
             self.view.scroll = 0;
             self.view.next = None;
+            self.sel = None;
         }
     }
 
@@ -585,6 +718,7 @@ impl App {
     }
 
     fn key(&mut self, core: &Core, k: KeyEvent) {
+        self.sel = None;
         if self.modal.is_some() {
             return self.modal_key(core, k);
         }
@@ -775,6 +909,7 @@ impl App {
             .map(|(_, h)| h.clone());
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                self.sel = None; // a click anywhere else clears the last selection
                 let in_modal = matches!(
                     hit,
                     Some(
@@ -797,6 +932,15 @@ impl App {
                             match h {
                                 Hit::Agent(a) | Hit::Tab(a) if double => {
                                     self.agent_menu(&a, m.column, m.row)
+                                }
+                                // A press in the terminal starts a selection there; the drag
+                                // below extends it and the release copies it.
+                                Hit::Terminal => {
+                                    self.sel = Some((
+                                        self.cell_at(m.column, m.row),
+                                        self.cell_at(m.column, m.row),
+                                    ));
+                                    self.in_sidebar = false;
                                 }
                                 h => self.click(core, h),
                             }
@@ -823,12 +967,23 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) if self.drag => {
                 self.sidebar_w = m.column.clamp(16, 60);
             }
-            MouseEventKind::Up(_) => self.drag = false,
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some((a, _)) = self.sel {
+                    let b = self.cell_at(m.column, m.row);
+                    self.sel = Some((a, b));
+                }
+            }
+            MouseEventKind::Up(_) => {
+                self.drag = false;
+                self.copy_selection();
+            }
             MouseEventKind::ScrollUp if matches!(hit, Some(Hit::Terminal)) => {
+                self.sel = None;
                 self.view.scroll = (self.view.scroll + 3).min(self.view.history);
                 self.view.next = None;
             }
             MouseEventKind::ScrollDown if matches!(hit, Some(Hit::Terminal)) => {
+                self.sel = None;
                 self.view.scroll = self.view.scroll.saturating_sub(3);
                 self.view.next = None;
             }
@@ -1719,11 +1874,7 @@ impl App {
         }
         // A pane taller than this area (another viewer sized it) shows its bottom rows: the input
         // line and any dialog live there, and nothing must be typed into a row out of sight.
-        let skip = if self.view.scroll == 0 {
-            self.view.size.1.saturating_sub(r.height)
-        } else {
-            0
-        };
+        let skip = self.rows_skip();
         for (i, row) in self
             .view
             .rows
@@ -1745,6 +1896,38 @@ impl App {
                 };
                 let (nx, _) = buf.set_stringn(x, y, text, (r.x + r.width - x) as usize, style);
                 x = nx;
+            }
+        }
+        // The selection sits on top of the text, reversed, the way a terminal shows one. A wide
+        // character is marked once, on the cell it starts at.
+        if let Some((a, b)) = self.sel {
+            let (a, b) = if a <= b { (a, b) } else { (b, a) };
+            let drawn = self
+                .view
+                .rows
+                .iter()
+                .skip(skip as usize)
+                .take(r.height as usize);
+            for (i, row) in drawn.enumerate() {
+                let vrow = skip as usize + i;
+                if vrow < a.0 as usize || vrow > b.0 as usize {
+                    continue;
+                }
+                let (start, end) = if vrow == a.0 as usize && vrow == b.0 as usize {
+                    (a.1 as usize, b.1 as usize)
+                } else if vrow == a.0 as usize {
+                    (a.1 as usize, usize::MAX)
+                } else if vrow == b.0 as usize {
+                    (0, b.1 as usize)
+                } else {
+                    (0, usize::MAX)
+                };
+                for (_, x, w) in term::row_cells(row) {
+                    if x + w > start && x <= end && x < r.width as usize {
+                        let cell = &mut buf[(r.x + x as u16, r.y + i as u16)];
+                        cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                    }
+                }
             }
         }
         if self.view.scroll > 0 {
@@ -2193,6 +2376,95 @@ fn inner(r: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn agent(name: &str, status: &str) -> Agent {
+        Agent {
+            name: name.into(),
+            project: "p".into(),
+            status: status.into(),
+            pane: Some("%1".into()),
+            run: Some("r".into()),
+        }
+    }
+    fn statuses(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(n, s)| (n.to_string(), s.to_string()))
+            .collect()
+    }
+    #[test]
+    fn only_an_agent_this_app_saw_working_is_announced() {
+        // The first update after start announces nothing, and neither does an agent first seen now.
+        assert!(notifications(&statuses(&[]), &[agent("a", "idle")], None).is_empty());
+        assert!(
+            notifications(
+                &statuses(&[("other", "working")]),
+                &[agent("a", "idle")],
+                None
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            notifications(&statuses(&[("a", "working")]), &[agent("a", "idle")], None),
+            vec![("a".to_string(), "done", false)]
+        );
+        assert_eq!(
+            notifications(
+                &statuses(&[("a", "working")]),
+                &[agent("a", "blocked")],
+                None
+            ),
+            vec![("a".to_string(), "needs you", true)]
+        );
+        // Idle to idle, and anything that was not working, says nothing.
+        assert!(notifications(&statuses(&[("a", "idle")]), &[agent("a", "idle")], None).is_empty());
+        assert!(
+            notifications(&statuses(&[("a", "blocked")]), &[agent("a", "idle")], None).is_empty()
+        );
+        // The agent on screen is the one being looked at already.
+        assert!(
+            notifications(
+                &statuses(&[("a", "working")]),
+                &[agent("a", "idle")],
+                Some("a")
+            )
+            .is_empty()
+        );
+    }
+    #[test]
+    fn notices_are_rate_limited_per_agent() {
+        let t = Instant::now();
+        assert!(may_notify(None, t));
+        assert!(!may_notify(Some(t), t + Duration::from_secs(9)));
+        assert!(may_notify(Some(t), t + Duration::from_secs(10)));
+    }
+    #[test]
+    fn a_notice_carries_a_plain_name_and_a_bell_only_when_blocked() {
+        assert_eq!(
+            notice_sequence("panel-main", "done", false),
+            "\x1b]777;notify;pctl;panel-main: done\x07"
+        );
+        assert_eq!(
+            notice_sequence("a;b\x1b\x07c", "needs you", true),
+            "\x1b]777;notify;pctl;abc: needs you\x07\x07"
+        );
+        assert_eq!(sanitize("x;y\x0bz\tc"), "xyzc");
+    }
+    #[test]
+    fn a_mouse_cell_maps_through_the_pane_offset_and_the_scroll() {
+        let t = Rect::new(27, 1, 10, 5);
+        assert_eq!(view_cell(t, 0, 20, 28, 2), (1, 1));
+        assert_eq!(
+            view_cell(t, 10, 20, 28, 2),
+            (11, 1),
+            "scrolled back, a screen row holds an older line"
+        );
+        assert_eq!(view_cell(t, 0, 20, 5, 2), (1, 0), "left of the view clamps");
+        assert_eq!(view_cell(t, 0, 20, 99, 2), (1, 9), "right of it clamps");
+        assert_eq!(view_cell(t, 0, 0, 99, 99), (0, 9), "with no rows yet");
+    }
     #[test]
     fn long_pastes_split_on_character_boundaries() {
         let s = "가".repeat(10); // 3 bytes each

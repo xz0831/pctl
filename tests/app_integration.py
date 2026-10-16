@@ -4,7 +4,7 @@ outer "monitor" tmux; its screen is read with capture-pane, keys go in with send
 clicks are SGR mouse sequences typed into it. Covers the sidebar, tabs and live terminal, typing,
 clicks, prefix shortcuts, the new-agent form, the right-click menu with its confirmation (and that
 clicks on a box never reach what is behind it; double-click and ctrl+b m open the same menu), Start for a stopped agent, wheel scroll-back,
-Leave (stops nothing, reopens in place, never leaves window-size at manual, even when killed), shortcuts from a config file, the
+drag-to-copy to the clipboard, Leave (stops nothing, reopens in place, never leaves window-size at manual, even when killed), shortcuts from a config file, the
 empty state with no server (which starts nothing), and that agents cannot open the app."""
 import argparse, json, os, pathlib, re, subprocess, tempfile, time
 p = argparse.ArgumentParser(); p.add_argument('--bin', required=True); p.add_argument('--tmux', required=True); p.add_argument('--report', required=True); a = p.parse_args()
@@ -49,6 +49,21 @@ def find(text, row=None, start=0):
 def click(x, y, button=0):
     vt('send-keys', '-t', 'view', '-l', f'\x1b[<{button};{x};{y}M\x1b[<{button};{x};{y}m')
     time.sleep(0.4)
+def drag(x1, y1, x2, y2):
+    """A left press and a drag, the SGR sequences a terminal reports, without the release."""
+    vt('send-keys', '-t', 'view', '-l', f'\x1b[<0;{x1};{y1}M\x1b[<32;{x2};{y2}M')
+    time.sleep(0.4)
+def release(x, y):
+    """The button release that ends a drag or a plain click."""
+    vt('send-keys', '-t', 'view', '-l', f'\x1b[<0;{x};{y}m')
+    time.sleep(0.4)
+def span(text):
+    """1-based (first column, last column, row) of `text` on screen."""
+    for i, line in enumerate(lines()):
+        j = line.find(text)
+        if j >= 0:
+            return j + 1, j + len(text), i + 1
+    raise AssertionError(f'{text!r} not on screen:\n{screen()}')
 def keys(*k): vt('send-keys', '-t', 'view', *k); time.sleep(0.4)
 def dclick(x, y):
     vt('send-keys', '-t', 'view', '-l', f'\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m' * 2); time.sleep(0.4)
@@ -290,6 +305,27 @@ try:
         assert cli('session', 'get', 'g-shell', st=other)['status'] in ('idle', 'unknown')
         subprocess.run([T, '-S', str(other / 'tmux.sock'), 'kill-server'], capture_output=True)
     case('first run: + Project, then the first agent; without leave to start a server the form says why, and PCTL_STANDALONE=1 starts it', first_run)
+    def copy_drag():
+        app()
+        click(*side('a-main'))
+        assert until(lambda: 'alpha / ● a-main' in status() and '>' in screen()), screen()
+        vt('set-option', '-g', 'set-clipboard', 'on')  # the outer tmux then stores an OSC 52 write
+        click(60, 12)  # a plain click in the terminal selects nothing
+        assert vt('show-buffer').strip() == '' and 'Copied' not in status(), (status(), vt('show-buffer'))
+        text('echo HELLO-WORLD'); keys('Enter')
+        assert until(lambda: 'got: echo HELLO-WORLD' in screen()), screen()
+        x1, x2, y = span('got: echo HELLO-WORLD')
+        drag(x1, y, x2, y)
+        hl = lambda: vt('capture-pane', '-p', '-e', '-t', 'view').split('\n')[y - 1]
+        assert until(lambda: '\x1b[7m' in hl()), hl()  # the selection is painted while the drag is held
+        release(x2, y)
+        assert until(lambda: 'Copied 21 characters' in status()), status()
+        assert until(lambda: vt('show-buffer').strip() == 'got: echo HELLO-WORLD'), vt('show-buffer')
+        vt('delete-buffer')
+        drag(x2, y, x1, y)  # dragging backwards copies the same text
+        release(x1, y)
+        assert until(lambda: vt('show-buffer').strip() == 'got: echo HELLO-WORLD'), vt('show-buffer')
+    case('a left drag in the terminal copies the selection to the clipboard, either direction; a plain click copies nothing', copy_drag)
     pathlib.Path(a.report).write_text(json.dumps({'results': results, 'passed': len(results)}, indent=1))
 finally:
     vt('kill-server')

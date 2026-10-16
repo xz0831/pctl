@@ -37,6 +37,10 @@ try:
    for other in rs:
     if other['id']!=r['id']:assert 'isolation-'+r['id'] not in tm('capture-pane','-p','-t',other['pane'])
  case('2x2 four native workers and exact input recipients',four)
+ def server_options():
+  assert tm('show-options','-gv','history-limit').strip()=='20000', tm('show-options','-gv','history-limit')
+  assert tm('show-options','-gv','set-clipboard').strip()=='external', tm('show-options','-gv','set-clipboard')
+ case('the server keeps 20000 lines of scrollback and leaves the clipboard to the terminal',server_options)
  def draft():
   f=root/'draft.txt';f.write_text('draft only\nexit 17\n한글;');r=rs[0];cli('input','draft','--agent',r['agent_id'],'--expected-run',r['id'],'--from-file',f)
   assert 'draft only' not in tm('capture-pane','-p','-t',r['pane']);v=json.loads((state/'drafts'/f"{r['id']}.json").read_text());assert v['sent'] is False
