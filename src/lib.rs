@@ -17,6 +17,7 @@ pub mod sidebar;
 pub mod terminal_input;
 pub mod theme;
 pub mod ui;
+pub mod web;
 
 pub fn now() -> u64 {
     SystemTime::now()

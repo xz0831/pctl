@@ -87,6 +87,16 @@ enum Cmd {
         #[arg(long)]
         project: String,
     },
+    /// Phone page: list sessions, read one screen, type a line. Off unless started; loopback or
+    /// Tailscale address only; needs the token from a 0600 file.
+    Web {
+        /// IP:PORT on loopback or a Tailscale address (100.64.0.0/10, fd7a:115c:a1e0::/48).
+        #[arg(long)]
+        listen: String,
+        /// File holding the access token (mode 0600, at least 32 characters).
+        #[arg(long)]
+        token_file: PathBuf,
+    },
     /// Create two synthetic projects with two native agent panes each.
     Demo,
     /// Synthetic fixture harness only; no model is called.
@@ -1019,6 +1029,7 @@ fn run() -> Result<()> {
             }
         },
         Cmd::Attach { project } => core.attach(&project)?,
+        Cmd::Web { listen, token_file } => pctl::web::serve(&core, &listen, &token_file)?,
         Cmd::Ui { project } => pctl::ui::run(&core, project)?,
         Cmd::Demo => {
             anyhow::ensure!(

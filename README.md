@@ -27,7 +27,7 @@ The real-tmux suites start their own servers in temporary state directories. Eac
 B=target/release/pctl T=$(command -v tmux); mkdir -p test-results
 for s in integration collaboration_integration msg_workflow_integration orchestration_integration \
          session_integration sidebar_integration sidebar_recovery snapshot_batch_integration \
-         team_context_preflight tmux_encoding_integration wake_integration; do
+         team_context_preflight tmux_encoding_integration wake_integration web_integration; do
   python3 tests/$s.py --bin $B --tmux $T --report test-results/$s.json >test-results/$s.out 2>&1; echo "$s exit $?"
 done
 python3 tests/remote_quoting.py --bin $B; echo "remote_quoting exit $?"
@@ -36,6 +36,10 @@ python3 tests/remote_quoting.py --bin $B; echo "remote_quoting exit $?"
 ## Hosts without Herdr
 
 pctl starts its tmux server only for a caller in a Herdr pane (`HERDR_ENV=1`) or with `PCTL_STANDALONE=1`. On a host without Herdr, set `PCTL_STANDALONE=1`.
+
+## Web page
+
+`pctl web --listen <tailscale-ip>:<port> --token-file <0600 file>` serves a phone page to list sessions, read one screen and type a line. It refuses other addresses, needs the token for every API call and refuses input to blocked sessions. See CLI.md.
 
 ## Lite package
 

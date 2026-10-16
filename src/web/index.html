@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pctl sessions</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header>
+  <b>pctl</b>
+  <button id="back" hidden>Sessions</button>
+  <span id="where"></span>
+</header>
+<section id="login" hidden>
+  <label for="token">Access token</label>
+  <input id="token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false">
+  <button id="save">Save</button>
+</section>
+<section id="list" hidden>
+  <ul id="sessions"></ul>
+  <button id="reload">Refresh</button>
+  <button id="forget">Forget token</button>
+</section>
+<section id="view" hidden>
+  <div id="status"></div>
+  <pre id="screen"></pre>
+  <textarea id="text" rows="3" placeholder="Type a line for the agent" autocapitalize="off"></textarea>
+  <button id="send">Send</button>
+  <span id="note" role="status"></span>
+</section>
+<script src="app.js"></script>
+</body>
+</html>

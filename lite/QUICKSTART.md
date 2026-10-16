@@ -78,7 +78,7 @@ pctl knows who is sending from the pane it runs in. Agents in the same project a
 ## Not covered here
 - The binary also has sidebar, theme, team and demo commands. They are not part of this quick start.
 - `pctl --host` uses ssh only when you pass it.
-- There is no web UI, and pctl makes no network calls.
+- `pctl web` (an optional page on loopback or a Tailscale address) is not part of this quick start. pctl makes no outgoing network calls.
 - Agents use their own existing install and login. pctl never stores credentials.
 
 `BUILDINFO.txt` says which source commit and target this ZIP was built from. `LICENSE` covers pctl (MIT), and `THIRD_PARTY_NOTICES.txt` lists the bundled Rust crates and musl libc.
