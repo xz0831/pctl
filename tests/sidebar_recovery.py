@@ -19,7 +19,8 @@ def cleanup(record):
  for name in ['sidebar.json','pending-sidebar.json',f"sidebar-{record['id']}.ready"]:(state/name).unlink(missing_ok=True)
 def pending(with_registry=False,partial=False):
  pane,pid=tm('split-window','-d','-h','-t',run['pane'],'-P','-F','#{pane_id}\t#{pane_pid}','exec /bin/sleep 300').split('\t')
- start=subprocess.run(['ps','-o','lstart=','-p',str(pid)],text=True,capture_output=True,env={'LC_ALL':'C'}).stdout.strip()
+ # Same source as pctl's process_start: /proc starttime ticks on Linux, ps lstart on macOS.
+ start=pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()[19] if os.path.exists(f'/proc/{pid}/stat') else subprocess.run(['ps','-o','lstart=','-p',str(pid)],text=True,capture_output=True,env={'LC_ALL':'C'}).stdout.strip()
  rec={'schema_version':1,'id':str(uuid.uuid4()),'server_instance':json.loads((state/'registry.json').read_text())['server_instance'],'pane':pane,'pid':pid,'process_start':start,'width':28,'host_project_id':project['id'],'host_agent_id':agent['id'],'host_run_id':run['id'],'started_at':int(time.time()*1000)}
  intent={'sidebar_id':rec['id'],'phase':'gated_pane_created','sidebar':rec,'window':run['window']}
  (state/'pending-sidebar.json').write_text(json.dumps(intent))

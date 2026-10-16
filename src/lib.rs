@@ -10,7 +10,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
+pub mod app;
 pub mod collaboration;
+pub mod human;
 pub mod orchestration;
 pub mod session;
 pub mod sidebar;
@@ -582,6 +584,15 @@ impl Core {
         self.tm(&["set-option", "-g", "remain-on-exit", "on"])?;
         self.apply_theme_chrome()?;
         self.tm(&["set-option", "-t", &session, "@pctl_project", project])?;
+        if let Some(p) = r.projects.iter().find(|p| p.id == project) {
+            self.tm(&[
+                "set-option",
+                "-t",
+                &session,
+                "@pctl_name",
+                &human::literal(&p.name),
+            ])?;
+        }
         self.tm(&[
             "set-option",
             "-w",
@@ -693,6 +704,15 @@ impl Core {
         ] {
             self.tm(&["set-option", "-p", "-t", &run.pane, key, value])?;
         }
+        // Display only: the tab shows the agent's name; the window name stays an ID.
+        self.tm(&[
+            "set-option",
+            "-w",
+            "-t",
+            &run.window,
+            "@pctl_tab",
+            &human::literal(&a.name),
+        ])?;
         self.tm(&[
             "set-option",
             "-w",

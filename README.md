@@ -8,7 +8,7 @@ A tmux-based control plane for interactive coding-agent sessions (Claude Code, C
 
 ## Build
 
-Requirements: Rust 1.88+ (edition 2024), tmux 3.x, and Python 3 for the integration suites. Runs on macOS arm64 and Linux.
+Requirements: Rust 1.99+ (edition 2024), tmux 3.8+, and Python 3 for the integration suites. Older versions are not tested. Runs on macOS arm64 and Linux.
 
 ```sh
 cargo build --release --locked
@@ -27,11 +27,68 @@ The real-tmux suites start their own servers in temporary state directories. Eac
 B=target/release/pctl T=$(command -v tmux); mkdir -p test-results
 for s in integration collaboration_integration msg_workflow_integration orchestration_integration \
          session_integration sidebar_integration sidebar_recovery snapshot_batch_integration \
-         team_context_preflight tmux_encoding_integration wake_integration web_integration worktree_integration; do
+         team_context_preflight tmux_encoding_integration wake_integration web_integration worktree_integration human_entry app_integration; do
   python3 tests/$s.py --bin $B --tmux $T --report test-results/$s.json >test-results/$s.out 2>&1; echo "$s exit $?"
 done
 python3 tests/remote_quoting.py --bin $B; echo "remote_quoting exit $?"
 ```
+
+## Use it like Herdr
+
+Type `pctl` in a terminal. The pctl app opens straight onto your agents:
+- **Left:** projects and their agents with their state.
+  - `●` idle (green) or working (blue)
+  - `!` waits for you
+  - `×` exited, `○` stopped
+- **Top:** the project's tabs.
+- **Middle:** the selected agent's live terminal. Typing goes to it, and the wheel scrolls back.
+
+Everything works with the mouse:
+
+| To do this | Click |
+|---|---|
+| Open an agent | the agent or its tab |
+| Open a bash terminal (like a new tab in Ghostty) | `+` in the tab bar |
+| Start Claude Code, Codex, OpenCode or a command | `+ agent` (a form; bash is preselected) |
+| Add a project | `[+]` next to PROJECTS |
+| Restart (same conversation), stop, start or remove an agent | right-click it; stop and remove ask first |
+| Resize the sidebar | drag its edge |
+| See the shortcuts | `? Help` |
+| Leave | `⏏ Leave` (the agents keep running) |
+
+Shortcuts follow Herdr. Press `ctrl+b`, then:
+- `c`: new bash tab
+- `a`: new agent
+- `n` / `p`: next / previous tab
+- `1`…`9`: go to that tab
+- `x`: stop
+- `r`: restart
+- `b`: sidebar
+- `w`: keyboard sidebar
+- `?`: help
+- `q`: leave
+
+Change them in `~/.config/pctl/config.toml` (or under `$XDG_CONFIG_HOME`):
+
+```toml
+[keys]
+prefix = "ctrl+a"
+next_tab = "alt+right"   # a key without the prefix
+new_agent = "prefix+g"
+```
+
+Themes: `◐ Theme` (or `ctrl+b t`) picks one of the built-in themes:
+- `portal` (green), `garage` (amber), `nebula` (violet), `void` (deep blue)
+- `lab` (light)
+- `classic` (your terminal's own colours), `mono`
+
+The terminal area follows the chosen theme too.
+
+Make your own: `pctl theme --new mine --from garage` writes `~/.config/pctl/themes/mine.toml`, with every colour and a comment saying where it shows. Change the colours and pick `mine` from `◐ Theme`. `pctl theme --list` shows all themes and any problems in your files. Agents can make themes the same way. Keep your own themes in your own config folder; do not commit them here.
+
+A little dry humour shows up where nothing is at stake: loading, empty screens, tips, goodbye. It never appears in errors or anything agents read. `[ui]` with `wit = false` in the config file turns it off.
+
+`pctl` reopens on the project and tab you left. It never starts a server by itself; adding the first agent follows the same rule as `session add` (a Herdr pane or `PCTL_STANDALONE=1`). tmux still keeps the processes behind the app. `pctl attach [--project <name>]` opens a plain tmux client instead.
 
 ## Hosts without Herdr
 

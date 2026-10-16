@@ -11,10 +11,10 @@ cp "$here/bin/pctl" "$dest/pctl.new" && chmod 755 "$dest/pctl.new" && mv -f "$de
 echo "installed: $dest/pctl ($("$dest/pctl" --version))"
 t=${PCTL_TMUX:-$(command -v tmux || true)}
 if [ -z "$t" ]; then
-  echo "warning: tmux not found; install tmux 3.0a or newer, or set PCTL_TMUX" >&2
+  echo "warning: tmux not found; install tmux 3.8 or newer, or set PCTL_TMUX" >&2
 else
   v=$("$t" -V | sed 's/^tmux //; s/^next-//')
-  case $v in [0-2].*) echo "warning: $t is tmux $v; pctl needs 3.0a or newer" >&2 ;; esac
+  case $v in [0-2].* | 3.[0-7] | 3.[0-7][a-z]) echo "warning: $t is tmux $v; pctl needs 3.8 or newer" >&2 ;; esac
 fi
 case :$PATH: in *:"$dest":*) ;; *) echo "note: add $dest to PATH" ;; esac
 echo "next: export PCTL_STANDALONE=1   (see pctl.env.example), then: bash $here/smoke.sh $dest/pctl"

@@ -937,11 +937,7 @@ impl App {
             Mode::Normal => match key.code {
                 KeyCode::Char('?') => self.mode = Mode::Help,
                 KeyCode::Char('t') => {
-                    let next = match self.theme {
-                        ThemeName::Portal => ThemeName::Classic,
-                        ThemeName::Classic => ThemeName::Mono,
-                        ThemeName::Mono => ThemeName::Portal,
-                    };
+                    let next = self.theme.next();
                     match core.set_theme(next) {
                         Ok(()) => {
                             self.theme = next;
@@ -2797,8 +2793,8 @@ mod tests {
         }
         app.key(&core, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.key(&core, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-        assert_eq!(app.theme, ThemeName::Classic);
-        assert_eq!(core.theme().unwrap(), ThemeName::Classic);
+        assert_eq!(app.theme, ThemeName::Portal.next());
+        assert_eq!(core.theme().unwrap(), ThemeName::Garage);
         assert!(core.registry().unwrap().runs.is_empty());
         assert!(!core.state.join("audit.jsonl").exists());
     }

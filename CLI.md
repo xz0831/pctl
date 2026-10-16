@@ -309,6 +309,66 @@ This convenience addresses an observed small-model error in the frozen0.3 test. 
 - The page never switches sessions by itself. The log line per request is time, method, path and status only.
 - HTTP is plain: use it over Tailscale (WireGuard) or loopback only.
 
+## Human entry: the pctl app (`pctl` alone)
+
+`pctl` with no command, on an interactive terminal, opens the pctl app. It is a full-screen TUI and not a tmux client. Without a terminal on stdin and stdout, `pctl` alone is the usual missing-command usage error (exit 2), so agents and scripts see no change. A launched agent (`PCTL_AGENT_ID` or `PCTL_RUN_ID` set) or anything inside that state's tmux, such as a bash tab of the app itself, is refused with `agent_caller` (exit 1). Its keys would skip the blocked-question refusals of `msg` and `session prompt`. On leaving, the app unsets `window-size` on every window it resized, so `pctl attach` fits again. "Start a new conversation…" asks first, and Stop acts on the run that was shown when it asked.
+
+Screen:
+- **Sidebar:** projects and their sessions with states.
+- **Tab bar:** the current project's sessions, then `+`.
+- **Terminal:** tmux's own screen of the selected session, read with `capture-pane -e` about 8 times a second and redrawn. Its window is resized to the view. Keys go back with `send-keys` (text with `-l`, other keys by tmux name); a paste goes through a bracketed `paste-buffer`.
+- **Status line:** state, the number of sessions waiting for a person, notices, `? Help` and `⏏ Leave`.
+
+Mouse (SGR mouse reporting):
+- Click opens a project, session or tab.
+- `+` opens a bash tab right away. It is a `session add` named `<project>-bash<n>` in the project folder, running bash with `-l`. bash is `$SHELL` when that is bash, else `/opt/homebrew/bin/bash`, `/usr/local/bin/bash` or `/bin/bash`.
+- `+ agent` opens the new-agent form:
+  - name and folder
+  - kind: bash, Claude Code, Codex, OpenCode or Command
+  - optional model: `--model` for Claude Code, `-m` for Codex, pctl's `--model` for OpenCode
+  - command (for Command)
+  - optional worktree branch
+- `[+]` adds a project.
+- Right-click on a session offers: restart in the same conversation, stop (asks first), start, start a new conversation, remove (asks first). Right-click on a project offers a new bash tab or a new agent.
+- An open dialog takes every click; nothing behind it reacts.
+- The wheel over the terminal scrolls back (`capture-pane -S/-E`). Any key returns to live.
+- Dragging the sidebar edge resizes it.
+
+Shortcuts:
+- Defaults are a prefix (`ctrl+b`) and a key: `c` new bash tab, `a` new agent, `shift+c` new project, `n`/`p` tabs, `1`–`9` tab N, `x` stop, `r` restart, `b` sidebar, `w` keyboard sidebar, `?` help, `q` leave. Prefix twice sends the prefix to the session.
+- Override them in `$XDG_CONFIG_HOME/pctl/config.toml` or `~/.config/pctl/config.toml`, under `[keys]`, with `name = "key"`.
+  - Names: `prefix`, `new_tab`, `new_agent`, `new_project`, `next_tab`, `prev_tab`, `stop_agent`, `restart_agent`, `toggle_sidebar`, `focus_sidebar`, `help`, `detach`.
+  - Keys look like `ctrl+b`, `alt+right`, `shift+c`, `f2` or `?`; a `prefix+` in front means after the prefix.
+- Unknown names and bad keys are reported in the status line, and the default is kept.
+
+Themes:
+- Built-in: `portal`, `garage`, `nebula`, `void`, `lab`, `classic`, `mono`. `pctl theme <name>` sets one per state (`appearance.json`); the app's `◐ Theme` button and `ctrl+b t` do the same.
+- Each theme also colours the terminal area: the default background and text, and the 16 ANSI colours. 256-colour and RGB output is left as the agent sent it. `classic` and `mono` keep the terminal's own colours.
+- Your own themes are files `$XDG_CONFIG_HOME/pctl/themes/<name>.toml` or `~/.config/pctl/themes/<name>.toml`.
+  - Names use a-z, 0-9, `-` and `_`, and must differ from the built-in themes.
+  - Each file is at most 16 KiB.
+  - The format is flat `key = "value"` lines:
+    - `base` (a built-in theme to start from)
+    - `about`
+    - `bg`, `panel`, `raised`, `text`, `muted`, `border`, `accent`, `cyan`, `warn`, `danger`, `ink`, `term_bg`, `term_fg` as `#rrggbb`, or `default` for the terminal's own colour
+    - `ansi = [16 colours]`
+  - Missing keys come from `base`. Problems are reported and the base colour is kept.
+- `pctl theme --new NAME [--from BASE]` writes a filled template and refuses to overwrite. `pctl theme --list` prints the built-in and your own themes, the folder, and any warnings.
+- A theme of your own applies to the app and is remembered in `app-view.json`. The tmux chrome of a plain `attach` keeps the state's built-in theme.
+- `[ui]` with `wit = false` in `config.toml` replaces the jokes with plain text (loading, empty screens, the stop question's last clause, tips, goodbye).
+
+Other behaviour:
+- The last project and tabs are kept in `<state>/app-view.json`.
+- Leaving the app stops nothing.
+- The app never starts a server. Adding a session goes through `session add`, which keeps its own server-start rule.
+
+`pctl attach --project <name|id>` attaches a plain tmux client at that project's manager window. Without `--project` it attaches at the most recently used project and window: it never starts a server, switches the client inside the same PCTL server, and refuses inside another tmux.
+
+tmux display for plain clients:
+- Agent windows carry `@pctl_tab` and `@pctl_status`. Project sessions carry `@pctl_name`.
+- The status line reruns the hidden `pctl session marks` every 5 seconds while a client is attached.
+- `^b s` is a names-and-state `choose-tree`, and `^b q` detaches.
+
 ## Worktree workers
 
 `pctl session add --name <name> --cwd <repo> --worktree <branch> [--base <ref>] [--model <provider/model>] -- <argv>` gives a worker its own branch and checkout.

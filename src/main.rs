@@ -18,8 +18,9 @@ struct Args {
     /// Save a state-local appearance preset; existing UIs refresh automatically.
     #[arg(long, global = true)]
     theme: Option<pctl::theme::ThemeName>,
+    /// Without a command on an interactive terminal: open the pctl app (like herdr).
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 #[derive(Subcommand)]
 enum Cmd {
@@ -30,8 +31,19 @@ enum Cmd {
         cmd: pctl::orchestration::Command,
     },
     /// Inspect or save a state-local visual theme (no agent controls).
+    /// Show or set the built-in theme; --new writes your own theme file to edit; --list shows all.
     Theme {
         name: Option<pctl::theme::ThemeName>,
+        /// Write ~/.config/pctl/themes/NAME.toml (or under $XDG_CONFIG_HOME) to edit; the app's
+        /// theme picker shows it.
+        #[arg(long, value_name = "NAME", conflicts_with = "name")]
+        new: Option<String>,
+        /// The built-in theme a new file starts from (default portal).
+        #[arg(long, requires = "new")]
+        from: Option<pctl::theme::ThemeName>,
+        /// Built-in themes and your own, with any problems in the files.
+        #[arg(long, conflicts_with_all = ["name", "new"])]
+        list: bool,
     },
     Project {
         #[command(subcommand)]
@@ -88,9 +100,11 @@ enum Cmd {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Attach a plain tmux client: to a project's manager window (name or ID), or without
+    /// --project to the most recently used project. `pctl` alone opens the app instead.
     Attach {
         #[arg(long)]
-        project: String,
+        project: Option<String>,
     },
     /// Phone page: list sessions, read one screen, type a line. Off unless started; loopback or
     /// Tailscale address only; needs the token from a 0600 file.
@@ -435,6 +449,9 @@ enum SessionCmd {
     },
     /// Name of the caller's own session (from PCTL_AGENT_ID).
     Whoami,
+    /// Status-line job: write agent names and states onto tmux tabs; print the totals.
+    #[command(hide = true)]
+    Marks,
     /// Start a stopped session in its saved conversation. Unknown conversation needs --new.
     Start {
         name: String,
@@ -622,18 +639,7 @@ fn main() {
     }
 }
 fn run() -> Result<()> {
-    let args = Args::parse();
-    if let Cmd::Worker { label, tick_ms } = &args.cmd {
-        return pctl::worker(label, *tick_ms);
-    }
-    if let Cmd::Team { cmd } = &args.cmd {
-        pctl::orchestration::preflight(cmd)?;
-    }
-    let bound = matches!(&args.cmd, Cmd::Msg { .. })
-        || match &args.cmd {
-            Cmd::Team { cmd } => pctl::orchestration::requires_context(cmd),
-            _ => false,
-        };
+    let mut args = Args::parse();
     let state = args.state.clone().unwrap_or_else(|| {
         PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state/pctl")
     });
@@ -647,6 +653,39 @@ fn run() -> Result<()> {
             PathBuf::from("tmux")
         }
     });
+    let Some(cmd) = args.cmd.take() else {
+        // A person typed `pctl` alone: open the app, like `herdr`. Agents and scripts have no
+        // terminal and keep getting the usage error.
+        use std::io::IsTerminal;
+        if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+            <Args as clap::CommandFactory>::command()
+                .error(
+                    clap::error::ErrorKind::MissingSubcommand,
+                    "a command is required; `pctl` alone opens the workspace only on an interactive terminal",
+                )
+                .exit();
+        }
+        let core = Core::new(state, tmux)?;
+        if let Some(theme) = args.theme {
+            core.set_theme(theme)?;
+        }
+        if let Err(e) = pctl::app::run(&core) {
+            eprintln!("pctl: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    };
+    if let Cmd::Worker { label, tick_ms } = &cmd {
+        return pctl::worker(label, *tick_ms);
+    }
+    if let Cmd::Team { cmd } = &cmd {
+        pctl::orchestration::preflight(cmd)?;
+    }
+    let bound = matches!(&cmd, Cmd::Msg { .. })
+        || match &cmd {
+            Cmd::Team { cmd } => pctl::orchestration::requires_context(cmd),
+            _ => false,
+        };
     let core = if bound {
         anyhow::ensure!(
             args.theme.is_none(),
@@ -659,12 +698,35 @@ fn run() -> Result<()> {
     if let Some(theme) = args.theme {
         core.set_theme(theme)?;
     }
-    match args.cmd {
-        Cmd::Theme { name } => {
-            if let Some(theme) = name {
-                core.set_theme(theme)?;
+    match cmd {
+        Cmd::Theme {
+            name,
+            new,
+            from,
+            list,
+        } => {
+            use pctl::theme::{ThemeName, custom};
+            if let Some(n) = new {
+                let path = custom::create(&n, from.unwrap_or_default())?;
+                print(
+                    &json!({"created": path, "next": "edit the colours, then pick it from ◐ Theme in pctl"}),
+                )?;
+            } else if list {
+                let (mine, warnings) = custom::load_all();
+                print(&json!({
+                    "built_in": ThemeName::ALL.iter().map(|t| json!({"name": t.label().to_lowercase(), "about": t.about()})).collect::<Vec<_>>(),
+                    "yours": mine.iter().map(|c| json!({"name": c.name, "about": c.about})).collect::<Vec<_>>(),
+                    "folder": custom::dir(),
+                    "warnings": warnings,
+                }))?;
+            } else {
+                if let Some(theme) = name {
+                    core.set_theme(theme)?;
+                }
+                print(
+                    &json!({"theme": core.theme()?, "config": core.state.join("appearance.json")}),
+                )?;
             }
-            print(&json!({"theme": core.theme()?, "config": core.state.join("appearance.json")}))?;
         }
         Cmd::Doctor => print(&core.doctor())?,
         Cmd::Team { cmd } => print(&pctl::orchestration::run(&core, cmd)?)?,
@@ -856,6 +918,7 @@ fn run() -> Result<()> {
             }
             SessionCmd::Restore { new } => print(&core.session_restore(new)?)?,
             SessionCmd::Whoami => print(&core.session_whoami()?)?,
+            SessionCmd::Marks => println!("{}", core.session_marks()?),
             SessionCmd::Start { name, new } => print(&core.session_start(&name, new)?)?,
             SessionCmd::Remove { name } => print(&core.session_remove(&name)?)?,
             SessionCmd::Hook => {
@@ -1057,7 +1120,10 @@ fn run() -> Result<()> {
                 print(&json!({"ok":true,"result":"client detached; agents retained"}))?
             }
         },
-        Cmd::Attach { project } => core.attach(&project)?,
+        Cmd::Attach { project } => match project {
+            Some(p) => core.attach(&core.resolve_project(&p)?)?,
+            None => core.open_default()?,
+        },
         Cmd::Worktree { cmd } => match cmd {
             WorktreeCmd::List => print(&core.worktree_list()?)?,
             WorktreeCmd::Remove { name } => print(&core.worktree_remove(&name)?)?,
