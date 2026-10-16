@@ -329,7 +329,7 @@ Mouse (SGR mouse reporting):
   - command (for Command)
   - optional worktree branch
 - `[+]` adds a project.
-- Right-click on a session offers: restart in the same conversation, stop (asks first), start, start a new conversation, remove (asks first). Right-click on a project offers a new bash tab or a new agent.
+- Right-click on a session (or double-click it, or `ctrl+b m` for the one on screen, for terminals such as MATE Terminal that keep the right button) offers: restart in the same conversation, stop (asks first), start, start a new conversation, remove (asks first). Right-click on a project offers a new bash tab or a new agent.
 - An open dialog takes every click; nothing behind it reacts.
 - The wheel over the terminal scrolls back (`capture-pane -S/-E`). Any key returns to live.
 - Dragging the sidebar edge resizes it.

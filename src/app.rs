@@ -54,7 +54,7 @@ impl Agent {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Hit {
     Project(String),
     Agent(String),
@@ -178,6 +178,8 @@ struct App {
     fresh: HashMap<String, (Agent, Instant)>,
     /// Panes whose window this app resized (resize-window leaves window-size at manual).
     touched: HashSet<String>,
+    /// The last left click, to tell a double-click.
+    last_click: Option<(Instant, Hit)>,
 }
 
 /// A launched agent, or anything inside this server's tmux (a bash tab of the app itself), must not
@@ -335,6 +337,7 @@ impl App {
             refresh: None,
             fresh: HashMap::new(),
             touched: HashSet::new(),
+            last_click: None,
         }
     }
     fn say(&mut self, text: impl Into<String>) {
@@ -655,6 +658,12 @@ impl App {
                 };
                 self.open_agent(&tabs[j]);
             }
+            Action::AgentMenu => {
+                if let Some(c) = current {
+                    let x = if self.sidebar { self.sidebar_w + 1 } else { 0 };
+                    self.agent_menu(&c, x, 1);
+                }
+            }
             Action::StopAgent => {
                 if let Some(c) = current {
                     self.confirm_stop(&c);
@@ -761,7 +770,19 @@ impl App {
                     Some(_) if !in_modal => {}
                     _ => {
                         if let Some(h) = hit {
-                            self.click(core, h);
+                            // A double-click on an agent or its tab opens its menu, like a
+                            // right-click: some terminals (MATE Terminal) keep the right button.
+                            let double = matches!(h, Hit::Agent(_) | Hit::Tab(_))
+                                && self.last_click.as_ref().is_some_and(|(t, last)| {
+                                    *last == h && t.elapsed() < Duration::from_millis(400)
+                                });
+                            self.last_click = (!double).then(|| (Instant::now(), h.clone()));
+                            match h {
+                                Hit::Agent(a) | Hit::Tab(a) if double => {
+                                    self.agent_menu(&a, m.column, m.row)
+                                }
+                                h => self.click(core, h),
+                            }
                         }
                     }
                 }
@@ -1839,7 +1860,7 @@ impl App {
             Modal::Help => {
                 let mut lines: Vec<Line> = vec![
                     Line::from(
-                        "Mouse: click a project, agent or tab to open it; + adds; right-click an agent for",
+                        "Mouse: click a project, agent or tab to open it; + adds; right-click or double-click an agent for",
                     ),
                     Line::from(
                         "restart, stop, start and remove; drag the sidebar edge; wheel scrolls the terminal.",
