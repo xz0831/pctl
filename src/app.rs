@@ -43,6 +43,10 @@ const CAPTURE_EVERY: Duration = Duration::from_millis(120);
 const MAX_COPY: usize = 100_000;
 /// At most one notification per agent in this long.
 const NOTICE_EVERY: Duration = Duration::from_secs(10);
+/// What `while_run` prints when the run changed.
+const RUN_CHANGED: &str = "pctl-run-changed";
+/// Typed text waits for the end of a burst of events, but never grows past this many bytes.
+const TYPED_MAX: usize = 2048;
 
 #[derive(Clone, Debug)]
 struct Agent {
@@ -188,6 +192,37 @@ struct App {
     sel: Option<(term::Cell, term::Cell)>,
     /// When each agent was last announced, for the 10-second limit.
     notified: HashMap<String, Instant>,
+    /// Keys typed in the events just read, for the agent they were typed to: text to send with
+    /// `-l` (true) or a key name. They go out as one tmux call, see `flush_typed`.
+    typed: Option<(Agent, Vec<(bool, String)>)>,
+}
+
+/// `s` as one tmux command argument, for a command inside another command.
+fn quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Run the tmux command `then` only while `pane` still holds `run`, else `otherwise`. Check and
+/// act are one tmux call, so a restart cannot slip in between. Ok(false): the run changed.
+/// `otherwise` is a command with its own leading " ; ", or empty.
+fn while_run(core: &Core, pane: &str, run: &str, then: &str, otherwise: &str) -> Result<bool> {
+    // The run goes into a format; an id with a format character is not one of ours.
+    if !run
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    {
+        return Ok(false);
+    }
+    let out = core.tm(&[
+        "if-shell",
+        "-F",
+        "-t",
+        pane,
+        &format!("#{{==:#{{@pctl_run}},{run}}}"),
+        then,
+        &format!("display-message -p {RUN_CHANGED}{otherwise}"),
+    ])?;
+    Ok(!out.contains(RUN_CHANGED))
 }
 
 /// A launched agent, or anything inside this server's tmux (a bash tab of the app itself), must not
@@ -361,8 +396,14 @@ pub fn run(core: &Core) -> Result<()> {
                 t.saturating_duration_since(Instant::now())
             });
             if event::poll(wait)? {
-                let ev = event::read()?;
-                app.handle(core, ev);
+                // Everything already waiting goes in one go, so fast typing is one tmux call.
+                loop {
+                    app.handle(core, event::read()?);
+                    if app.quit || !event::poll(Duration::ZERO)? {
+                        break;
+                    }
+                }
+                app.flush_typed(core);
             }
         }
         Ok(())
@@ -417,6 +458,7 @@ impl App {
             last_click: None,
             sel: None,
             notified: HashMap::new(),
+            typed: None,
         }
     }
     fn say(&mut self, text: impl Into<String>) {
@@ -566,7 +608,7 @@ impl App {
             return;
         };
         // The pane comes from the last list; check it still holds this run before touching it.
-        let Some(pane) = self.verified(core, &a, false) else {
+        let Some(pane) = self.verified(core, &a) else {
             self.view.rows.clear();
             return;
         };
@@ -638,24 +680,24 @@ impl App {
 
     /// The agent's pane, if it still holds the agent's current run. Panes are cached from the
     /// last list (every 1.5 s); after a restart or a new tmux server the same pane id can belong
-    /// to another process, and nothing must be typed into it.
-    /// shortcut: check and send are two tmux calls; a restart in the milliseconds between them
-    /// could slip through. Use one `if-shell -F` command if that ever matters.
-    fn verified(&mut self, core: &Core, a: &Agent, loud: bool) -> Option<String> {
+    /// to another process, and nothing must be typed into it. Used before resizing; typing and
+    /// pasting check inside the call that sends (`while_run`).
+    fn verified(&mut self, core: &Core, a: &Agent) -> Option<String> {
         let (pane, run) = (a.pane.clone()?, a.run.clone()?);
         match core.tm(&["display-message", "-p", "-t", &pane, "#{@pctl_run}"]) {
             Ok(r) if r.trim() == run => Some(pane),
             _ => {
-                if loud {
-                    self.say(format!(
-                        "{} changed (restarted or moved); not typing until the list catches up",
-                        a.name
-                    ));
-                }
                 self.poke();
                 None
             }
         }
+    }
+    fn changed(&mut self, a: &Agent) {
+        self.say(format!(
+            "{} changed (restarted or moved); not typing until the list catches up",
+            a.name
+        ));
+        self.poke();
     }
     fn send_key(&mut self, core: &Core, k: &KeyEvent) {
         let Some(a) = self.current().filter(|a| a.running()).cloned() else {
@@ -664,27 +706,55 @@ impl App {
         let Some((lit, key)) = term::key_args(k) else {
             return;
         };
-        let Some(pane) = self.verified(core, &a, true) else {
-            return;
-        };
-        let key = literal(&key);
-        let r = if lit {
-            core.tm(&["send-keys", "-t", &pane, "-l", "--", &key])
-        } else {
-            core.tm(&["send-keys", "-t", &pane, "--", &key])
-        };
-        if let Err(e) = r {
-            self.say(format!("Could not type into {}: {e:#}", a.name));
+        if self
+            .typed
+            .as_ref()
+            .is_some_and(|(t, _)| (&t.pane, &t.run) != (&a.pane, &a.run))
+        {
+            self.flush_typed(core);
+        }
+        let (_, parts) = self.typed.get_or_insert_with(|| (a, vec![]));
+        match parts.last_mut() {
+            Some((true, text)) if lit => text.push_str(&key),
+            _ => parts.push((lit, key)),
         }
         self.view.scroll = 0;
+        if parts.iter().map(|(_, k)| k.len()).sum::<usize>() > TYPED_MAX {
+            self.flush_typed(core);
+        }
+    }
+    /// Send the typed keys: one tmux call checks the run and types them all.
+    fn flush_typed(&mut self, core: &Core) {
+        let Some((a, parts)) = self.typed.take() else {
+            return;
+        };
+        let (Some(pane), Some(run)) = (&a.pane, &a.run) else {
+            return self.changed(&a);
+        };
+        let send: Vec<String> = parts
+            .iter()
+            .map(|(lit, key)| {
+                format!(
+                    "send-keys -t {pane} {}-- {}",
+                    if *lit { "-l " } else { "" },
+                    quote(key)
+                )
+            })
+            .collect();
+        match while_run(core, pane, run, &send.join(" ; "), "") {
+            Ok(true) => {}
+            Ok(false) => self.changed(&a),
+            Err(e) => self.say(format!("Could not type into {}: {e:#}", a.name)),
+        }
         self.view.next = Some(Instant::now());
     }
     fn paste(&mut self, core: &Core, text: &str) {
+        self.flush_typed(core);
         let Some(a) = self.current().filter(|a| a.running()).cloned() else {
             return;
         };
-        let Some(pane) = self.verified(core, &a, true) else {
-            return;
+        let (Some(pane), Some(run)) = (&a.pane, &a.run) else {
+            return self.changed(&a);
         };
         // One tmux command carries about 16 KB; a longer paste goes in 8 KB pieces into one buffer,
         // then out as one bracketed paste.
@@ -695,11 +765,21 @@ impl App {
             let append = if i == 0 { "-b" } else { "-ab" };
             r = r.and_then(|_| core.tm(&["set-buffer", append, &buffer, "--", &literal(piece)]));
         }
-        let r = r.and_then(|_| core.tm(&["paste-buffer", "-p", "-d", "-b", &buffer, "-t", &pane]));
-        if let Err(e) = r {
-            self.say(format!("Could not paste: {e:#}"));
+        let r = r.and_then(|_| {
+            while_run(
+                core,
+                pane,
+                run,
+                &format!("paste-buffer -p -d -b {buffer} -t {pane}"),
+                &format!(" ; delete-buffer -b {buffer}"),
+            )
+        });
+        match r {
+            Ok(true) => {}
+            Ok(false) => self.changed(&a),
+            Err(e) => self.say(format!("Could not paste: {e:#}")),
         }
-        self.view.next = Some(Instant::now() + Duration::from_millis(25));
+        self.view.next = Some(Instant::now());
     }
 
     fn handle(&mut self, core: &Core, ev: Event) {
@@ -778,6 +858,7 @@ impl App {
     }
 
     fn action(&mut self, core: &Core, a: Action) {
+        self.flush_typed(core);
         let current = self.current().map(|a| a.name.clone());
         match a {
             Action::NewTab => match self.project.clone() {
@@ -899,6 +980,7 @@ impl App {
     }
 
     fn mouse(&mut self, core: &Core, m: MouseEvent) {
+        self.flush_typed(core);
         let hit = self
             .hits
             .iter()
@@ -1325,6 +1407,7 @@ impl App {
         }));
     }
     fn modal_key(&mut self, core: &Core, k: KeyEvent) {
+        self.flush_typed(core);
         match &mut self.modal {
             Some(Modal::Help) => self.modal = None,
             Some(Modal::Confirm { .. }) => match k.code {
