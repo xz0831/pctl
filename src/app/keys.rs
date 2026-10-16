@@ -22,6 +22,7 @@ pub enum Action {
     PrevTab,
     StopAgent,
     RestartAgent,
+    AgentMenu,
     ToggleSidebar,
     FocusSidebar,
     Theme,
@@ -30,7 +31,7 @@ pub enum Action {
 }
 
 /// Name in the config file, default key, and what the help screen says.
-pub const ACTIONS: [(&str, &str, Action, &str); 12] = [
+pub const ACTIONS: [(&str, &str, Action, &str); 13] = [
     (
         "new_tab",
         "prefix+c",
@@ -62,6 +63,12 @@ pub const ACTIONS: [(&str, &str, Action, &str); 12] = [
         "prefix+r",
         Action::RestartAgent,
         "Restart this agent, same conversation",
+    ),
+    (
+        "agent_menu",
+        "prefix+m",
+        Action::AgentMenu,
+        "This agent's menu: restart, stop, start, remove",
     ),
     (
         "toggle_sidebar",

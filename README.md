@@ -51,7 +51,7 @@ Everything works with the mouse:
 | Open a bash terminal (like a new tab in Ghostty) | `+` in the tab bar |
 | Start Claude Code, Codex, OpenCode or a command | `+ agent` (a form; bash is preselected) |
 | Add a project | `[+]` next to PROJECTS |
-| Restart (same conversation), stop, start or remove an agent | right-click it; stop and remove ask first |
+| Restart (same conversation), stop, start or remove an agent | right-click or double-click it (or `ctrl+b m`); stop and remove ask first |
 | Resize the sidebar | drag its edge |
 | See the shortcuts | `? Help` |
 | Leave | `⏏ Leave` (the agents keep running) |

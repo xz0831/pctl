@@ -65,7 +65,7 @@ pub fn tip(wit: bool) -> &'static str {
     pick(&[
         "Tip: prefix twice sends the prefix to the agent. Keys inside keys.",
         "Tip: the wheel scrolls back. The past is read-only, as it should be.",
-        "Tip: right-click an agent. It won't mind.",
+        "Tip: right-click or double-click an agent. It won't mind.",
         "Tip: agents keep running after you leave. They never needed supervision.",
     ])
 }

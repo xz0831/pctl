@@ -3,7 +3,7 @@
 outer "monitor" tmux; its screen is read with capture-pane, keys go in with send-keys, and mouse
 clicks are SGR mouse sequences typed into it. Covers the sidebar, tabs and live terminal, typing,
 clicks, prefix shortcuts, the new-agent form, the right-click menu with its confirmation (and that
-clicks on a box never reach what is behind it), Start for a stopped agent, wheel scroll-back,
+clicks on a box never reach what is behind it; double-click and ctrl+b m open the same menu), Start for a stopped agent, wheel scroll-back,
 Leave (stops nothing, reopens in place, hands window sizing back), shortcuts from a config file, the
 empty state with no server (which starts nothing), and that agents cannot open the app."""
 import argparse, json, os, pathlib, re, subprocess, tempfile, time
@@ -49,6 +49,8 @@ def click(x, y, button=0):
     vt('send-keys', '-t', 'view', '-l', f'\x1b[<{button};{x};{y}M\x1b[<{button};{x};{y}m')
     time.sleep(0.4)
 def keys(*k): vt('send-keys', '-t', 'view', *k); time.sleep(0.4)
+def dclick(x, y):
+    vt('send-keys', '-t', 'view', '-l', f'\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m' * 2); time.sleep(0.4)
 def text(t): vt('send-keys', '-t', 'view', '-l', t); time.sleep(0.2)
 def add(name, project, folder=None):
     d = root / 'proj' / project / (folder or name); d.mkdir(parents=True, exist_ok=True)
@@ -103,6 +105,18 @@ try:
         keys('Escape'); assert until(lambda: 'Shortcuts' not in screen())
         click(*side('a-main')); assert until(lambda: 'a-main idle' in status())
     case('clicks, ctrl+b n and ctrl+b 2 switch agents; ctrl+b ? shows the shortcuts', switching)
+    def no_right_button():
+        dclick(*side('b-main'))
+        assert until(lambda: 'Restart (same conversation)' in screen() and 'beta / ● b-main' in status()), screen()
+        keys('Escape'); assert until(lambda: 'Restart (same' not in screen()), screen()
+        x, y = side('a-main'); click(x, y); time.sleep(0.3); click(x, y)
+        assert 'Restart (same' not in screen() and 'alpha / ● a-main' in status(), 'two slow clicks just open the agent'
+        dclick(*find('a-block', row=1))
+        assert until(lambda: 'Restart (same conversation)' in screen() and 'a-block blocked' in status()), screen()
+        keys('Escape'); keys('C-b', 'm')
+        assert until(lambda: 'Restart (same conversation)' in screen()), screen()
+        keys('Escape'); click(*side('a-main')); assert until(lambda: 'a-main idle' in status())
+    case('without a right button: double-click an agent or tab, or ctrl+b m, opens its menu', no_right_button)
     def new_tab():
         top = lines()[0]
         click(top.rindex('+') + 1, 1)
