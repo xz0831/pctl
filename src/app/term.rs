@@ -189,9 +189,181 @@ pub fn key_args(k: &KeyEvent) -> Option<(bool, String)> {
     Some((false, format!("{prefix}{name}")))
 }
 
+/// A cell of the view: row, then column.
+pub type Cell = (u16, u16);
+
+/// The characters of a row, each with the cell column it starts at and how many cells it takes.
+pub fn row_cells(row: &Row) -> Vec<(char, usize, usize)> {
+    let mut out = Vec::new();
+    let mut x = 0;
+    for (text, _) in row {
+        for c in text.chars() {
+            let w = cells(c);
+            out.push((c, x, w));
+            x += w;
+        }
+    }
+    out
+}
+
+/// Cells one character takes: 2 for the wide ranges tmux also pads, 0 for combining marks, else 1.
+/// The selection and the highlight must count columns the way the screen does.
+fn cells(c: char) -> usize {
+    match c as u32 {
+        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x200B..=0x200F | 0xFE00..=0xFE0F => 0,
+        0x1100..=0x115F
+        | 0x2E80..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE6F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1FAFF
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
+/// The text a selection covers, read from the rows of the view: the whole rows between the first
+/// and the last, the first from its start column and the last to its end column. Each line loses
+/// its trailing spaces; a character is copied once however many cells it takes. Either end may
+/// come first, so a drag upwards or leftwards reads the same.
+pub fn selection_text(rows: &[Row], a: Cell, b: Cell) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let (a, b) = if a <= b { (a, b) } else { (b, a) };
+    let ((r0, c0), (r1, c1)) = ((a.0 as usize, a.1 as usize), (b.0 as usize, b.1 as usize));
+    let mut lines = Vec::new();
+    let last = r1.min(rows.len() - 1);
+    for (r, row) in rows.iter().enumerate().take(last + 1).skip(r0) {
+        let start = if r == r0 { c0 } else { 0 };
+        let end = if r == r1 { c1 } else { usize::MAX };
+        let text: String = row_cells(row)
+            .into_iter()
+            .filter(|(_, x, w)| x + w > start && *x <= end)
+            .map(|(c, _, _)| c)
+            .collect();
+        lines.push(text.trim_end_matches(' ').to_string());
+    }
+    lines.join("\n")
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// RFC 4648 base64 with `=` padding, for the OSC 52 clipboard write. This is the whole encoder:
+/// the app has no base64 crate.
+pub fn base64(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = chunk.iter().fold(0u32, |n, b| (n << 8) | u32::from(*b)) << (8 * (3 - chunk.len()));
+        for i in 0..4 {
+            if i > chunk.len() {
+                out.push('=');
+            } else {
+                out.push(B64[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn row(s: &str) -> Row {
+        vec![(s.to_string(), Style::default())]
+    }
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        for (plain, coded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+            ("한글", "7ZWc6riA"),
+        ] {
+            assert_eq!(base64(plain.as_bytes()), coded, "{plain}");
+        }
+        let all: Vec<u8> = (0..=255).collect();
+        let coded = base64(&all);
+        assert_eq!(
+            coded.len(),
+            344,
+            "ceil(256/3)*4 bytes for every byte there is"
+        );
+        assert!(
+            coded
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
+        );
+        assert_eq!(base64(&[0]), "AA==");
+        assert_eq!(
+            base64(&[0xff, 0xff, 0xff]),
+            "////",
+            "a whole group needs no padding"
+        );
+    }
+    #[test]
+    fn selection_takes_whole_lines_between_the_ends() {
+        let rows = vec![row("first line here  "), row("second"), row("third line")];
+        assert_eq!(
+            selection_text(&rows, (0, 6), (2, 4)),
+            "line here\nsecond\nthird"
+        );
+        assert_eq!(
+            selection_text(&rows, (2, 4), (0, 6)),
+            "line here\nsecond\nthird",
+            "dragging up and left reads the same"
+        );
+        assert_eq!(selection_text(&rows, (1, 0), (1, 5)), "second");
+        assert_eq!(selection_text(&rows, (0, 0), (0, 4)), "first");
+        assert_eq!(
+            selection_text(&rows, (1, 3), (2, 99)),
+            "ond\nthird line",
+            "an end column past the line is the line's end"
+        );
+        assert_eq!(
+            selection_text(&rows, (1, 0), (1, 9)),
+            "second",
+            "trailing blank cells add nothing"
+        );
+    }
+    #[test]
+    fn a_wide_character_is_copied_once() {
+        let rows = vec![row("한글 wide")];
+        assert_eq!(
+            selection_text(&rows, (0, 0), (0, 3)),
+            "한글",
+            "two wide characters take four cells"
+        );
+        assert_eq!(
+            selection_text(&rows, (0, 1), (0, 2)),
+            "한글",
+            "a column inside one copies it once"
+        );
+        assert_eq!(selection_text(&rows, (0, 5), (0, 8)), "wide");
+    }
+    #[test]
+    fn selection_reads_the_rows_the_view_holds_and_trims_spaces() {
+        // While scrolled back the view holds the older rows; the text comes from those, not the pane.
+        let rows = vec![row("old line"), row("newer")];
+        assert_eq!(selection_text(&rows, (0, 0), (0, 2)), "old");
+        assert_eq!(selection_text(&[], (0, 0), (3, 9)), "");
+        assert_eq!(
+            selection_text(&[row("blank row     ")], (0, 0), (0, 14)),
+            "blank row",
+            "trailing spaces come off"
+        );
+        assert_eq!(
+            selection_text(&[row("          ")], (0, 0), (0, 9)),
+            "",
+            "a row of spaces copies nothing"
+        );
+    }
     #[test]
     fn capture_styles_and_drops_other_escapes() {
         let rows = parse_capture(

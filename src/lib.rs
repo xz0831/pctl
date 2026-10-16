@@ -584,8 +584,10 @@ impl Core {
             );
         }
         self.tm(&["set-option", "-g", "mouse", "on"])?;
-        self.tm(&["set-option", "-g", "history-limit", "2000"])?;
-        self.tm(&["set-option", "-g", "set-clipboard", "off"])?;
+        self.tm(&["set-option", "-g", "history-limit", "20000"])?;
+        // external: a copy made in tmux (a mouse drag in `pctl attach`) goes out to the person's
+        // terminal as OSC 52, while programs inside the panes cannot write to the clipboard.
+        self.tm(&["set-option", "-g", "set-clipboard", "external"])?;
         self.tm(&["set-option", "-g", "remain-on-exit", "on"])?;
         self.apply_theme_chrome()?;
         self.tm(&["set-option", "-t", &session, "@pctl_project", project])?;
