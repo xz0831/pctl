@@ -357,7 +357,10 @@ pub fn run(core: &Core) -> Result<()> {
                 app.capture(core);
             }
             terminal.draw(|f| app.render(f))?;
-            if event::poll(Duration::from_millis(40))? {
+            let wait = (app.view.next).map_or(Duration::ZERO, |t| {
+                t.saturating_duration_since(Instant::now())
+            });
+            if event::poll(wait)? {
                 let ev = event::read()?;
                 app.handle(core, ev);
             }
@@ -674,7 +677,7 @@ impl App {
             self.say(format!("Could not type into {}: {e:#}", a.name));
         }
         self.view.scroll = 0;
-        self.view.next = Some(Instant::now() + Duration::from_millis(25));
+        self.view.next = Some(Instant::now());
     }
     fn paste(&mut self, core: &Core, text: &str) {
         let Some(a) = self.current().filter(|a| a.running()).cloned() else {
