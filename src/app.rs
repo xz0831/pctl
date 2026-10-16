@@ -176,7 +176,7 @@ struct App {
     refresh: Option<mpsc::Sender<()>>,
     /// Agents added here that a refresh started earlier may not list yet.
     fresh: HashMap<String, (Agent, Instant)>,
-    /// Panes whose window this app resized (resize-window leaves window-size at manual).
+    /// Panes whose window this app resized; a window with a client attached stays manual.
     touched: HashSet<String>,
     /// The last left click, to tell a double-click.
     last_click: Option<(Instant, Hit)>,
@@ -275,7 +275,7 @@ pub fn run(core: &Core) -> Result<()> {
             }
         }
     });
-    {
+    let shown = (|| -> Result<()> {
         let _guard = TerminalGuard::enter()?;
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         terminal.clear()?;
@@ -292,11 +292,15 @@ pub fn run(core: &Core) -> Result<()> {
                 app.handle(core, ev);
             }
         }
-    }
-    // Hand the windows back to tmux's own sizing, so `pctl attach` and other viewers fit again.
+        Ok(())
+    })();
+    // Hand the windows back to tmux's own sizing, also after a draw or read error.
+    // shortcut: a killed app (SIGHUP) leaves windows that had a client attached at manual; a
+    // signal handler would need a new dependency. Reopening the app and leaving clears them.
     for pane in &app.touched {
         let _ = core.tm(&["set-option", "-wu", "-t", pane, "window-size"]);
     }
+    shown?;
     println!("{}", quips::goodbye(app.keys.wit));
     let _ = std::fs::write(
         &place,
@@ -444,6 +448,11 @@ impl App {
         if self.view.asked != (w, h) {
             self.view.asked = (w, h);
             self.touched.insert(pane.clone());
+            // resize-window sets window-size to manual. With no client attached, unset it at once:
+            // tmux 3.8 keeps the size and nothing is left behind however the app ends. With a
+            // client attached, unsetting would hand the window straight back to that client's
+            // size, so it stays manual until the app leaves.
+            let unset = format!("set-option -wu -t {pane} window-size");
             let _ = core.tm(&[
                 "resize-window",
                 "-t",
@@ -452,6 +461,13 @@ impl App {
                 &w.to_string(),
                 "-y",
                 &h.to_string(),
+                ";",
+                "if-shell",
+                "-F",
+                "-t",
+                &pane,
+                "#{==:#{session_attached},0}",
+                &unset,
             ]);
         }
         let (start, end) = (
@@ -536,13 +552,14 @@ impl App {
         };
         // One tmux command carries about 16 KB; a longer paste goes in 8 KB pieces into one buffer,
         // then out as one bracketed paste.
+        // One buffer per app: two apps pasting at once must not mix their text.
+        let buffer = format!("pctl-app-{}", std::process::id());
         let mut r = Ok(String::new());
         for (i, piece) in chunks(text, 8192).into_iter().enumerate() {
             let append = if i == 0 { "-b" } else { "-ab" };
-            r = r.and_then(|_| core.tm(&["set-buffer", append, "pctl-app", "--", &literal(piece)]));
+            r = r.and_then(|_| core.tm(&["set-buffer", append, &buffer, "--", &literal(piece)]));
         }
-        let r =
-            r.and_then(|_| core.tm(&["paste-buffer", "-p", "-d", "-b", "pctl-app", "-t", &pane]));
+        let r = r.and_then(|_| core.tm(&["paste-buffer", "-p", "-d", "-b", &buffer, "-t", &pane]));
         if let Err(e) = r {
             self.say(format!("Could not paste: {e:#}"));
         }
@@ -1702,7 +1719,21 @@ impl App {
                 buf[(x, y)].set_style(Style::default().fg(tfg).bg(tbg));
             }
         }
-        for (i, row) in self.view.rows.iter().take(r.height as usize).enumerate() {
+        // A pane taller than this area (another viewer sized it) shows its bottom rows: the input
+        // line and any dialog live there, and nothing must be typed into a row out of sight.
+        let skip = if self.view.scroll == 0 {
+            self.view.size.1.saturating_sub(r.height)
+        } else {
+            0
+        };
+        for (i, row) in self
+            .view
+            .rows
+            .iter()
+            .skip(skip as usize)
+            .take(r.height as usize)
+            .enumerate()
+        {
             let y = r.y + i as u16;
             let mut x = r.x;
             for (text, style) in row {
@@ -1735,6 +1766,7 @@ impl App {
             );
         } else if let (Some((cx, cy)), false, None) =
             (self.view.cursor, self.in_sidebar, &self.modal)
+            && let Some(cy) = cy.checked_sub(skip)
             && cx < r.width
             && cy < r.height
         {

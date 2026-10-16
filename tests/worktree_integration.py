@@ -3,7 +3,7 @@
 branch and a worktree beside the repo and runs the session there; every refusal leaves no session,
 branch or worktree behind; `--model` gives an OpenCode session a private server and its model
 without writing a file; `worktree list` reports dirty, ahead and merged; `worktree remove` refuses
-a running, dirty, unmerged, locked, moved or missing worktree and otherwise moves the folder and its
+a running, dirty, unmerged, locked, moved, missing or symlinked worktree and otherwise moves the folder and its
 own git record to the trash (no repo-wide prune: another worktree that is away keeps its record),
 deletes the merged branch and unregisters the session."""
 import argparse, json, os, pathlib, subprocess, tempfile, time
@@ -111,11 +111,17 @@ try:
         git(w, 'switch', '-q', '-c', 't/other'); refused('moved'); git(w, 'switch', '-q', 't/one'); git(repo, 'branch', '-q', '-D', 't/other')
         w.rename(root / 'away'); assert 'missing' in cli('worktree', 'remove', 'w-one', ok=False); (root / 'away').rename(w)
         assert 'w-one' in names() and str(w) in git(repo, 'worktree', 'list') and git(w, 'status', '--porcelain') == '', 'a missing folder removes nothing'
+        # The folder was moved and a link left in its place: removing would trash the link and the
+        # moved folder's git record, breaking the real folder.
+        w.rename(root / 'moved-one'); w.symlink_to(root / 'moved-one')
+        assert 'symlink' in cli('worktree', 'remove', 'w-one', ok=False)
+        w.unlink(); (root / 'moved-one').rename(w)
+        assert git(w, 'branch', '--show-current') == 't/one' and 'w-one' in names(), 'a symlinked folder removes nothing'
         plain = cli('session', 'add', '--name', 'p-plain', '--cwd', repo, '--', bindir / 'plain')
         cli('agent', 'terminate', '--agent', plain['agent_id'], '--expected-run', plain['run_id'])
         assert 'has no worktree' in cli('worktree', 'remove', 'p-plain', ok=False)
         cli('session', 'remove', 'p-plain')
-    case('remove refuses a running, dirty, unmerged, locked, moved or missing worktree and a plain session', remove_gates)
+    case('remove refuses a running, dirty, unmerged, locked, moved, missing or symlinked worktree and a plain session', remove_gates)
     def remove():
         admin = pathlib.Path(git(wt('w-one'), 'rev-parse', '--absolute-git-dir'))
         (admin / 'modules' / 'sub').mkdir(parents=True); (admin / 'modules' / 'sub' / 'HEAD').write_text('unpushed\n')  # stands in for submodule data
