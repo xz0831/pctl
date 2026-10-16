@@ -17,12 +17,26 @@ while IFS= read -r line; do
     work*) echo "✻ Thinking… (3s · esc to interrupt)"; sleep 2; printf '\033[2J\033[Hdone\n> \n' ;;  # real harnesses redraw the footer away
     block*) echo "Do you want to proceed?"; echo "❯ 1. Yes" ;;
     clear*) printf '\033[2J\033[H> \n' ;;
+    later*) sleep 1; echo "the-text-you-wait-for"; echo "> " ;;
+    many*) for i in $(seq 1 150); do echo "line-$i"; done; echo "> " ;;
     *) echo "got: $line"; echo "> " ;;
   esac
 done
 '''
 for name in ('claude', 'codex', 'plain'):
     (bindir / name).write_text(FAKE); (bindir / name).chmod(0o755)
+# Raw mode: nothing is buffered or echoed, so every byte a key sends shows as its hex value.
+# It announces itself first: keys sent before the pane is raw land in the line buffer instead.
+RAWKEYS = r'''#!/usr/bin/env python3
+import os, sys, tty
+tty.setraw(0)
+sys.stdout.write('raw-ready\r\n'); sys.stdout.flush()
+while True:
+    b = os.read(0, 1)
+    if not b: break
+    sys.stdout.write('%02x|' % b[0]); sys.stdout.flush()
+'''
+(bindir / 'rawkeys').write_text(RAWKEYS); (bindir / 'rawkeys').chmod(0o755)
 # The caller is a pane of a permission-carrying terminal app (config: [server] start_env) inside a
 # Codex command: none of that identity may reach PCTL panes.
 (home / '.config' / 'pctl').mkdir(parents=True, exist_ok=True)
@@ -193,6 +207,71 @@ try:
         assert cli('session', 'get', 'x-three')['process'] == 'running'
         assert cli('session', 'restore')['restored'] == []
     case('restore resumes lost sessions, skips unknown conversations unless --new', restore)
+    def keys_reach_pane():
+        cli('session', 'add', '--name', 'k-raw', '--cwd', cwd('k-raw'), '--project', 'demo', '--', bindir / 'rawkeys')
+        assert until(lambda: 'raw-ready' in cli('session', 'read', 'k-raw', '--lines', '3')), 'the pane is raw before any key'
+        v = cli('session', 'keys', 'k-raw', 'Escape', 'Up', '5')
+        assert v['name'] == 'k-raw' and v['keys'] == ['Escape', 'Up', '5'] and v['was_blocked'] is False, v
+        assert until(lambda: '35|' in cli('session', 'read', 'k-raw', '--lines', '3')), cli('session', 'read', 'k-raw', '--lines', '3')
+        raw = cli('session', 'read', 'k-raw', '--lines', '3')
+        arrow = '1b|4f|41|' if '1b|4f|41|' in raw else '1b|5b|41|'  # Up: application or normal cursor mode
+        assert raw.strip().endswith('1b|' + arrow + '35|'), raw  # Escape, Up and the digit 5, in order, as their own bytes
+    case('session keys presses Escape, Up and a digit: the bytes arrive in the pane', keys_reach_pane)
+    def keys_refused():
+        def err(*args):
+            return json.loads(cli('session', 'keys', *args, ok=False))['error']
+        before = cli('session', 'read', 'k-raw', '--lines', '3')
+        for bad in ('F5', 'hello', 'esc', 'ctrl-c', ''):
+            assert err('k-raw', bad).startswith('unsupported key'), err('k-raw', bad)
+        assert 'unsupported key' in err('k-raw', 'Escape', 'F5'), 'one bad name refuses the whole call'
+        assert 'at most 32 keys' in err('k-raw', *['Escape'] * 33)
+        assert 'required arguments were not provided' in cli('session', 'keys', 'k-raw', ok=False), 'a call needs at least one key'
+        assert cli('session', 'read', 'k-raw', '--lines', '3') == before, 'nothing was sent'
+    case('an unknown key name is refused and nothing is sent; at most 32 keys', keys_refused)
+    def keys_stale_run():
+        s = cli('session', 'get', 'k-raw')
+        sock = str(state / 'tmux.sock')
+        cap = lambda: subprocess.run([T, '-S', sock, 'capture-pane', '-p', '-t', s['pane']], text=True, capture_output=True).stdout
+        subprocess.run([T, '-S', sock, 'set-option', '-p', '-t', s['pane'], '@pctl_run', 'someone-else'], check=True)
+        before = cap()
+        e = json.loads(cli('session', 'keys', 'k-raw', 'Escape', ok=False))['error']
+        assert 'controls locked' in e, e
+        assert cap() == before, 'a key never lands in a pane whose run changed'
+        subprocess.run([T, '-S', sock, 'set-option', '-p', '-t', s['pane'], '@pctl_run', s['run_id']], check=True)
+        cli('session', 'keys', 'k-raw', 'n')
+        assert until(lambda: '6e|' in cli('session', 'read', 'k-raw', '--lines', '3'))
+    case('a pane whose run changed refuses keys; they work again once the run matches', keys_stale_run)
+    def keys_blocked():
+        cli('session', 'prompt', 'p-shell', 'block')
+        assert until(lambda: cli('session', 'get', 'p-shell')['status'] == 'blocked', 3)
+        v = cli('session', 'keys', 'p-shell', 'Down', 'Enter')
+        assert v['was_blocked'] is True and v['status_before'] == 'blocked', v
+        assert until(lambda: 'got:' in cli('session', 'read', 'p-shell', '--lines', '6')), 'the blocked pane read a line'
+        e = json.loads(cli('session', 'prompt', 'p-shell', 'yes', ok=False))['error']
+        assert e.startswith('blocked:'), e
+        assert 'got: yes' not in cli('session', 'read', 'p-shell', '--lines', '6'), 'pasted text is still never an answer'
+        s = cli('session', 'get', 'p-shell')
+        cli('input', 'paste', '--agent', s['agent_id'], '--expected-run', s['run_id'], '--text', 'clear')
+        cli('input', 'submit', '--agent', s['agent_id'], '--expected-run', s['run_id'])
+        assert until(lambda: cli('session', 'get', 'p-shell')['status'] == 'idle')
+    case('session keys answers a blocked session (was_blocked); session prompt still refuses it', keys_blocked)
+    def wait_match():
+        cli('session', 'prompt', 'p-shell', 'later')
+        v = cli('session', 'wait', 'p-shell', '--match', 'the-text-you-wait-for', '--timeout-ms', '15000')
+        assert v['matched'] == 'the-text-you-wait-for' and v['name'] == 'p-shell', v
+        cli('session', 'prompt', 'p-shell', 'many')
+        assert until(lambda: cli('session', 'get', 'p-shell')['status'] == 'idle', 5)
+        vis = subprocess.run([T, '-S', str(state / 'tmux.sock'), 'capture-pane', '-p', '-t', cli('session', 'get', 'p-shell')['pane']], text=True, capture_output=True).stdout
+        assert 'line-5' not in vis, 'line-5 is above the visible screen: only the scrollback can match it'
+        v = cli('session', 'wait', 'p-shell', '--match', 'line-5\nline-6', '--timeout-ms', '15000')
+        assert v['matched'] == 'line-5\nline-6', v
+    case('wait --match returns when the text arrives, from the screen or the scrollback', wait_match)
+    def wait_match_errors():
+        e = json.loads(cli('session', 'wait', 'p-shell', '--match', 'never-shown-xyz', '--timeout-ms', '600', ok=False))['error']
+        assert e.startswith('timeout:') and 'never-shown-xyz' in e, e
+        e = cli('session', 'wait', 'p-shell', '--match', 'x', '--until', 'idle', '--timeout-ms', '600', ok=False)
+        assert 'cannot be used with' in e, e
+    case('wait --match times out with timeout:; --match with --until is a usage error', wait_match_errors)
     pathlib.Path(a.report).write_text(json.dumps({'results': results, 'passed': len(results)}, indent=1))
 finally:
     subprocess.run([T, '-S', str(state / 'tmux.sock'), 'kill-server'], capture_output=True)

@@ -243,6 +243,19 @@ fn menu_row(l: &str) -> bool {
 fn codex_root() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".codex/sessions")
 }
+/// The named keys `session keys` may press. A closed set: free text is `session prompt`'s job.
+const KEYS: [&str; 10] = [
+    "Escape", "Enter", "Tab", "BTab", "Up", "Down", "Left", "Right", "BSpace", "Space",
+];
+/// The tmux key name for an allowed key, or None for anything else. tmux's own names for these
+/// keys are the names above; a single digit, `y` or `n` is sent as that one character.
+fn key_name(key: &str) -> Option<&str> {
+    let single = key.len() == 1 && (key.as_bytes()[0].is_ascii_digit() || key == "y" || key == "n");
+    (KEYS.contains(&key) || single).then_some(key)
+}
+fn allowed_keys() -> String {
+    format!("{}, 0-9, y, n", KEYS.join(", "))
+}
 
 impl Core {
     pub(crate) fn by_name<'a>(&self, r: &'a Registry, name: &str) -> Result<&'a Agent> {
@@ -368,21 +381,80 @@ impl Core {
             json!({"name": name, "run_id": run.id, "status_before": before, "result": "delivered; acceptance unverified"}),
         )
     }
-    /// Poll until the status is one of `until` (default: not working).
-    pub fn session_wait(&self, name: &str, until: &[String], timeout: Duration) -> Result<Value> {
+    /// Press named keys in the session's pane, in order. A blocked session is answered too: a
+    /// deliberate key on a dialog is what this command is for, unlike pasted text.
+    pub fn session_keys(&self, name: &str, keys: &[String]) -> Result<Value> {
+        ensure!(!keys.is_empty(), "no keys given");
+        ensure!(keys.len() <= 32, "at most 32 keys per call");
+        let mut send = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(named) = key_name(key) else {
+                bail!("unsupported key {key:?}; allowed: {}", allowed_keys());
+            };
+            send.push(named);
+        }
+        let before = self.session_get(name)?["status"].clone();
+        let (a, run) = self.current(name)?;
+        {
+            let _lock = self.lock()?;
+            let r = self.registry()?;
+            ensure_terminal_input(&r, &a.id)?;
+            let pane = self.guard(&r, &a.id, &run.id, true)?;
+            ensure!(!pane.in_mode, "pane is in copy/other mode");
+            ensure!(
+                !pane.synchronized,
+                "synchronize-panes is enabled; input rejected"
+            );
+            let mut args = vec!["send-keys", "-t", &pane.pane];
+            args.extend(send.iter().copied());
+            match self.tm(&args) {
+                Ok(_) => self
+                    .audit(
+                        "session_keys",
+                        &run.id,
+                        &format!("keys sent: {}", send.join(" ")),
+                    )
+                    .context("keys delivered but audit failed; do not retry"),
+                Err(error) => bail!("outcome_unknown; do not retry automatically: {error}"),
+            }?;
+        }
+        Ok(
+            json!({"name": name, "run_id": run.id, "status_before": before, "was_blocked": before == "blocked", "keys": keys, "result": "delivered; acceptance unverified"}),
+        )
+    }
+    /// Poll until the status is one of `until` (default: not working), or, with `matched`, until
+    /// that text shows on the screen `session_read` returns.
+    pub fn session_wait(
+        &self,
+        name: &str,
+        until: &[String],
+        timeout: Duration,
+        matched: Option<&str>,
+    ) -> Result<Value> {
         let deadline = Instant::now() + timeout;
         loop {
-            let v = self.session_get(name)?;
-            let s = v["status"].as_str().unwrap_or("");
-            let done = if until.is_empty() {
-                s != "working"
+            let mut v = self.session_get(name)?;
+            if let Some(text) = matched {
+                if self.session_read(name, 200)?.contains(text) {
+                    v["matched"] = json!(text);
+                    return Ok(v);
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "timeout: {name} never showed {text:?}"
+                );
             } else {
-                until.iter().any(|u| u == s)
-            };
-            if done {
-                return Ok(v);
+                let s = v["status"].as_str().unwrap_or("");
+                let done = if until.is_empty() {
+                    s != "working"
+                } else {
+                    until.iter().any(|u| u == s)
+                };
+                if done {
+                    return Ok(v);
+                }
+                ensure!(Instant::now() < deadline, "timeout: {name} is still {s}");
             }
-            ensure!(Instant::now() < deadline, "timeout: {name} is still {s}");
             std::thread::sleep(Duration::from_millis(500));
         }
     }
@@ -661,6 +733,20 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn keys_are_the_allowed_names_only() {
+        for key in [
+            "Escape", "Enter", "Tab", "BTab", "Up", "Down", "Left", "Right", "BSpace", "Space",
+            "0", "9", "y", "n",
+        ] {
+            assert_eq!(key_name(key), Some(key), "{key} maps to its own tmux name");
+        }
+        for key in [
+            "", "esc", "escape", "Y", "N", "yy", "10", "space", "Ctrl-C", "F5", "hello", "Escape ",
+        ] {
+            assert_eq!(key_name(key), None, "{key} is refused");
+        }
+    }
     #[test]
     fn activity_reads_the_footer() {
         assert_eq!(
