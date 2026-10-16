@@ -3,8 +3,9 @@
 branch and a worktree beside the repo and runs the session there; every refusal leaves no session,
 branch or worktree behind; `--model` gives an OpenCode session a private server and its model
 without writing a file; `worktree list` reports dirty, ahead and merged; `worktree remove` refuses
-a running, dirty, unmerged, locked or moved worktree and otherwise moves the folder to the trash,
-prunes it, deletes the merged branch and unregisters the session."""
+a running, dirty, unmerged, locked, moved or missing worktree and otherwise moves the folder and its
+own git record to the trash (no repo-wide prune: another worktree that is away keeps its record),
+deletes the merged branch and unregisters the session."""
 import argparse, json, os, pathlib, subprocess, tempfile, time
 p = argparse.ArgumentParser(); p.add_argument('--bin', required=True); p.add_argument('--tmux', required=True); p.add_argument('--report', required=True); a = p.parse_args()
 B = str(pathlib.Path(a.bin).resolve()); T = str(pathlib.Path(a.tmux).resolve())
@@ -108,20 +109,28 @@ try:
         git(repo, 'merge', '-q', '--no-ff', '-m', 'merge one', 't/one')
         git(repo, 'worktree', 'lock', w); refused('locked'); git(repo, 'worktree', 'unlock', w)
         git(w, 'switch', '-q', '-c', 't/other'); refused('moved'); git(w, 'switch', '-q', 't/one'); git(repo, 'branch', '-q', '-D', 't/other')
+        w.rename(root / 'away'); assert 'missing' in cli('worktree', 'remove', 'w-one', ok=False); (root / 'away').rename(w)
+        assert 'w-one' in names() and str(w) in git(repo, 'worktree', 'list') and git(w, 'status', '--porcelain') == '', 'a missing folder removes nothing'
         plain = cli('session', 'add', '--name', 'p-plain', '--cwd', repo, '--', bindir / 'plain')
         cli('agent', 'terminate', '--agent', plain['agent_id'], '--expected-run', plain['run_id'])
         assert 'has no worktree' in cli('worktree', 'remove', 'p-plain', ok=False)
         cli('session', 'remove', 'p-plain')
-    case('remove refuses a running, dirty, unmerged, locked or moved worktree and a plain session', remove_gates)
+    case('remove refuses a running, dirty, unmerged, locked, moved or missing worktree and a plain session', remove_gates)
     def remove():
+        admin = pathlib.Path(git(wt('w-one'), 'rev-parse', '--absolute-git-dir'))
+        (admin / 'modules' / 'sub').mkdir(parents=True); (admin / 'modules' / 'sub' / 'HEAD').write_text('unpushed\n')  # stands in for submodule data
+        wt('w-oc').rename(root / 'oc-away')  # another worktree's folder is away (unmounted, moved) right now
         v = cli('worktree', 'remove', 'w-one')
+        (root / 'oc-away').rename(wt('w-oc'))
+        assert git(wt('w-oc'), 'branch', '--show-current') == 't/oc' and str(wt('w-oc')) in git(repo, 'worktree', 'list'), 'the away worktree kept its record'
         assert v['branch_deleted'] is True and v['trashed'], v
-        moved = pathlib.Path(v['trashed'])
+        moved = pathlib.Path(v['trashed']); gitdir = pathlib.Path(v['trashed_git_dir'])
         assert moved.parent == home / '.Trash' and moved.name.startswith('repo-wt-w-one-') and (moved / 'b.txt').read_text() == 'b\n', v
+        assert gitdir == moved.with_name(moved.name + '.gitdir') and (gitdir / 'modules' / 'sub' / 'HEAD').read_text() == 'unpushed\n' and not admin.exists(), v
         assert not wt('w-one').exists() and str(wt('w-one')) not in git(repo, 'worktree', 'list')
         assert 't/one' not in git(repo, 'branch', '--list') and 'w-one' not in names()
         assert (repo / 'b.txt').read_text() == 'b\n', 'the merged work stays on main'
-    case('remove moves a stopped, clean, merged worktree to the trash, prunes it, deletes the branch, unregisters', remove)
+    case('remove moves a stopped, clean, merged worktree and its own git record to the trash, deletes the branch, unregisters', remove)
     pathlib.Path(a.report).write_text(json.dumps({'results': results, 'passed': len(results)}, indent=1))
 finally:
     subprocess.run([T, '-S', str(state / 'tmux.sock'), 'kill-server'], capture_output=True)

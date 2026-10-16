@@ -270,9 +270,11 @@ impl Core {
             .collect())
     }
     /// Remove a worktree session only when nothing can be lost: no run, the worktree is unlocked,
-    /// still on its branch and clean, and the branch is merged into its base. The folder moves to
-    /// ~/.Trash, git's record is pruned, the merged branch is deleted (`git branch -d`, kept if git
-    /// refuses), and the session is unregistered.
+    /// still on its branch and clean, and the branch is merged into its base. The folder and its own
+    /// git record (`.git/worktrees/<id>`) move to ~/.Trash side by side, the merged branch is deleted
+    /// (`git branch -d`, kept if git refuses), and the session is unregistered. No `git worktree
+    /// prune`: it is repo-wide and permanent, so it would also drop the record of any other worktree
+    /// whose folder is away at that moment, and a worktree's submodule data lives in its record.
     pub fn worktree_remove(&self, name: &str) -> Result<Value> {
         let _lock = self.lock()?;
         let mut r = self.registry()?;
@@ -286,56 +288,74 @@ impl Core {
             "has_run: {name} still has a run; stop it first (pctl agent terminate)"
         );
         let (repo, path) = (Path::new(&w.repo), Path::new(&a.cwd));
+        ensure!(
+            path.is_dir(),
+            "missing: {} is gone, so nothing can be checked; nothing removed. Put the folder back, or clean up with git yourself",
+            a.cwd
+        );
         let list = entries(repo)?;
-        if path.exists() {
-            let e = list
-                .iter()
-                .skip(1)
-                .find(|e| same(&e.path, path))
-                .with_context(|| {
-                    format!(
-                        "git does not list {} as a worktree of {}; not touching it",
-                        a.cwd, w.repo
-                    )
-                })?;
-            ensure!(
-                !e.locked,
-                "locked: {} is locked; `git worktree unlock` it first",
-                a.cwd
-            );
-            ensure!(
-                e.branch.as_deref() == Some(w.branch.as_str()),
-                "moved: {} has {} checked out, not {}",
-                a.cwd,
-                e.branch.as_deref().unwrap_or("a detached HEAD"),
-                w.branch
-            );
-            let dirty = git(path, &["status", "--porcelain"])?;
-            ensure!(
-                dirty.is_empty(),
-                "dirty: {} has uncommitted changes:\n{}",
-                a.cwd,
-                first_lines(&dirty)
-            );
-        }
+        let e = list
+            .iter()
+            .skip(1)
+            .find(|e| same(&e.path, path))
+            .with_context(|| {
+                format!(
+                    "git does not list {} as a worktree of {}; not touching it",
+                    a.cwd, w.repo
+                )
+            })?;
+        ensure!(
+            !e.locked,
+            "locked: {} is locked; `git worktree unlock` it first",
+            a.cwd
+        );
+        ensure!(
+            e.branch.as_deref() == Some(w.branch.as_str()),
+            "moved: {} has {} checked out, not {}",
+            a.cwd,
+            e.branch.as_deref().unwrap_or("a detached HEAD"),
+            w.branch
+        );
+        let dirty = git(path, &["status", "--porcelain"])?;
+        ensure!(
+            dirty.is_empty(),
+            "dirty: {} has uncommitted changes:\n{}",
+            a.cwd,
+            first_lines(&dirty)
+        );
+        let admin = PathBuf::from(git(path, &["rev-parse", "--absolute-git-dir"])?);
+        let common = path.join(git(path, &["rev-parse", "--git-common-dir"])?);
+        ensure!(
+            admin.is_dir()
+                && admin
+                    .parent()
+                    .is_some_and(|p| same(&p.to_string_lossy(), &common.join("worktrees"))),
+            "{} is not a linked worktree's own git record; not touching it",
+            admin.display()
+        );
         ensure!(
             merged(repo, &w),
             "unmerged: {} is not merged into {} (or is gone); nothing removed",
             w.branch,
             w.base
         );
-        let trashed = if path.exists() {
-            let trash = PathBuf::from(std::env::var_os("HOME").context("HOME")?).join(".Trash");
-            fs::create_dir_all(&trash)?;
-            let folder = path.file_name().context("worktree folder name")?;
-            let to = trash.join(format!("{}-{}", folder.to_string_lossy(), now()));
-            fs::rename(path, &to)
-                .with_context(|| format!("moving {} to {}", a.cwd, to.display()))?;
-            Some(to.to_string_lossy().to_string())
-        } else {
-            None
-        };
-        git(repo, &["worktree", "prune"])?;
+        let trash = PathBuf::from(std::env::var_os("HOME").context("HOME")?).join(".Trash");
+        fs::create_dir_all(&trash)?;
+        let folder = path.file_name().context("worktree folder name")?;
+        let to = trash.join(format!("{}-{}", folder.to_string_lossy(), now()));
+        let git_to = to.with_file_name(format!(
+            "{}.gitdir",
+            to.file_name().context("name")?.to_string_lossy()
+        ));
+        fs::rename(path, &to).with_context(|| format!("moving {} to {}", a.cwd, to.display()))?;
+        fs::rename(&admin, &git_to).with_context(|| {
+            format!(
+                "{} is in {}, but its git record {} did not move; put the folder back, or move the record yourself",
+                a.cwd,
+                to.display(),
+                admin.display()
+            )
+        })?;
         let branch = git(repo, &["branch", "-d", &w.branch]);
         r.agents.retain(|x| x.id != a.id);
         self.save(&r)?;
@@ -345,7 +365,7 @@ impl Core {
             &format!("{name}: worktree to trash, unregistered"),
         )?;
         Ok(json!({
-            "removed": name, "trashed": trashed, "branch": w.branch,
+            "removed": name, "trashed": to, "trashed_git_dir": git_to, "branch": w.branch,
             "branch_deleted": branch.is_ok(),
             "branch_kept_because": branch.err().map(|e| e.to_string()),
         }))
