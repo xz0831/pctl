@@ -12,8 +12,8 @@ root = pathlib.Path(tempfile.mkdtemp(prefix='pctl-hu-', dir=os.path.realpath('/t
 bindir = root / 'bin'; bindir.mkdir()
 (bindir / 'plain').write_text('#!/bin/bash\nif [ "$(basename "$PWD")" = b-block ]; then echo "Do you want to proceed?"; echo "❯ 1. Yes"; fi\necho "> "\nwhile IFS= read -r line; do echo "got: $line"; echo "> "; done\n')
 (bindir / 'plain').chmod(0o755)
-ENV = {k: v for k, v in os.environ.items() if not k.startswith(('HERDR_', 'PCTL_', 'TMUX'))}
-ENV.update(HERDR_ENV='1', TERM='xterm-256color')
+ENV = {k: v for k, v in os.environ.items() if not k.startswith(('PCTL_', 'TMUX'))}
+ENV.update(PCTL_STANDALONE='1', TERM='xterm-256color')
 def cli(*args, ok=True, st=None):
     q = subprocess.run([B, '--state', str(st or state), '--tmux', T, *map(str, args)], text=True, capture_output=True, timeout=30, env=ENV)
     assert (q.returncode == 0) == ok, (args, q.returncode, q.stderr, q.stdout)

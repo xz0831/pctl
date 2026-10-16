@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline smoke test for a host without Herdr: real tmux, two fake agents, no model, no network.
+# Offline smoke test: real tmux, two fake agents, no model, no network.
 # Covers session create/list/read/input/attach, name-addressed send/reply with wake notice and
 # delivery evidence, duplicate and blocked refusals, and restart. Leaves nothing running.
 # Usage: scripts/lite-smoke.sh [path/to/pctl]   (tmux: $PCTL_TMUX, else tmux on PATH;
@@ -9,8 +9,9 @@ B=${1:-$(command -v pctl)} || { echo "FAIL pctl not found"; exit 1; }
 B=$(cd "$(dirname "$B")" && pwd)/$(basename "$B")
 T=${PCTL_TMUX:-$(command -v tmux)} || { echo "FAIL tmux not found"; exit 1; }
 base=${PCTL_SMOKE_DIR:-/tmp}
-for v in $(compgen -e); do case $v in HERDR_* | PCTL_* | TMUX | TMUX_PANE) unset "$v" ;; esac; done
+for v in $(compgen -e); do case $v in PCTL_* | TMUX | TMUX_PANE) unset "$v" ;; esac; done
 root=$(mktemp -d "$base/pctl-smoke.XXXXXX") || { echo "FAIL cannot create a folder in $base"; exit 1; }
+export XDG_CONFIG_HOME=$root/config  # no [server] start_env from the person's config
 S=$root/s
 n=0
 cleanup() {
@@ -45,7 +46,7 @@ EOF
 mkdir -p "$root/alpha" "$root/beta"
 
 out=$(p session add --name alpha --cwd "$root/alpha" --project lite -- /bin/sh "$root/agent" 2>&1)
-grep -q server_start_outside_herdr <<<"$out" && [ "$(p session list | tr -d ' \n')" = "[]" ] ||
+grep -q server_start_not_allowed <<<"$out" && [ "$(p session list | tr -d ' \n')" = "[]" ] ||
   fail "without PCTL_STANDALONE=1 the first start must be refused and register nothing: $out"
 pass "no server is started unless PCTL_STANDALONE=1; refusal registers nothing"
 export PCTL_STANDALONE=1

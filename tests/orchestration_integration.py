@@ -3,10 +3,10 @@
 No real models, account access, arbitrary message execution, or preexisting servers.
 """
 import argparse, concurrent.futures, hashlib, json, os, pathlib, subprocess, tempfile, time
-os.environ['HERDR_ENV'] = '1'  # Only disposable test servers bypass the Herdr startup gate.
+os.environ['PCTL_STANDALONE'] = '1'  # Only disposable test servers start themselves.
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--tmux',required=True);p.add_argument('--report',default='test-results/v06-orchestration.json');args=p.parse_args()
 B=str(pathlib.Path(args.bin).resolve());T=str(pathlib.Path(args.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-team-',dir=os.path.realpath('/tmp')));state=root/'s';results=[]
-baseenv={k:v for k,v in os.environ.items() if not k.startswith('PCTL_')}
+baseenv={k:v for k,v in os.environ.items() if not k.startswith('PCTL_') or k == 'PCTL_STANDALONE'}
 def pid_cwd(pid):
  if os.path.exists(f'/proc/{pid}/cwd'): return pathlib.Path(os.readlink(f'/proc/{pid}/cwd')).resolve()  # Linux: no lsof needed
  out=subprocess.run(['lsof','-a','-d','cwd','-Fn','-p',str(pid)],text=True,capture_output=True).stdout

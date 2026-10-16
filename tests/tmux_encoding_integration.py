@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Native no-locale/C-locale tmux transport regression. Inert local profiles only."""
 import argparse,hashlib,json,os,pathlib,subprocess,tempfile,time
-os.environ['HERDR_ENV'] = '1'  # Only disposable test servers bypass the Herdr startup gate.
+os.environ['PCTL_STANDALONE'] = '1'  # Only disposable test servers start themselves.
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--tmux',required=True);p.add_argument('--report',required=True);a=p.parse_args();B=str(pathlib.Path(a.bin).resolve());T=str(pathlib.Path(a.tmux).resolve());R=pathlib.Path(tempfile.mkdtemp(prefix='pctl-encoding-',dir=os.path.realpath('/tmp')));S=R/'s';checks=[]
-operator={k:v for k,v in os.environ.items() if not k.startswith('PCTL_')};minimal={'PATH':'/usr/bin:/bin','TERM':'xterm-256color','HOME':str(R),'PWD':str(R)}
+operator={k:v for k,v in os.environ.items() if not k.startswith('PCTL_') or k == 'PCTL_STANDALONE'};minimal={'PATH':'/usr/bin:/bin','TERM':'xterm-256color','HOME':str(R),'PWD':str(R)}
 def cli(*args,env=None,ok=True):
  q=subprocess.run([B,'--state',str(S),'--tmux',T,*map(str,args)],capture_output=True,text=True,env=env or operator,timeout=20);assert (q.returncode==0)==ok,(args,q.returncode,q.stdout,q.stderr);return json.loads(q.stdout if ok else q.stderr)
 def check(name,fn):fn();checks.append({'test':name,'passed':True});print('PASS',name,flush=True)

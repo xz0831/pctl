@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Name-addressed sessions (msg/Hermes surface): no Herdr identity leaks into panes, list/get/prompt/
+"""Name-addressed sessions (msg/Hermes surface): no starter-terminal identity leaks into panes, list/get/prompt/
 read/wait/whoami, blocked sessions are never typed into or restarted, conversation IDs survive
 restart and restore, and the SessionStart hook records Codex threads. Fake harnesses only."""
 import argparse, json, os, pathlib, subprocess, tempfile, time
@@ -23,8 +23,12 @@ done
 '''
 for name in ('claude', 'codex', 'plain'):
     (bindir / name).write_text(FAKE); (bindir / name).chmod(0o755)
-# The caller looks like a Herdr pane inside a Codex command: none of it may reach PCTL panes.
-ENV = dict(os.environ, HOME=str(home), HERDR_ENV='1', HERDR_PANE_ID='w9:p9', HERDR_SOCKET_PATH='/nonexistent', CODEX_THREAD_ID='leak')
+# The caller is a pane of a permission-carrying terminal app (config: [server] start_env) inside a
+# Codex command: none of that identity may reach PCTL panes.
+(home / '.config' / 'pctl').mkdir(parents=True, exist_ok=True)
+(home / '.config' / 'pctl' / 'config.toml').write_text('[server]\nstart_env = "TERMAPP_ENV"\n')
+ENV = {k: v for k, v in os.environ.items() if not k.startswith(('PCTL_', 'XDG_CONFIG'))}
+ENV.update(HOME=str(home), TERMAPP_ENV='1', TERMAPP_PANE_ID='w9:p9', TERMAPP_SOCKET_PATH='/nonexistent', CODEX_THREAD_ID='leak')
 def cli(*args, ok=True, env=None, stdin=None):
     q = subprocess.run([B, '--state', str(state), '--tmux', T, *map(str, args)], text=True, capture_output=True, timeout=30, env=env or ENV, input=stdin)
     assert (q.returncode == 0) == ok, (args, q.returncode, q.stderr, q.stdout)
@@ -52,10 +56,10 @@ try:
         env = cwd('p-shell') / 'env.txt'
         assert until(env.exists)
         text = env.read_text()
-        leaked = [l.split('=')[0] for l in text.splitlines() if l.startswith('HERDR_') or l.startswith('CODEX_THREAD_ID=')]
+        leaked = [l.split('=')[0] for l in text.splitlines() if l.startswith('TERMAPP_') or l.startswith('CODEX_THREAD_ID=')]
         assert leaked == [], leaked
         assert 'PCTL_AGENT_ID=' in text
-    case('PCTL panes carry no HERDR_* or CODEX_THREAD_ID from the server starter', no_leak)
+    case('PCTL panes carry no start_env-prefixed variables or CODEX_THREAD_ID from the server starter', no_leak)
     def whoami():
         f = cwd('c-main') / 'whoami.json'
         assert until(lambda: f.exists() and f.read_text().strip())
@@ -99,11 +103,11 @@ try:
         assert log.read_text().splitlines()[1] == f'claude --resume {c}'
     case('claude: fixed --session-id on first start, --resume on restart', claude_resume)
     def moved():
-        cli('session', 'add', '--name', 'c-moved', '--cwd', cwd('c-moved'), '--conversation', 'herdr-convo-1', '--', bindir / 'claude')
+        cli('session', 'add', '--name', 'c-moved', '--cwd', cwd('c-moved'), '--conversation', 'moved-convo-1', '--', bindir / 'claude')
         log = cwd('c-moved') / 'argv.log'
         assert until(lambda: log.exists() and log.read_text().strip())
-        assert log.read_text().splitlines()[0] == 'claude --resume herdr-convo-1'
-        assert cli('session', 'get', 'c-moved')['conversation'] == 'herdr-convo-1'
+        assert log.read_text().splitlines()[0] == 'claude --resume moved-convo-1'
+        assert cli('session', 'get', 'c-moved')['conversation'] == 'moved-convo-1'
         assert 'needs a claude or codex' in cli('session', 'add', '--name', 'p-moved', '--cwd', cwd('p-moved'), '--conversation', 'x', '--', bindir / 'plain', ok=False)
     case('add --conversation starts a moved session in its existing conversation', moved)
     def start_stopped():
@@ -112,9 +116,9 @@ try:
         cli('agent', 'terminate', '--agent', s['agent_id'], '--expected-run', s['run_id'])
         assert cli('session', 'get', 'c-moved')['process'] == 'stopped'
         v = cli('session', 'start', 'c-moved')
-        assert v['process'] == 'running' and v['conversation'] == 'herdr-convo-1', v
+        assert v['process'] == 'running' and v['conversation'] == 'moved-convo-1', v
         log = cwd('c-moved') / 'argv.log'
-        assert until(lambda: log.read_text().splitlines()[-1] == 'claude --resume herdr-convo-1')
+        assert until(lambda: log.read_text().splitlines()[-1] == 'claude --resume moved-convo-1')
     case('start runs a stopped session in its saved conversation', start_stopped)
     def remove():
         assert 'has_run' in cli('session', 'remove', 'c-moved', ok=False)
@@ -157,17 +161,19 @@ try:
         assert len((cwd('x-three') / 'argv.log').read_text().splitlines()) == 1, 'not restarted'
     case('restart refuses a session whose conversation ID is unknown', unknown_conversation)
     def gate():
-        outside = {k: v for k, v in ENV.items() if not k.startswith('HERDR_')}
+        outside = {k: v for k, v in ENV.items() if not k.startswith('TERMAPP_')}
         other = root / 's2'
-        q = subprocess.run([B, '--state', str(other), '--tmux', T, 'session', 'add', '--name', 'g', '--cwd', str(cwd('g')), '--', str(bindir / 'plain')], text=True, capture_output=True, timeout=30, env=outside)
-        assert q.returncode != 0 and json.loads(q.stderr)['error_code'] == 'server_start_outside_herdr', q.stderr
+        bare = root / 'bare-home'; bare.mkdir(exist_ok=True)  # no config: the terminal's variable means nothing
+        for env in (outside, dict(ENV, HOME=str(bare))):
+            q = subprocess.run([B, '--state', str(other), '--tmux', T, 'session', 'add', '--name', 'g', '--cwd', str(cwd('g')), '--', str(bindir / 'plain')], text=True, capture_output=True, timeout=30, env=env)
+            assert q.returncode != 0 and json.loads(q.stderr)['error_code'] == 'server_start_not_allowed', q.stderr
         assert subprocess.run([T, '-S', str(other / 'tmux.sock'), 'ls'], capture_output=True).returncode != 0, 'no server created'
         subprocess.run([T, '-S', str(state / 'tmux.sock'), 'kill-server'], capture_output=True)
         err = json.loads(cli('session', 'restore', ok=False, env=outside))
-        assert err['error_code'] == 'server_start_outside_herdr', err
+        assert err['error_code'] == 'server_start_not_allowed', err
         assert subprocess.run([T, '-S', str(state / 'tmux.sock'), 'ls'], capture_output=True).returncode != 0, 'no server created'
         assert all(s['process'] == 'lost' for s in cli('session', 'list', env=outside)), 'refused restore keeps every run'
-    case('outside Herdr (no HERDR_ENV) no server is created: add and restore are refused', gate)
+    case('without start_env set to 1 (or with no [server] start_env) no server is created: add and restore are refused', gate)
     def restore():
         before = {s['name']: s['conversation'] for s in cli('session', 'list')}
         out = {o['name']: o for o in cli('session', 'restore')['restored']}

@@ -15,7 +15,7 @@ FAKE = '#!/bin/bash\necho "pwd: $PWD"; echo "args: $*"; echo "cfg: $OPENCODE_CON
 for n in ('plain', 'opencode'):
     (bindir / n).write_text(FAKE); (bindir / n).chmod(0o755)
 ENV = {k: v for k, v in os.environ.items() if not k.startswith(('GIT_', 'PCTL_'))}
-ENV.update(HERDR_ENV='1', HOME=str(home), GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1',
+ENV.update(PCTL_STANDALONE='1', HOME=str(home), GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1',
            GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@example.invalid', GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@example.invalid')
 def run(*args, cwd=None, ok=True):
     q = subprocess.run(list(map(str, args)), cwd=cwd, text=True, capture_output=True, timeout=60, env=ENV)

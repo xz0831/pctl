@@ -246,12 +246,17 @@ impl Core {
             .arg("-f")
             .arg("/dev/null");
         c.env_remove("TMUX");
-        // A server started from a Herdr pane would copy that pane's identity into every PCTL
-        // pane (msg sender, Herdr hooks). Permissions follow process lineage, not environment.
+        // A server started from a permission-carrying terminal's pane would copy that pane's
+        // identity into every PCTL pane (msg sender, the terminal's hooks): drop the variables
+        // that share start_env's prefix (FOO_ for FOO_ENV). Permissions follow process lineage.
+        let prefix = start_env().map(|s| s.split_once('_').map_or(s.as_str(), |(p, _)| p));
         for (k, _) in std::env::vars_os() {
-            if k.to_str()
-                .is_some_and(|k| k.starts_with("HERDR_") || k == "CODEX_THREAD_ID")
-            {
+            if k.to_str().is_some_and(|k| {
+                k == "CODEX_THREAD_ID"
+                    || prefix.is_some_and(|p| {
+                        k == p || k.strip_prefix(p).is_some_and(|r| r.starts_with('_'))
+                    })
+            }) {
                 c.env_remove(k);
             }
         }
@@ -1355,14 +1360,33 @@ fn ensure_terminal_input(r: &Registry, agent: &str) -> Result<()> {
     );
     Ok(())
 }
-/// macOS permissions follow the process lineage that starts the server: in a Herdr setup only a
-/// Herdr pane carries them, so a launchd/ssh/front-door caller must not create one. Hosts without
-/// Herdr opt out explicitly with PCTL_STANDALONE=1.
+/// The variable that lets a caller start the tmux server: `[server] start_env` in config.toml.
+/// macOS permissions follow the process lineage that starts the server, so where a terminal app
+/// carries them, only its panes (which set this variable to 1) may create one, and a launchd,
+/// ssh or front-door caller must not. Read once per process.
+pub(crate) fn start_env() -> Option<&'static String> {
+    static START: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    START
+        .get_or_init(|| {
+            let text = fs::read_to_string(app::keys::config_path()?).ok()?;
+            app::keys::section(&text, "server")
+                .into_iter()
+                .find(|(k, _)| k == "start_env")
+                .map(|(_, v)| v)
+                .filter(|v| {
+                    !v.is_empty()
+                        && v.bytes()
+                            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                })
+        })
+        .as_ref()
+}
+/// Without `[server] start_env`, only an explicit PCTL_STANDALONE=1 starts a server.
 pub(crate) fn server_start_allowed() -> Result<()> {
-    let on = |k| std::env::var(k).as_deref() == Ok("1");
+    let on = |k: &str| std::env::var(k).as_deref() == Ok("1");
     ensure!(
-        on("HERDR_ENV") || on("PCTL_STANDALONE"),
-        "server_start_outside_herdr: no PCTL server is running and this caller is not in a Herdr pane; start it from Herdr (pctl-server-herdr), or set PCTL_STANDALONE=1 on a host without Herdr"
+        on("PCTL_STANDALONE") || start_env().is_some_and(|k| on(k)),
+        "server_start_not_allowed: no PCTL server is running and this caller may not start one; set PCTL_STANDALONE=1, or run it where the variable named by [server] start_env in config.toml is 1"
     );
     Ok(())
 }
@@ -1374,7 +1398,7 @@ pub fn error_code(message: &str) -> &'static str {
         "launch_limit",
         "orchestration_capacity",
         "operator_only",
-        "server_start_outside_herdr",
+        "server_start_not_allowed",
         "conversation_unknown",
     ] {
         if message.contains(code) {

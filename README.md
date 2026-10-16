@@ -33,9 +33,12 @@ done
 python3 tests/remote_quoting.py --bin $B; echo "remote_quoting exit $?"
 ```
 
-## Use it like Herdr
+## The app
 
 Type `pctl` in a terminal. The pctl app opens straight onto your agents:
+
+![The pctl app: projects and agents on the left, tabs on top, the selected agent's live terminal](docs/images/app-main.svg)
+
 - **Left:** projects and their agents with their state.
   - `●` idle (green) or working (blue)
   - `!` waits for you
@@ -45,10 +48,12 @@ Type `pctl` in a terminal. The pctl app opens straight onto your agents:
 
 Everything works with the mouse:
 
+![Double-click (or right-click) an agent for its menu; here an agent waits for a decision](docs/images/app-menu.svg)
+
 | To do this | Click |
 |---|---|
 | Open an agent | the agent or its tab |
-| Open a bash terminal (like a new tab in Ghostty) | `+` in the tab bar |
+| Open a bash terminal | `+` in the tab bar |
 | Start Claude Code, Codex, OpenCode or a command | `+ agent` (a form; bash is preselected) |
 | Add a project | `[+]` next to PROJECTS |
 | Restart (same conversation), stop, start or remove an agent | right-click or double-click it (or `ctrl+b m`); stop and remove ask first |
@@ -56,13 +61,17 @@ Everything works with the mouse:
 | See the shortcuts | `? Help` |
 | Leave | `⏏ Leave` (the agents keep running) |
 
-Shortcuts follow Herdr. Press `ctrl+b`, then:
+![The new-agent form: bash, Claude Code, Codex, OpenCode or any command, optionally in its own git worktree](docs/images/app-form.svg)
+
+Shortcuts: press `ctrl+b`, then:
 - `c`: new bash tab
 - `a`: new agent
+- `m`: the agent's menu
 - `n` / `p`: next / previous tab
 - `1`…`9`: go to that tab
 - `x`: stop
 - `r`: restart
+- `t`: theme
 - `b`: sidebar
 - `w`: keyboard sidebar
 - `?`: help
@@ -84,15 +93,27 @@ Themes: `◐ Theme` (or `ctrl+b t`) picks one of the built-in themes:
 
 The terminal area follows the chosen theme too.
 
+![The nebula theme](docs/images/app-nebula.svg)
+
 Make your own: `pctl theme --new mine --from garage` writes `~/.config/pctl/themes/mine.toml`, with every colour and a comment saying where it shows. Change the colours and pick `mine` from `◐ Theme`. `pctl theme --list` shows all themes and any problems in your files. Agents can make themes the same way. Keep your own themes in your own config folder; do not commit them here.
 
 A little dry humour shows up where nothing is at stake: loading, empty screens, tips, goodbye. It never appears in errors or anything agents read. `[ui]` with `wit = false` in the config file turns it off.
 
-`pctl` reopens on the project and tab you left. It never starts a server by itself; adding the first agent follows the same rule as `session add` (a Herdr pane or `PCTL_STANDALONE=1`). tmux still keeps the processes behind the app. `pctl attach [--project <name>]` opens a plain tmux client instead.
+`pctl` reopens on the project and tab you left. It never starts a server by itself; adding the first agent follows the same rule as `session add` (see [Starting the server](#starting-the-server)). tmux still keeps the processes behind the app. `pctl attach [--project <name>]` opens a plain tmux client instead.
 
-## Hosts without Herdr
+## Starting the server
 
-pctl starts its tmux server only for a caller in a Herdr pane (`HERDR_ENV=1`) or with `PCTL_STANDALONE=1`. On a host without Herdr, set `PCTL_STANDALONE=1`.
+pctl starts its tmux server only when the caller may. Usually that means setting `PCTL_STANDALONE=1`.
+
+On macOS, permissions such as Full Disk Access, Accessibility and Screen Recording follow the process that starts the server. If one terminal app carries them, let only its panes start the server. Name the variable that app sets to `1` in its panes:
+
+```toml
+# ~/.config/pctl/config.toml
+[server]
+start_env = "TERMAPP_ENV"
+```
+
+Variables with the same prefix (`TERMAPP_` here) are not copied into agent panes. A refused start fails with `server_start_not_allowed` and creates nothing.
 
 ## Web page
 
