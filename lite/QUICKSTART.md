@@ -24,6 +24,18 @@ pctl runs interactive coding agents (any terminal CLI) in tmux panes, addressed 
    - `bash smoke.sh ~/.local/bin/pctl`
    - The smoke test takes about 30 seconds and uses fake agents in a new folder under `/tmp`. Its own tmux server is stopped at the end.
 
+## The app (`pctl` alone)
+Run `pctl` with no command in a terminal to open the full-screen app.
+- **Layout:** projects and agents on the left, tabs on top, the selected agent's live terminal in the middle. Type to it directly.
+- **Mouse and keys:**
+  - Click to open an agent.
+  - `+` in the tab bar opens a bash tab; `+ agent` opens the new-agent form.
+  - Right-click an agent for restart, stop, start and remove. Where the terminal keeps the right button for itself (MATE Terminal does), double-click the agent or press `ctrl+b m`.
+  - `? Help` lists the shortcuts; `⏏ Leave` exits and stops nothing.
+- **Status marks** are read from the screen, so they can lag a moment: `●` idle or working, `!` waiting for you, `○` stopped.
+- **Change shortcuts** in `~/.config/pctl/config.toml` under `[keys]`.
+- **Agents cannot open the app.** Inside an agent's pane it refuses; use the commands below there.
+
 ## Sessions (run from any terminal)
 | Do | Command |
 |---|---|
