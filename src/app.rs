@@ -272,7 +272,7 @@ fn notifications(
     out
 }
 
-fn agent_caller(core: &Core) -> bool {
+pub(crate) fn agent_caller(core: &Core) -> bool {
     let sock = core.state.join("tmux.sock");
     let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     std::env::var_os("PCTL_AGENT_ID").is_some()

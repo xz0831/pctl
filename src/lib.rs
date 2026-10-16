@@ -11,8 +11,10 @@ use std::{
 };
 use uuid::Uuid;
 pub mod app;
+pub mod bridge;
 pub mod collaboration;
 pub mod human;
+pub mod machine;
 pub mod orchestration;
 pub mod session;
 pub mod sidebar;
