@@ -5,6 +5,7 @@ use crate::{Agent, Core, Registry, Run, ensure_terminal_input, now};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
@@ -269,26 +270,84 @@ impl Core {
             ),
         }
     }
-    fn view(&self, r: &Registry, a: &Agent, panes: Option<&[crate::Pane]>) -> Value {
+    /// The live pane of an agent's current run.
+    fn pane_of<'a>(
+        r: &Registry,
+        a: &Agent,
+        panes: Option<&'a [crate::Pane]>,
+    ) -> Option<&'a crate::Pane> {
+        let run = r.runs.iter().find(|x| x.agent_id == a.id)?;
+        panes?
+            .iter()
+            .find(|p| p.pane == run.pane && p.run == run.id)
+    }
+    /// What each of `panes` is doing, read with one tmux call per 16 panes instead of two per pane.
+    /// tmux stops a command list at its first error, so a pane that is gone makes the call fail or
+    /// come back short; those panes are left out and the caller asks for them one by one.
+    fn activities(&self, panes: &[&str]) -> HashMap<String, &'static str> {
+        let mut known = HashMap::new();
+        for chunk in panes.chunks(16) {
+            // Each pane's screen is followed by a line only this call can write: a screen that
+            // prints something alike cannot end its own part early or start another's.
+            let mark = Uuid::new_v4().simple().to_string();
+            // The pane comes from tmux's own format: a literal "%1" would be read as a strftime code.
+            let line = format!("{mark} #{{pane_id}} #{{pane_title}} {mark}");
+            let mut args: Vec<String> = vec![];
+            for p in chunk {
+                let p = p.to_string();
+                args.extend(["capture-pane", "-p", "-e", "-t", &p, ";"].map(String::from));
+                args.extend(["display-message", "-p", "-t", &p, &line, ";"].map(String::from));
+            }
+            args.pop();
+            let Ok(out) = self.tm(&args.iter().map(String::as_str).collect::<Vec<_>>()) else {
+                continue;
+            };
+            let (mut got, mut screen) = (vec![], String::new());
+            for l in out.split('\n') {
+                let Some(rest) = l.strip_prefix(&format!("{mark} ")) else {
+                    screen.push_str(l);
+                    screen.push('\n');
+                    continue;
+                };
+                let Some((pane, title)) = rest
+                    .strip_suffix(&format!(" {mark}"))
+                    .and_then(|m| m.split_once(' '))
+                else {
+                    break;
+                };
+                got.push((pane, activity(screen.trim_end_matches('\n'), title)));
+                screen.clear();
+            }
+            if got.len() == chunk.len() && got.iter().zip(chunk).all(|((p, _), c)| p == c) {
+                known.extend(got.into_iter().map(|(p, a)| (p.to_string(), a)));
+            }
+        }
+        known
+    }
+    fn view(
+        &self,
+        r: &Registry,
+        a: &Agent,
+        panes: Option<&[crate::Pane]>,
+        known: &HashMap<String, &'static str>,
+    ) -> Value {
         let run = r.runs.iter().find(|x| x.agent_id == a.id);
-        let pane = run.and_then(|run| {
-            panes?
-                .iter()
-                .find(|p| p.pane == run.pane && p.run == run.id)
-        });
+        let pane = Self::pane_of(r, a, panes);
         let (process, status) = match (run, pane) {
             (None, _) => ("stopped", "stopped"),
             (Some(_), None) => ("lost", "lost"),
             (Some(_), Some(p)) if p.dead => ("exited", "exited"),
             (Some(_), Some(p)) => (
                 "running",
-                self.tm(&["capture-pane", "-p", "-e", "-t", &p.pane])
-                    .map_or("unknown", |s| {
-                        let title = self
-                            .tm(&["display-message", "-p", "-t", &p.pane, "#{pane_title}"])
-                            .unwrap_or_default();
-                        activity(&s, &title)
-                    }),
+                known.get(&p.pane).copied().unwrap_or_else(|| {
+                    self.tm(&["capture-pane", "-p", "-e", "-t", &p.pane])
+                        .map_or("unknown", |s| {
+                            let title = self
+                                .tm(&["display-message", "-p", "-t", &p.pane, "#{pane_title}"])
+                                .unwrap_or_default();
+                            activity(&s, &title)
+                        })
+                }),
             ),
         };
         let project = r.projects.iter().find(|p| p.id == a.project_id);
@@ -333,15 +392,23 @@ impl Core {
     pub fn session_list(&self) -> Result<Vec<Value>> {
         let r = self.discover()?;
         let panes = self.live_panes(&r);
+        let reading: Vec<&str> = r
+            .agents
+            .iter()
+            .filter_map(|a| Self::pane_of(&r, a, panes.as_deref()))
+            .filter(|p| !p.dead)
+            .map(|p| p.pane.as_str())
+            .collect();
+        let known = self.activities(&reading);
         Ok(r.agents
             .iter()
-            .map(|a| self.view(&r, a, panes.as_deref()))
+            .map(|a| self.view(&r, a, panes.as_deref(), &known))
             .collect())
     }
     pub fn session_get(&self, name: &str) -> Result<Value> {
         let r = self.discover()?;
         let a = self.by_name(&r, name)?;
-        Ok(self.view(&r, a, self.live_panes(&r).as_deref()))
+        Ok(self.view(&r, a, self.live_panes(&r).as_deref(), &HashMap::new()))
     }
     fn current(&self, name: &str) -> Result<(Agent, Run)> {
         let r = self.registry()?;
