@@ -289,6 +289,11 @@ impl Core {
         );
         let (repo, path) = (Path::new(&w.repo), Path::new(&a.cwd));
         ensure!(
+            !fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()),
+            "symlink: {} is a symbolic link now; git would answer for wherever it points, so nothing is removed",
+            a.cwd
+        );
+        ensure!(
             path.is_dir(),
             "missing: {} is gone, so nothing can be checked; nothing removed. Put the folder back, or clean up with git yourself",
             a.cwd

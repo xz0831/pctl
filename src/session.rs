@@ -197,17 +197,26 @@ fn activity(raw: &str, title: &str) -> &'static str {
             .iter()
             .any(|(_, l)| l.contains("esc to interrupt") || spinner_line(l));
     // A question beats the dim-prompt hint: when both show, refusing input is the safe side.
-    let question = tail.iter().any(|(_, l)| {
-        [
-            "do you want to",
-            "would you like to",
-            "allow command",
-            "approve",
-            "enter to confirm",
-        ]
+    // Only rows below the last free input row count: prose an agent wrote above its own prompt
+    // ("if the reviewer approves") is not a question. Dialogs replace the input row or sit below
+    // it (Claude's trust dialog: "❯ No, exit" … "Enter to confirm").
+    let below = tail
         .iter()
-        .any(|k| l.contains(k))
-    }) || tail.iter().any(|(_, l)| menu_row(l));
+        .rposition(|(_, l)| l.starts_with(['❯', '›']) && !menu_row(l))
+        .map_or(0, |i| i + 1);
+    let question = tail[below..].iter().any(|(_, l)| {
+        menu_row(l)
+            || [
+                "do you want to",
+                "would you like to",
+                "allow command",
+                "approve",
+                "enter to confirm",
+                "esc to cancel",
+            ]
+            .iter()
+            .any(|k| l.contains(k))
+    });
     if busy {
         "working"
     } else if question {
@@ -692,6 +701,17 @@ mod tests {
         // Claude Code's folder-trust dialog (2.1.x, captured): unnumbered, coloured choices.
         let trust = " Quick safety check: Is this a project you created or one you trust?\n \x1b[38;5;153m❯\x1b[39m \x1b[38;5;153mNo,\x1b[39m \x1b[38;5;153mexit\x1b[39m\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel\n";
         assert_eq!(activity(trust, ""), "blocked");
+        // Prose above a free input row is not a question (an idle lead reporting "approves").
+        let report = "⏺ I merge if the reviewer approves. Do you want to see the diff?\n────\n❯ \n────\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n";
+        assert_eq!(activity(report, "✳ t"), "idle");
+        assert_eq!(activity("❯ 1. Yes\n⏺ Ran it.\n❯ \n", ""), "idle");
+        assert_eq!(
+            activity(
+                "• Would you like to approve it? I asked.\n› Ask Codex to do anything\n",
+                ""
+            ),
+            "idle"
+        );
     }
     #[test]
     fn launch_argv_assigns_then_resumes() {

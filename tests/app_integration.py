@@ -4,7 +4,7 @@ outer "monitor" tmux; its screen is read with capture-pane, keys go in with send
 clicks are SGR mouse sequences typed into it. Covers the sidebar, tabs and live terminal, typing,
 clicks, prefix shortcuts, the new-agent form, the right-click menu with its confirmation (and that
 clicks on a box never reach what is behind it; double-click and ctrl+b m open the same menu), Start for a stopped agent, wheel scroll-back,
-Leave (stops nothing, reopens in place, hands window sizing back), shortcuts from a config file, the
+Leave (stops nothing, reopens in place, never leaves window-size at manual, even when killed), shortcuts from a config file, the
 empty state with no server (which starts nothing), and that agents cannot open the app."""
 import argparse, json, os, pathlib, re, subprocess, tempfile, time
 p = argparse.ArgumentParser(); p.add_argument('--bin', required=True); p.add_argument('--tmux', required=True); p.add_argument('--report', required=True); a = p.parse_args()
@@ -179,17 +179,21 @@ try:
     def leave():
         here = status()
         pane = cli('session', 'get', 'a-shell')['pane']
-        assert st('show-options', '-wv', '-t', pane, 'window-size') == 'manual', 'the app sized the window it shows'
-        st('resize-window', '-t', pane, '-x', '50', '-y', '10'); time.sleep(1.5)  # another viewer's size
+        assert int(st('display-message', '-p', '-t', pane, '#{pane_width}')) > 50, 'the app sized the window it shows'
+        assert st('show-options', '-wv', '-t', pane, 'window-size') == '', 'tmux keeps its own sizing while the app shows it'
+        st('resize-window', '-t', pane, '-x', '50', '-y', '10'); st('set-option', '-wu', '-t', pane, 'window-size'); time.sleep(1.5)  # another viewer
         assert st('display-message', '-p', '-t', pane, '#{pane_width}') == '50', 'the app does not fight another size'
         click(*find('⏏ Leave'))
         assert until(lambda: 'EXITED 0' in screen()), screen()
-        assert st('show-options', '-wv', '-t', pane, 'window-size') == '', 'leaving hands sizing back to tmux'
         rows = {s['name']: s['status'] for s in cli('session', 'list')}
         assert rows['a-main'] == 'idle' and rows['a-shell'] in ('idle', 'unknown') and rows['a-block'] == 'blocked', rows
         app()
         assert until(lambda: 'alpha / ● a-shell' in status()), (here, status())
-    case('Leave exits the app and stops nothing, hands window sizing back; pctl reopens where it was left', leave)
+        assert until(lambda: int(st('display-message', '-p', '-t', pane, '#{pane_width}')) > 50), 'reopened, it sizes the window again'
+        vt('kill-server'); time.sleep(0.5)  # the terminal goes away under the app (SIGHUP)
+        assert st('show-options', '-wv', '-t', pane, 'window-size') == '', 'a killed app leaves no manual size behind'
+        app(); assert until(lambda: 'alpha / ● a-shell' in status()), status()
+    case('Leave exits the app and stops nothing, never leaves window-size manual; pctl reopens where it was left', leave)
     def agents_refused():
         for env in ({'PCTL_AGENT_ID': 'x'}, {'PCTL_RUN_ID': 'x'}, {'TMUX': f'{state}/tmux.sock,1,0'}):
             app(env=env, ready=False)

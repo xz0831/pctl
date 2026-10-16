@@ -176,8 +176,6 @@ struct App {
     refresh: Option<mpsc::Sender<()>>,
     /// Agents added here that a refresh started earlier may not list yet.
     fresh: HashMap<String, (Agent, Instant)>,
-    /// Panes whose window this app resized (resize-window leaves window-size at manual).
-    touched: HashSet<String>,
     /// The last left click, to tell a double-click.
     last_click: Option<(Instant, Hit)>,
 }
@@ -293,10 +291,6 @@ pub fn run(core: &Core) -> Result<()> {
             }
         }
     }
-    // Hand the windows back to tmux's own sizing, so `pctl attach` and other viewers fit again.
-    for pane in &app.touched {
-        let _ = core.tm(&["set-option", "-wu", "-t", pane, "window-size"]);
-    }
     println!("{}", quips::goodbye(app.keys.wit));
     let _ = std::fs::write(
         &place,
@@ -336,7 +330,6 @@ impl App {
             quit: false,
             refresh: None,
             fresh: HashMap::new(),
-            touched: HashSet::new(),
             last_click: None,
         }
     }
@@ -443,7 +436,9 @@ impl App {
         }
         if self.view.asked != (w, h) {
             self.view.asked = (w, h);
-            self.touched.insert(pane.clone());
+            // resize-window sets window-size to manual; unset it at once. With no client attached
+            // the window keeps this size (tmux 3.8), and `pctl attach` still fits itself, however
+            // the app ends (Leave, a closed window, an error).
             let _ = core.tm(&[
                 "resize-window",
                 "-t",
@@ -452,6 +447,12 @@ impl App {
                 &w.to_string(),
                 "-y",
                 &h.to_string(),
+                ";",
+                "set-option",
+                "-wu",
+                "-t",
+                &pane,
+                "window-size",
             ]);
         }
         let (start, end) = (
@@ -536,13 +537,14 @@ impl App {
         };
         // One tmux command carries about 16 KB; a longer paste goes in 8 KB pieces into one buffer,
         // then out as one bracketed paste.
+        // One buffer per app: two apps pasting at once must not mix their text.
+        let buffer = format!("pctl-app-{}", std::process::id());
         let mut r = Ok(String::new());
         for (i, piece) in chunks(text, 8192).into_iter().enumerate() {
             let append = if i == 0 { "-b" } else { "-ab" };
-            r = r.and_then(|_| core.tm(&["set-buffer", append, "pctl-app", "--", &literal(piece)]));
+            r = r.and_then(|_| core.tm(&["set-buffer", append, &buffer, "--", &literal(piece)]));
         }
-        let r =
-            r.and_then(|_| core.tm(&["paste-buffer", "-p", "-d", "-b", "pctl-app", "-t", &pane]));
+        let r = r.and_then(|_| core.tm(&["paste-buffer", "-p", "-d", "-b", &buffer, "-t", &pane]));
         if let Err(e) = r {
             self.say(format!("Could not paste: {e:#}"));
         }
