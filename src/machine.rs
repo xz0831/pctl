@@ -241,6 +241,9 @@ fn probe(m: &Machine) -> Value {
         Ok(Ok(list)) => {
             row["server"] = json!(list["connected"].as_bool().unwrap_or(false));
             row["agents"] = json!(list["sessions"].as_array().map_or(0, Vec::len));
+            if let Some(e) = list["error"].as_str() {
+                row["error"] = json!(format!("list: {e}"));
+            }
         }
         Ok(Err(e)) => {
             row["error"] = json!(format!("list: {e:#}"));
