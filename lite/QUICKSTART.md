@@ -7,6 +7,11 @@ pctl runs interactive coding agents (any terminal CLI) in tmux panes, addressed 
 - tmux 3.0a or newer, on PATH or set with `PCTL_TMUX`
 - bash, only for `smoke.sh`
 
+## Your part (people, not pctl)
+- Get your organization's approval before you copy, install or run pctl, and follow its software rules.
+- pctl contains no AI model and no credentials. Install each agent CLI you start (for example claude or codex) and log in to it yourself, using the setup your organization allows.
+- tmux must be installed. Ask your administrator if it is missing.
+
 ## Install (offline)
 1. Unzip the ZIP.
 2. Run `sh install.sh`.
