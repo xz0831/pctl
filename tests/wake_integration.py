@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """msg send wakes a terminal-line recipient with one notice line; native recipients and retries are not woken."""
 import argparse, json, os, pathlib, subprocess, tempfile, time
+os.environ['HERDR_ENV'] = '1'  # Only disposable test servers bypass the Herdr startup gate.
 p = argparse.ArgumentParser(); p.add_argument('--bin', required=True); p.add_argument('--tmux', required=True); p.add_argument('--report', required=True); a = p.parse_args()
 B = str(pathlib.Path(a.bin).resolve()); T = str(pathlib.Path(a.tmux).resolve())
 root = pathlib.Path(tempfile.mkdtemp(prefix='pctl-wake-', dir=os.path.realpath('/tmp'))); state = root / 's'; results = []

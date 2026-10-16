@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Isolated native snapshot batching, partial-output and fresh-control-guard regression."""
 import argparse, hashlib, json, os, pathlib, subprocess, tempfile
+os.environ['HERDR_ENV'] = '1'  # Only disposable test servers bypass the Herdr startup gate.
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--tmux',required=True);p.add_argument('--report',required=True);a=p.parse_args()
 B=str(pathlib.Path(a.bin).resolve());T=str(pathlib.Path(a.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-batch-',dir=os.path.realpath('/tmp')));state=root/'s';calls=root/'calls.jsonl';mode=root/'mode';shim=root/'tmux-shim';results=[]
 env={k:v for k,v in os.environ.items() if not k.startswith('PCTL_')}

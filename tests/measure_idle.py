@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bounded Linux idle process measurement on a fresh, isolated synthetic demo."""
 import argparse, hashlib, json, os, pathlib, platform, shutil, statistics, subprocess, tempfile, time
+os.environ['HERDR_ENV'] = '1'  # Only disposable test servers bypass the Herdr startup gate.
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--tmux',required=True);p.add_argument('--seconds',type=int,default=60);p.add_argument('--report',default='test-results/idle-metrics.json');a=p.parse_args();B=str(pathlib.Path(a.bin).resolve());T=str(pathlib.Path(a.tmux).resolve());state=pathlib.Path(tempfile.mkdtemp(prefix='pctl-idle-',dir=os.path.realpath('/tmp')));hz=os.sysconf('SC_CLK_TCK')
 def cli(*args):return json.loads(subprocess.check_output([B,'--state',str(state),'--tmux',T,*args],text=True))
 def tm(*args):return subprocess.check_output([T,'-S',str(state/'tmux.sock'),*args],text=True).strip()

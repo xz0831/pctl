@@ -21,16 +21,16 @@ cargo test --release --locked
 cargo clippy --release --locked --all-targets -- -D warnings
 ```
 
-The real-tmux suites start their own servers in temporary state directories. Each takes `--bin`, `--tmux` and `--report`, except `remote_quoting.py`, which takes only `--bin`. For now they need `HERDR_ENV=1` (see the first issue):
+The real-tmux suites start their own servers in temporary state directories. Each takes `--bin`, `--tmux` and `--report`, except `remote_quoting.py`, which takes only `--bin`:
 
 ```sh
 B=target/release/pctl T=$(command -v tmux); mkdir -p test-results
 for s in integration collaboration_integration msg_workflow_integration orchestration_integration \
          session_integration sidebar_integration sidebar_recovery snapshot_batch_integration \
          team_context_preflight tmux_encoding_integration wake_integration; do
-  HERDR_ENV=1 python3 tests/$s.py --bin $B --tmux $T --report test-results/$s.json >test-results/$s.out 2>&1; echo "$s exit $?"
+  python3 tests/$s.py --bin $B --tmux $T --report test-results/$s.json >test-results/$s.out 2>&1; echo "$s exit $?"
 done
-HERDR_ENV=1 python3 tests/remote_quoting.py --bin $B; echo "remote_quoting exit $?"
+python3 tests/remote_quoting.py --bin $B; echo "remote_quoting exit $?"
 ```
 
 ## Workflow

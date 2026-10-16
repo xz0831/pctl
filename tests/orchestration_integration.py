@@ -3,6 +3,7 @@
 No real models, account access, arbitrary message execution, or preexisting servers.
 """
 import argparse, concurrent.futures, hashlib, json, os, pathlib, subprocess, tempfile, time
+os.environ['HERDR_ENV'] = '1'  # Only disposable test servers bypass the Herdr startup gate.
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--tmux',required=True);p.add_argument('--report',default='test-results/v06-orchestration.json');args=p.parse_args()
 B=str(pathlib.Path(args.bin).resolve());T=str(pathlib.Path(args.tmux).resolve());root=pathlib.Path(tempfile.mkdtemp(prefix='pctl-team-',dir=os.path.realpath('/tmp')));state=root/'s';results=[]
 baseenv={k:v for k,v in os.environ.items() if not k.startswith('PCTL_')}
