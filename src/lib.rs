@@ -1283,7 +1283,7 @@ impl Core {
             .command_output(Command::new(&self.tmux).arg("-V"), None)
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|e| e.to_string());
-        serde_json::json!({"tmux":version,"state":self.state,"socket":self.state.join("tmux.sock"),"connection":self.server().ok(),"platform":std::env::consts::OS,"task_adapter":"generic = unknown; synthetic fixture only","security_boundary":false,"requires":"tmux >=3.0a pane options; Linux /proc process generation checks","scope":"isolated prototype; not production or RHEL certification"})
+        serde_json::json!({"tmux":version,"state":self.state,"socket":self.state.join("tmux.sock"),"connection":self.server().ok(),"platform":std::env::consts::OS,"task_adapter":"generic = unknown; synthetic fixture only","security_boundary":false,"requires":"tmux >=3.0a pane options; Linux /proc process generation checks","scope":"isolated prototype; not production certified"})
     }
     fn audit(&self, action: &str, run: &str, result: &str) -> Result<()> {
         let file = self.state.join("audit.jsonl");

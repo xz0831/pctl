@@ -1,4 +1,4 @@
-//! Name-addressed session commands for msg and Hermes (the Herdr replacement surface):
+//! Name-addressed session commands (the Herdr replacement surface):
 //! list/get/prompt/wait/read/whoami, harness conversation IDs kept across restarts,
 //! and restore after the tmux server is gone (reboot).
 use crate::{Agent, Core, Registry, Run, ensure_terminal_input, now};
