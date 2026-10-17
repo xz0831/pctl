@@ -7,13 +7,17 @@ use ratatui::style::{Color, Modifier, Style};
 pub type Row = Vec<(String, Style)>;
 
 /// Rows of `capture-pane -p -e` output. SGR sequences set the style; OSC strings (hyperlinks)
-/// and any other escape are dropped.
+/// and any other escape are dropped. tmux writes a style only where it changes, so a line that
+/// wraps a coloured one starts with no SGR at all: the style carries over from the line before.
 pub fn parse_capture(text: &str) -> Vec<Row> {
-    text.split('\n').map(parse_line).collect()
+    let mut style = Style::default();
+    text.split('\n')
+        .map(|line| parse_line(line, &mut style))
+        .collect()
 }
 
-fn parse_line(line: &str) -> Row {
-    let (mut row, mut style, mut text) = (Row::new(), Style::default(), String::new());
+fn parse_line(line: &str, style: &mut Style) -> Row {
+    let (mut row, mut text) = (Row::new(), String::new());
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\x1b' {
@@ -35,9 +39,9 @@ fn parse_line(line: &str) -> Row {
                 }
                 if last == Some('m') {
                     if !text.is_empty() {
-                        row.push((std::mem::take(&mut text), style));
+                        row.push((std::mem::take(&mut text), *style));
                     }
-                    style = sgr(style, &params);
+                    *style = sgr(*style, &params);
                 }
             }
             Some(']') => {
@@ -55,7 +59,7 @@ fn parse_line(line: &str) -> Row {
         }
     }
     if !text.is_empty() {
-        row.push((text, style));
+        row.push((text, *style));
     }
     row
 }
@@ -306,6 +310,20 @@ pub fn unbase64(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_wrapped_line_keeps_the_colour_of_the_line_it_continues() {
+        // tmux writes SGR only where the style changes: the second line has none of its own.
+        let rows = parse_capture("\x1b[48;5;238mThis wraps\n onto the next line\x1b[49m\nplain");
+        let bg = |r: usize| rows[r][0].1.bg;
+        assert_eq!(bg(0), Some(Color::Indexed(238)));
+        assert_eq!(
+            bg(1),
+            Some(Color::Indexed(238)),
+            "the continuation keeps the background"
+        );
+        assert_eq!(rows[1][0].0, " onto the next line");
+        assert_eq!(bg(2), Some(Color::Reset), "a reset ends it");
+    }
     fn row(s: &str) -> Row {
         vec![(s.to_string(), Style::default())]
     }

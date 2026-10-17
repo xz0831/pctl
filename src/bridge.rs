@@ -261,7 +261,8 @@ pub fn read_screen(
         format!("{}", anchor - scroll as i64),
         format!("{}", anchor + h as i64 - 1 - scroll as i64),
     );
-    let mut args = vec!["capture-pane", "-p", "-e", "-t", pane];
+    // -N keeps trailing blanks: a coloured bar (a message box, a selected row) reaches the edge.
+    let mut args = vec!["capture-pane", "-p", "-e", "-N", "-t", pane];
     if scroll > 0 {
         args.extend(["-S", &start, "-E", &end]);
     }
