@@ -232,6 +232,8 @@ fn activity_reason(raw: &str, title: &str) -> Activity {
             || l.contains("esc to cancel")
             || l.contains("enter confirm")
             || (l.contains("allow once") && l.contains("reject"))
+            || l.contains("(y/n)")
+            || l.contains("[y/n]")
     });
     for (i, (_, _, l)) in tail.iter().enumerate().skip(below) {
         if menu_row(l) {
@@ -880,6 +882,11 @@ mod tests {
     use super::*;
     #[test]
     fn activity_explains_and_ignores_quoted_questions_without_input() {
+        // A y/n prompt is a dialog control of its own: no input row, still blocked.
+        assert_eq!(
+            activity("Allow command `rm -rf build`? (y/n)\n", ""),
+            "blocked"
+        );
         for raw in [
             "The command reports permission required.\n\n  Build  model\n  tab agents  ctrl+p commands\n",
             "$ echo approve\napprove\n$ ",
