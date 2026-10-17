@@ -1,0 +1,10 @@
+[1;34mMermaid[0m
+
+[38;5;242mflowchart LR[0m
+[38;5;242m A[Start] --> B[End][0m
+
+[38;5;242mthis is invalid %% synthetic[0m
+
+[38;5;242mflowchart TD[0m
+[38;5;242m A --> B[0m
+[38;5;242m click A "https://example.invalid/synthetic" "Synthetic link"[0m

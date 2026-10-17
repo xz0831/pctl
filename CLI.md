@@ -438,3 +438,29 @@ It then:
 
 There is no `--force`. Nothing is deleted outright.
 
+
+## Documents (`pctl view`)
+
+`pctl view <file|folder> [--look portal|garage] [--dark]` opens the document reader (the `mdv` crate in `crates/mdv`) in the terminal it runs in. It needs an interactive terminal and works in any one: nothing in it is specific to a terminal program. The reader is built in; the `mdv` command is not needed.
+
+- Copy (`y`) puts the text on the clipboard of the computer it runs on (the same `PCTL_CLIP_WRITE_TEXT` seam and command search as the app) and writes OSC 52 to the terminal. The status line says `Copied` only when a command ran here or the terminal is known to honour OSC 52; over ssh no command runs and it says `paste to verify`; a VTE terminal (MATE Terminal, GNOME Terminal) ignores OSC 52 and the line says so.
+- A question about a passage goes to the main agent of the document's project, through `tell` in the same process (the reader first checks that there is exactly one running `*-main` session in the project, and that it is still the run it picked). Delivery states are `tell`'s: reached, queued, typed but unconfirmed, and blocked (nothing is typed, the question is kept and can be retried). An agent answers with `pctl show --answer <request-id> <text>`.
+- Questions and answers are kept in `~/.local/state/mdv/threads.jsonl` (`MDV_THREADS_FILE` moves it).
+
+## Showing a document (`pctl show`)
+
+`pctl show <file|folder> [--title T] [--note N] [--project P]` is how an agent tells the person "read this". It records the document in `<state>/docs.json` and prints the record as JSON. Nothing opens and no focus moves: the app lists the document under its project as `new` and sends one notice; the person opens it when they choose. Show a document only when the person must read it, not on every save.
+
+- The project is the caller's own session project; `--project` (a name or ID) names another, and is required outside a session. The record keeps who showed it (session and run), the canonical path, the title (default: the file name), the note (one line, 500 characters), the time and the computer.
+- The path is checked on the computer that owns the file: it must exist, must not be a private place (`~/.ssh`, hidden folders in the home folder other than `.config` and `.local`, `.env` and key files, `secret`/`token`/`credential` names, shell history, the pctl state folder), and is stored canonical.
+- Showing the same path again keeps one record. If the content is unchanged it stays as it was (a read document stays read); if it changed it is `new` again. Each record keeps the latest content and the version before it under `<state>/docs/<id>/` (`latest`, `previous`, mode 0600), for files up to 20 MiB; bigger files and folders are kept by path only. At most 200 documents are kept.
+- `pctl show --list [--project P]` prints the documents, newest first (JSON: `id`, `project`, `by`, `run`, `path`, `title`, `note`, `shown`, `host`, `new`, `previous`). `pctl show --read <id>` marks one read; it refuses an agent caller, because only the person opening a document does that.
+- `pctl show --answer <request-id> <text>` answers a question asked in `pctl view` (`-` reads the text from standard input); an unknown request id is refused.
+- The bridge `list` answer has a `docs` array, and the op `doc_read` (field `doc`) marks one read, so the app shows and reads another computer's documents over ssh.
+
+### Documents in the app
+
+- Each project's documents are listed under its agents as `📄 <title>`, with `new` until opened (the newest 8 per project). The list is read with the agents, so a document shown on another computer appears through that computer's bridge too.
+- A document that arrives (or is shown again with new content) sends one notice through the same path as `done` and `needs you`: `<agent>: wants you to read <title>`. Nothing opens, no cell is created and the focus does not move: the agent's cell keeps taking the keys until the person clicks.
+- Clicking a row (or Enter on it in the sidebar) opens the document in a new cell right of the cell that shows the agent which showed it, else of the focused cell, and marks it read. The cell is a session named `doc-<first 8 characters of the id>` in the document's project, running `pctl view <path>` on the computer that owns the file (another computer: through the bridge op `act` with `doc_open`, which looks the path up in that computer's `docs.json` and checks it again; the reader there is started with `--remote`, so a copy key says "drag to copy" instead of writing to that computer's clipboard). Keys, paste, the wheel and a mouse drag go to it like to an agent. The reader session is not an agent: it has no tab or sidebar row, and `pctl session list` marks it `"viewer": true`.
+- Closing the cell (or putting another agent in it) ends the reader (`doc_close`), not the document; clicking the row again starts a new reader and the questions and answers come back. Quitting the app ends the readers on this computer. A reader that exits by itself (`q`) leaves its cell showing the last screen, marked `closed`, until the cell is closed.

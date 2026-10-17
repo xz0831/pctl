@@ -518,6 +518,7 @@ impl Core {
             "process": process, "status": status,
             "tell_queue": crate::tellq::len(&self.state, &a.name),
             "tell_dropped": crate::tellq::dropped(&self.state, &a.name),
+            "viewer": crate::docs::is_viewer(&a.argv),
         })
     }
     /// Live panes, or None when no server owns this state (after a reboot).

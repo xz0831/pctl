@@ -113,6 +113,40 @@ enum Cmd {
         #[arg(long, hide = true)]
         from_line: Option<String>,
     },
+    /// Read a Markdown file or folder in the terminal: search, copy, and ask the project's main
+    /// agent about a passage. Needs an interactive terminal.
+    View {
+        path: PathBuf,
+        /// portal or garage.
+        #[arg(long, value_parser = ["portal", "garage"])]
+        look: Option<String>,
+        #[arg(long)]
+        dark: bool,
+        /// Set by the app for a document on another computer: no clipboard command runs here.
+        #[arg(long, hide = true)]
+        remote: bool,
+    },
+    /// Show the person a file or folder: it appears in the app's side bar as `new`, with one
+    /// notice; nothing opens by itself. `--answer` is how an agent answers a question asked in
+    /// `pctl view`. `--list` prints the documents as JSON.
+    Show {
+        path: Option<PathBuf>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        /// A project name or ID. Default: the project of the session that runs this.
+        #[arg(long)]
+        project: Option<String>,
+        /// Answer question REQ_ID; TEXT `-` reads standard input.
+        #[arg(long, num_args = 2, value_names = ["REQ_ID", "TEXT"], conflicts_with_all = ["path", "list", "read"])]
+        answer: Option<Vec<String>>,
+        #[arg(long, conflicts_with_all = ["path", "read"])]
+        list: bool,
+        /// Mark a document read (the app does this when the person opens it).
+        #[arg(long, value_name = "ID", conflicts_with = "path")]
+        read: Option<String>,
+    },
     Skill {
         #[command(subcommand)]
         cmd: SkillCmd,
@@ -1202,6 +1236,61 @@ fn run() -> Result<()> {
             }
             if out.result.exit_code() != 0 {
                 std::process::exit(out.result.exit_code());
+            }
+        }
+        Cmd::View {
+            path,
+            look,
+            dark,
+            remote,
+        } => pctl::view::run(
+            &core,
+            &path,
+            mdv::view::ViewOptions {
+                look: look.map(|l| match l.as_str() {
+                    "garage" => mdv::Look::Garage,
+                    _ => mdv::Look::Portal,
+                }),
+                dark,
+            },
+            remote,
+        )?,
+        Cmd::Show {
+            path,
+            title,
+            note,
+            project,
+            answer,
+            list,
+            read,
+        } => {
+            if let Some(a) = answer {
+                let mut text = a[1].clone();
+                if text == "-" {
+                    use std::io::Read;
+                    text.clear();
+                    std::io::stdin().take(16001).read_to_string(&mut text)?;
+                }
+                mdv::threads::answer(&a[0], &text).map_err(anyhow::Error::msg)?;
+                print(&json!({"ok": true, "answered": a[0]}))?
+            } else if list {
+                print(&core.doc_list(project.as_deref()))?
+            } else if let Some(id) = read {
+                anyhow::ensure!(
+                    !pctl::app::agent_caller(&core),
+                    "agent_caller: only the person opening a document marks it read"
+                );
+                print(&core.doc_read(&id)?)?
+            } else {
+                let path = path.context(
+                    "usage: pctl show <file|folder> | --list | --answer <req-id> <text>",
+                )?;
+                print(&core.doc_show(
+                    &path,
+                    title.as_deref(),
+                    note.as_deref(),
+                    project.as_deref(),
+                )?)?
             }
         }
         Cmd::Skill { cmd } => match cmd {
