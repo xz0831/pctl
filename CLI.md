@@ -372,6 +372,14 @@ tmux display for plain clients:
 - The status line reruns the hidden `pctl session marks` every 5 seconds while a client is attached.
 - `^b s` is a names-and-state `choose-tree`, and `^b q` detaches.
 
+## Codex conversation recovery
+
+Codex storage is `$CODEX_HOME` when set, otherwise `$HOME/.codex`. Automatic first-turn discovery reads `sessions/` for one recent rollout with matching cwd, a valid `session_meta` header and a filename ending in that header's ID. Only a live registered run is eligible; IDs assigned to other profiles and ambiguous candidates remain unknown. A successful pick writes `codex_conversation` to `audit.jsonl`, with run ID and a JSON result containing source, rollout path, conversation ID, cwd and run start time. Hook-supplied Codex IDs also need a matching saved rollout and cwd, and record their source there. These are cwd/time and file checks, not proof of which process wrote the rollout.
+
+Before a saved or explicit Codex resume, `session add`, `start`, `restart` and `restore` look for the ID in both `sessions/` and `archived_sessions/`. A missing or invalid rollout returns `conversation_unknown` with the searched root and recovery guidance. Restart checks before stopping the old run. Restore the file or correct HOME/CODEX_HOME; `session start/restart --new` clears PCTL's saved conversation ID when a fresh conversation is intended. Explicit resume arguments in a profile still select their own conversation.
+
+Session add/start/restart/restore wait 500 ms after releasing the launch gate, then check the registered process. An early exit is `start_failed`, including exit status and the last 12 screen lines; its dead pane stays registered for inspection or restart. Survival of this short check is not a guarantee of later health or task completion. Lower-level `agent start/restart` keep their immediate launch semantics.
+
 ## Explaining session status
 
 `pctl session explain <name>` prints `{status,rule,row,text,considered_rows,pane_title}` without adding fields to `session list` or `session get`. Rows are 1-based positions in the visible screen. `considered_rows` contains the last 12 nonempty rows as `{row,text}` (ANSI styling removed); the OpenCode footer rule uses only the last four. A title-spinner match or no match has null `row` and `text`. Stopped, lost and exited sessions have no considered rows and a null title. A failed capture reports `unknown` with the error in `rule`.

@@ -72,11 +72,72 @@ fn conversation_unknown(a: &Agent) -> bool {
     });
     !harness(&a.argv).is_empty() && a.conversation.is_none() && !picks
 }
-/// Fallback until the SessionStart hook reports: the rollout Codex created for this run (same
-/// cwd, created after the run started, not owned by another profile). Only an unambiguous
-/// single candidate counts; otherwise the conversation stays unknown.
-fn discover_codex(r: &Registry, a: &Agent, run: &Run, root: &Path) -> Option<String> {
-    let since = run.started_at.saturating_sub(5);
+struct CodexRollout {
+    id: String,
+    cwd: String,
+    path: PathBuf,
+}
+fn codex_rollout(path: PathBuf) -> Option<CodexRollout> {
+    let f = fs::File::open(&path).ok()?;
+    let mut line = String::new();
+    BufReader::new(f.take(4 << 20)).read_line(&mut line).ok()?;
+    let v: Value = serde_json::from_str(&line).ok()?;
+    let (id, cwd) = (v["payload"]["id"].as_str()?, v["payload"]["cwd"].as_str()?);
+    if v["type"] != "session_meta"
+        || id.is_empty()
+        || id.len() > 128
+        || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        || !path.file_name()?.to_str()?.starts_with("rollout-")
+        || !path
+            .file_name()?
+            .to_str()?
+            .ends_with(&format!("-{id}.jsonl"))
+    {
+        return None;
+    }
+    Some(CodexRollout {
+        id: id.into(),
+        cwd: cwd.into(),
+        path,
+    })
+}
+fn saved_codex_rollout(root: &Path, id: &str) -> Option<CodexRollout> {
+    let suffix = format!("-{id}.jsonl");
+    ["sessions", "archived_sessions"]
+        .iter()
+        .flat_map(|dir| recent_files(&root.join(dir), 0, 3))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(&suffix))
+        })
+        .filter_map(codex_rollout)
+        .find(|rollout| rollout.id == id)
+}
+fn require_codex_rollout(root: &Path, id: &str) -> Result<CodexRollout> {
+    saved_codex_rollout(root, id).with_context(|| format!(
+        "conversation_unknown: Codex rollout {id:?} is missing or invalid under {}/sessions and {}/archived_sessions; restore the rollout or use session start/restart --new for a fresh conversation (check HOME/CODEX_HOME)",
+        root.display(), root.display()))
+}
+fn check_codex_resume(argv: &[String], conversation: Option<&str>) -> Result<()> {
+    if harness(argv) == "codex" {
+        let id = if argv.get(1).map(String::as_str) == Some("resume") {
+            argv.get(2)
+                .map(String::as_str)
+                .filter(|id| !id.starts_with('-'))
+        } else {
+            conversation
+        };
+        if let Some(id) = id {
+            require_codex_rollout(&codex_root(), id)?;
+        }
+    }
+    Ok(())
+}
+/// Fallback: one filename/header-verified rollout created for this cwd after the run started.
+/// This is cwd/time evidence, not proof that this process wrote the file; ambiguity stays unknown.
+fn discover_codex(r: &Registry, a: &Agent, run: &Run, root: &Path) -> Option<CodexRollout> {
+    let since = run.started_at;
     let taken: Vec<_> = r
         .agents
         .iter()
@@ -84,7 +145,7 @@ fn discover_codex(r: &Registry, a: &Agent, run: &Run, root: &Path) -> Option<Str
         .filter_map(|o| o.conversation.as_deref())
         .collect();
     let mut found = vec![];
-    for path in recent_files(root, since, 3) {
+    for path in recent_files(&root.join("sessions"), since, 3) {
         let created = fs::metadata(&path)
             .and_then(|m| m.created())
             .ok()
@@ -93,26 +154,11 @@ fn discover_codex(r: &Registry, a: &Agent, run: &Run, root: &Path) -> Option<Str
         if created < since {
             continue;
         }
-        let mut line = String::new();
-        let Ok(f) = fs::File::open(&path) else {
+        let Some(rollout) = codex_rollout(path) else {
             continue;
         };
-        // session_meta carries instructions and can be large; the first line is enough.
-        if BufReader::new(f.take(4 << 20))
-            .read_line(&mut line)
-            .is_err()
-        {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let (Some(id), Some(cwd)) = (v["payload"]["id"].as_str(), v["payload"]["cwd"].as_str())
-        else {
-            continue;
-        };
-        if v["type"] == "session_meta" && cwd == a.cwd && !taken.contains(&id) {
-            found.push(id.to_string());
+        if rollout.cwd == a.cwd && !taken.contains(&rollout.id.as_str()) {
+            found.push(rollout);
         }
     }
     (found.len() == 1).then(|| found.remove(0))
@@ -135,7 +181,9 @@ fn recent_files(root: &Path, since: u64, depth: usize) -> Vec<PathBuf> {
         // Only a file's own mtime counts: adding a day folder does not touch the year folder.
         if depth > 0 && p.is_dir() {
             out.extend(recent_files(&p, since, depth - 1));
-        } else if depth == 0 && p.extension().is_some_and(|x| x == "jsonl") && modified(&p) >= since
+        } else if p.is_file()
+            && p.extension().is_some_and(|x| x == "jsonl")
+            && modified(&p) >= since
         {
             out.push(p);
         }
@@ -297,7 +345,12 @@ fn menu_row(l: &str) -> bool {
     })
 }
 fn codex_root() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".codex/sessions")
+    std::env::var_os("CODEX_HOME")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".codex")
+        })
 }
 /// The named keys `session keys` may press. A closed set: free text is `session prompt`'s job.
 const KEYS: [&str; 10] = [
@@ -421,10 +474,11 @@ impl Core {
             .flatten()
     }
     /// Fill in Codex thread IDs for running profiles that have none yet.
-    fn discover(&self) -> Result<Registry> {
+    fn discover(&self) -> Result<(Registry, Option<Vec<crate::Pane>>)> {
         let _lock = self.lock()?;
         let mut r = self.registry()?;
         let root = codex_root();
+        let panes = self.live_panes(&r);
         let mut changed = false;
         for i in 0..r.agents.len() {
             let a = &r.agents[i];
@@ -434,19 +488,30 @@ impl Core {
             let Some(run) = r.runs.iter().find(|x| x.agent_id == a.id) else {
                 continue;
             };
-            if let Some(id) = discover_codex(&r, a, run, &root) {
-                r.agents[i].conversation = Some(id);
+            if !Self::pane_of(&r, a, panes.as_deref()).is_some_and(|p| !p.dead) {
+                continue;
+            }
+            if let Some(rollout) = discover_codex(&r, a, run, &root) {
+                self.audit(
+                    "codex_conversation",
+                    &run.id,
+                    &json!({
+                        "source": "cwd/time fallback", "conversation": rollout.id,
+                        "path": rollout.path, "cwd": rollout.cwd, "run_started_at": run.started_at,
+                    })
+                    .to_string(),
+                )?;
+                r.agents[i].conversation = Some(rollout.id);
                 changed = true;
             }
         }
         if changed {
             self.save(&r)?;
         }
-        Ok(r)
+        Ok((r, panes))
     }
     pub fn session_list(&self) -> Result<Vec<Value>> {
-        let r = self.discover()?;
-        let panes = self.live_panes(&r);
+        let (r, panes) = self.discover()?;
         let reading: Vec<&str> = r
             .agents
             .iter()
@@ -461,14 +526,13 @@ impl Core {
             .collect())
     }
     pub fn session_get(&self, name: &str) -> Result<Value> {
-        let r = self.discover()?;
+        let (r, panes) = self.discover()?;
         let a = self.by_name(&r, name)?;
-        Ok(self.view(&r, a, self.live_panes(&r).as_deref(), &HashMap::new()))
+        Ok(self.view(&r, a, panes.as_deref(), &HashMap::new()))
     }
     pub fn session_explain(&self, name: &str) -> Result<Value> {
-        let r = self.discover()?;
+        let (r, panes) = self.discover()?;
         let a = self.by_name(&r, name)?;
-        let panes = self.live_panes(&r);
         let pane = Self::pane_of(&r, a, panes.as_deref());
         let reason = match (r.runs.iter().any(|x| x.agent_id == a.id), pane) {
             (false, _) => "stopped: no run",
@@ -650,6 +714,7 @@ impl Core {
                 "invalid conversation ID"
             );
         }
+        check_codex_resume(&argv, conversation)?;
         let cwd = fs::canonicalize(cwd).context("cwd")?;
         ensure!(
             !self.registry()?.agents.iter().any(|a| a.name == name),
@@ -703,8 +768,8 @@ impl Core {
         }
         self.configure_input(&a.id, "terminal-line")?;
         self.configure_collaboration(&a.id, "mailbox")?;
-        self.start(&a.id)?;
-        self.session_get(name)
+        let run = self.start(&a.id)?;
+        self.settled_session(name, &run)
     }
     /// Restart in the same conversation. Refuses a session that is mid-turn unless forced.
     /// Start a stopped registration in its saved conversation (after `agent edit`, a terminate,
@@ -718,8 +783,8 @@ impl Core {
             "has_run: {name} already has a run; use restart"
         );
         self.fresh_or_known(&a, new)?;
-        self.start(&a.id)?;
-        self.session_get(name)
+        let run = self.start(&a.id)?;
+        self.settled_session(name, &run)
     }
     pub fn session_restart(&self, name: &str, force: bool, new: bool) -> Result<Value> {
         let v = self.session_get(name)?;
@@ -734,13 +799,27 @@ impl Core {
         );
         let (a, run) = self.current(name)?;
         self.fresh_or_known(&a, new)?;
-        self.restart(&a.id, &run.id)?;
+        let run = self.restart(&a.id, &run.id)?;
+        self.settled_session(name, &run)
+    }
+    fn settled_session(&self, name: &str, run: &Run) -> Result<Value> {
+        std::thread::sleep(Duration::from_millis(500));
+        let r = self.registry()?;
+        let pane = self.guard(&r, &run.agent_id, &run.id, false)?;
+        if pane.dead {
+            let lines = self.session_read(name, 12)?;
+            bail!(
+                "start_failed: {name} exited during startup (exit status {}); last screen lines:\n{lines}",
+                pane.exit
+            );
+        }
         self.session_get(name)
     }
     /// Refuse an accidental fresh conversation (conversation_unknown); `new` asks for one
     /// explicitly and forgets the old ID so Claude gets a new fixed session ID.
     fn fresh_or_known(&self, a: &Agent, new: bool) -> Result<()> {
         if new {
+            check_codex_resume(&a.argv, None)?;
             let _lock = self.lock()?;
             let mut r = self.registry()?;
             if let Some(x) = r.agents.iter_mut().find(|x| x.id == a.id) {
@@ -753,6 +832,7 @@ impl Core {
             "conversation_unknown: {} has no known conversation ID; pass --new to start a fresh conversation",
             a.name
         );
+        check_codex_resume(&a.argv, a.conversation.as_deref())?;
         Ok(())
     }
     /// Start again, in the same conversation, every profile whose run was lost with its pane
@@ -796,7 +876,7 @@ impl Core {
             let result = self
                 .fresh_or_known(a, new)
                 .and_then(|_| self.start(&a.id))
-                .map(|run| run.id);
+                .and_then(|run| self.settled_session(&a.name, &run).map(|_| run.id));
             if let Err(e) = &result
                 && format!("{e:#}").contains("conversation_unknown")
             {
@@ -835,6 +915,21 @@ impl Core {
         let mut r = self.registry()?;
         if !r.runs.iter().any(|x| x.agent_id == agent && x.id == run) {
             return Ok(json!({"recorded": false, "reason": "stale run"}));
+        }
+        let a = r
+            .agents
+            .iter()
+            .find(|a| a.id == agent)
+            .context("unknown agent")?;
+        if harness(&a.argv) == "codex" {
+            let rollout = require_codex_rollout(&codex_root(), id)?;
+            ensure!(
+                rollout.cwd == a.cwd,
+                "conversation_unknown: hook rollout cwd does not match session cwd"
+            );
+            self.audit("codex_conversation", &run, &json!({
+                "source": "session hook", "conversation": id, "path": rollout.path, "cwd": rollout.cwd,
+            }).to_string())?;
         }
         let a = r
             .agents
@@ -1095,16 +1190,20 @@ mod tests {
     #[test]
     fn discover_codex_matches_cwd_and_skips_taken() {
         let d = tempfile::tempdir().unwrap();
-        let day = d.path().join("2026/10/15");
+        let day = d.path().join("sessions/2026/10/15");
         fs::create_dir_all(&day).unwrap();
         let meta = |id: &str, cwd: &str| {
             format!(
                 "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}}}\n"
             )
         };
-        fs::write(day.join("rollout-a.jsonl"), meta("other-cwd", "/elsewhere")).unwrap();
-        fs::write(day.join("rollout-b.jsonl"), meta("taken", "/w")).unwrap();
-        fs::write(day.join("rollout-c.jsonl"), meta("mine", "/w")).unwrap();
+        fs::write(
+            day.join("rollout-other-cwd.jsonl"),
+            meta("other-cwd", "/elsewhere"),
+        )
+        .unwrap();
+        fs::write(day.join("rollout-taken.jsonl"), meta("taken", "/w")).unwrap();
+        fs::write(day.join("rollout-mine.jsonl"), meta("mine", "/w")).unwrap();
         let mut r = Registry::default();
         let mut a = Agent {
             id: "a".into(),
@@ -1136,16 +1235,16 @@ mod tests {
             started_at: now(),
         };
         assert_eq!(
-            discover_codex(&r, &a, &run, d.path()).as_deref(),
-            Some("mine")
+            discover_codex(&r, &a, &run, d.path()).map(|v| v.id),
+            Some("mine".into())
         );
-        fs::write(day.join("rollout-d.jsonl"), meta("twin", "/w")).unwrap();
+        fs::write(day.join("rollout-twin.jsonl"), meta("twin", "/w")).unwrap();
         assert_eq!(
-            discover_codex(&r, &a, &run, d.path()),
+            discover_codex(&r, &a, &run, d.path()).map(|v| v.id),
             None,
             "two candidates: unknown"
         );
         a.cwd = "/nowhere".into();
-        assert_eq!(discover_codex(&r, &a, &run, d.path()), None);
+        assert!(discover_codex(&r, &a, &run, d.path()).is_none());
     }
 }

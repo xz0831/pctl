@@ -42,7 +42,7 @@ while True:
 (home / '.config' / 'pctl').mkdir(parents=True, exist_ok=True)
 (home / '.config' / 'pctl' / 'config.toml').write_text('[server]\nstart_env = "TERMAPP_ENV"\n')
 ENV = {k: v for k, v in os.environ.items() if not k.startswith(('PCTL_', 'XDG_CONFIG'))}
-ENV.update(HOME=str(home), TERMAPP_ENV='1', TERMAPP_PANE_ID='w9:p9', TERMAPP_SOCKET_PATH='/nonexistent', CODEX_THREAD_ID='leak')
+ENV.update(CODEX_HOME=str(home / '.codex'), HOME=str(home), TERMAPP_ENV='1', TERMAPP_PANE_ID='w9:p9', TERMAPP_SOCKET_PATH='/nonexistent', CODEX_THREAD_ID='leak')
 def cli(*args, ok=True, env=None, stdin=None):
     q = subprocess.run([B, '--state', str(state), '--tmux', T, *map(str, args)], text=True, capture_output=True, timeout=30, env=env or ENV, input=stdin)
     assert (q.returncode == 0) == ok, (args, q.returncode, q.stderr, q.stdout)
@@ -167,6 +167,8 @@ try:
     def codex_hook():
         assert cli('session', 'get', 'x-work')['conversation'] is None, 'no rollout: unknown, no guess'
         s = cli('session', 'get', 'x-work')
+        day = home / '.codex/sessions/2026/10/15'; day.mkdir(parents=True, exist_ok=True)
+        (day / 'rollout-01a1-thread.jsonl').write_text(json.dumps({'type': 'session_meta', 'payload': {'id': '01a1-thread', 'cwd': str(cwd('x-work'))}}) + '\n')
         # Silent always: Claude adds SessionStart hook output to the conversation.
         assert cli('session', 'hook', stdin='{"session_id":"t-outside"}') == ''
         assert cli('session', 'hook', stdin='not json') == ''
@@ -184,11 +186,11 @@ try:
         day = home / '.codex/sessions/2026/10/15'; day.mkdir(parents=True, exist_ok=True)
         os.utime(home / '.codex/sessions', (0, 0)); os.utime(home / '.codex/sessions/2026', (0, 0))  # old year folders, as on a real host
         meta = lambda i: json.dumps({'type': 'session_meta', 'payload': {'id': i, 'cwd': str(cwd('x-two'))}}) + '\n'
-        (day / 'rollout-1.jsonl').write_text(meta('only-one'))
+        (day / 'rollout-only-one.jsonl').write_text(meta('only-one'))
         assert cli('session', 'get', 'x-two')['conversation'] == 'only-one'
         cli('session', 'add', '--name', 'x-three', '--cwd', cwd('x-three'), '--', bindir / 'codex')
         meta3 = lambda i: json.dumps({'type': 'session_meta', 'payload': {'id': i, 'cwd': str(cwd('x-three'))}}) + '\n'
-        (day / 'rollout-2.jsonl').write_text(meta3('twin-a')); (day / 'rollout-3.jsonl').write_text(meta3('twin-b'))
+        (day / 'rollout-twin-a.jsonl').write_text(meta3('twin-a')); (day / 'rollout-twin-b.jsonl').write_text(meta3('twin-b'))
         assert cli('session', 'get', 'x-three')['conversation'] is None, 'two candidates: unknown'
     case('codex fallback: one rollout candidate is taken, two are left unknown', codex_fallback)
     def unknown_conversation():
