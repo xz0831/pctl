@@ -143,6 +143,22 @@ fn mtime(m: &fs::Metadata) -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// The session that reads document `id` in the app's document cell.
+pub fn viewer_name(id: &str) -> String {
+    format!("doc-{}", id.chars().take(8).collect::<String>())
+}
+/// Whether a session's command line is `pctl view <path>`.
+pub fn is_viewer(argv: &[String]) -> bool {
+    match argv {
+        [exe, view, _, rest @ ..] => {
+            view == "view"
+                && (rest.is_empty() || rest == ["--remote"])
+                && Path::new(exe).file_stem().is_some_and(|n| n == "pctl")
+        }
+        _ => false,
+    }
+}
+
 impl Core {
     fn docs_store(&self) -> Store {
         fs::read(self.state.join("docs.json"))
@@ -318,6 +334,57 @@ impl Core {
         docs
     }
 
+    /// Start the reader for a document in the project's tmux session and mark it read. The path is
+    /// the recorded one, checked again: the file may have been replaced by a link since.
+    pub fn doc_open(&self, id: &str) -> Result<String> {
+        let doc = self
+            .doc_list(None)
+            .into_iter()
+            .find(|d| d.id == id)
+            .with_context(|| format!("unknown document {id}"))?;
+        let canon = fs::canonicalize(&doc.path).context("the document is gone")?;
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        ensure!(
+            !denied(&canon, &home) && !canon.starts_with(&self.state),
+            "cannot open {}: a private place",
+            doc.path
+        );
+        let name = viewer_name(id);
+        match self.session_get(&name) {
+            Ok(s) if s["process"] == "running" => {}
+            old => {
+                if old.is_ok() {
+                    self.doc_close(&name)?;
+                }
+                let dir = if canon.is_dir() {
+                    &canon
+                } else {
+                    canon.parent().unwrap_or(&canon)
+                };
+                let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+                let mut argv = vec![exe, "view".into(), canon.to_string_lossy().into_owned()];
+                // Asked over ssh: the person is at another computer, so no clipboard command here.
+                if std::env::var_os("SSH_CONNECTION").is_some() {
+                    argv.push("--remote".into());
+                }
+                self.session_add(&name, dir, Some(&doc.project), argv, None, None, None)?;
+            }
+        }
+        self.doc_read(id)?;
+        Ok(name)
+    }
+
+    /// End a reader session: stop it and take it off the list. The document stays.
+    pub fn doc_close(&self, name: &str) -> Result<()> {
+        let s = self.session_get(name)?;
+        ensure!(s["viewer"] == true, "{name} is not a document reader");
+        if let (Some(agent), Some(run)) = (s["agent_id"].as_str(), s["run_id"].as_str()) {
+            self.terminate(agent, run)?;
+        }
+        self.session_remove(name)?;
+        Ok(())
+    }
+
     /// The person opened it.
     pub fn doc_read(&self, id: &str) -> Result<Value> {
         let _lock = self.lock()?;
@@ -345,6 +412,17 @@ mod tests {
     }
     fn show(c: &Core, f: &Path, cap: u64) -> Doc {
         c.doc_show_within(f, None, None, Some("demo"), cap).unwrap()
+    }
+
+    #[test]
+    fn a_reader_is_told_by_its_command_line() {
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(is_viewer(&argv(&["/bin/pctl", "view", "/d/a.md"])));
+        assert!(is_viewer(&argv(&["pctl", "view", "/d/a.md", "--remote"])));
+        assert!(!is_viewer(&argv(&["pctl", "view", "/d/a.md", "--dark"])));
+        assert!(!is_viewer(&argv(&["claude", "view", "x"])));
+        assert!(!is_viewer(&argv(&["pctl", "show", "x"])));
+        assert_eq!(viewer_name("0123456789abcdef"), "doc-01234567");
     }
 
     #[test]

@@ -122,6 +122,9 @@ enum Cmd {
         look: Option<String>,
         #[arg(long)]
         dark: bool,
+        /// Set by the app for a document on another computer: no clipboard command runs here.
+        #[arg(long, hide = true)]
+        remote: bool,
     },
     /// Show the person a file or folder: it appears in the app's side bar as `new`, with one
     /// notice; nothing opens by itself. `--answer` is how an agent answers a question asked in
@@ -1235,7 +1238,12 @@ fn run() -> Result<()> {
                 std::process::exit(out.result.exit_code());
             }
         }
-        Cmd::View { path, look, dark } => pctl::view::run(
+        Cmd::View {
+            path,
+            look,
+            dark,
+            remote,
+        } => pctl::view::run(
             &core,
             &path,
             mdv::view::ViewOptions {
@@ -1245,6 +1253,7 @@ fn run() -> Result<()> {
                 }),
                 dark,
             },
+            remote,
         )?,
         Cmd::Show {
             path,

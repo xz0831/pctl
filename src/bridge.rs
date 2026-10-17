@@ -606,6 +606,10 @@ pub fn act(core: &Core, req: &Value) -> Result<Value> {
                 .unwrap_or_default();
             core.terminate(id, run)?;
         }
+        "doc_open" => {
+            return Ok(json!({"name": core.doc_open(text("doc")?)?}));
+        }
+        "doc_close" => core.doc_close(text("agent")?)?,
         "new_tab" => {
             let project = text("project")?;
             let root = core

@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use mdv::view::{AskOutcome, AskRequest, CopyOutcome, Hooks, ViewOptions};
 use std::{io::Write, path::Path};
 
-pub fn run(core: &Core, path: &Path, options: ViewOptions) -> Result<()> {
+pub fn run(core: &Core, path: &Path, options: ViewOptions, remote: bool) -> Result<()> {
     // The reader asks `pctl` about sessions; it must be this binary on this state, not an installed one.
     // SAFETY: nothing else runs yet; this is called from the command's own thread before any other.
     unsafe {
@@ -17,20 +17,25 @@ pub fn run(core: &Core, path: &Path, options: ViewOptions) -> Result<()> {
         std::env::set_var("PCTL_STATE", &core.state);
         std::env::set_var("PCTL_TMUX", &core.tmux);
     }
-    mdv::view::run(path, options, hooks(core)).map_err(|e| anyhow!(e))
+    mdv::view::run(path, options, hooks(core, remote)).map_err(|e| anyhow!(e))
 }
 
-pub fn hooks(core: &Core) -> Hooks {
+/// `remote`: the person is not at this computer (the app shows it from another one).
+pub fn hooks(core: &Core, remote: bool) -> Hooks {
     let core = core.clone();
     Hooks {
-        copy: Box::new(copy),
+        copy: Box::new(move |text| copy(text, remote)),
         ask: Box::new(move |request| ask(&core, request)),
     }
 }
 
 /// An OSC 52 write on our own stdout and, on this computer's own desktop, a clipboard command
 /// too, as the app does for a drag. Over ssh that clipboard is not the person's.
-fn copy(text: &str) -> CopyOutcome {
+fn copy(text: &str, remote: bool) -> CopyOutcome {
+    // The status line is a few characters wide in a narrow cell; the app copies a mouse drag itself.
+    if remote {
+        return CopyOutcome::Failed("drag to copy".into());
+    }
     if text.len() >= clipboard::MAX_COPY {
         return CopyOutcome::Failed(format!(
             "too long to copy ({} characters)",
@@ -101,6 +106,14 @@ mod tests {
             honours_osc52,
             vte,
         }
+    }
+
+    #[test]
+    fn a_document_on_another_computer_is_not_copied_by_a_command_here() {
+        assert!(matches!(
+            copy("text", true),
+            CopyOutcome::Failed(why) if why.contains("drag")
+        ));
     }
 
     #[test]

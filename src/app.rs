@@ -6,6 +6,7 @@
 //! add`) the sidebar shows this computer first and each of them after it, and everything works on
 //! their agents too, through the bridge on that computer. The terminal area can be split into cells,
 //! each showing one agent (from any computer); see `layout`.
+mod docs;
 pub(crate) mod keys;
 mod layout;
 mod machines;
@@ -32,6 +33,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use docs::DocRow;
 use keys::{ACTIONS, Action, Keymap};
 use layout::{Dir, Divider, Side, Tree};
 use machines::{ACT_WITHIN, Id, Mach};
@@ -55,6 +57,8 @@ use std::{panic, sync::Arc};
 
 /// At most one notification per agent in this long.
 const NOTICE_EVERY: Duration = Duration::from_secs(10);
+/// Documents listed under one project in the sidebar.
+const DOCS_PER_PROJECT: usize = 8;
 /// How often the screen is read: fast while it changes, slower the longer it stays the same.
 fn capture_every(quiet: u32) -> Duration {
     Duration::from_millis(match quiet {
@@ -150,6 +154,8 @@ struct Agent {
     run: Option<String>,
     /// Tell messages kept for it while it waited for a decision.
     queued: usize,
+    /// The reader of a document (`pctl view`), not an agent: shown in its cell only.
+    viewer: bool,
 }
 impl Agent {
     fn running(&self) -> bool {
@@ -168,6 +174,8 @@ enum Hit {
     Machine(String),
     Project(Id),
     Agent(Id),
+    /// A document row: the computer and the document's ID.
+    Doc(Id),
     Tab(Id),
     NewAgent(Id),
     NewTab(Id),
@@ -288,6 +296,8 @@ struct Update {
     agents: std::result::Result<Vec<Value>, String>,
     projects: Vec<(String, String)>,
     connected: bool,
+    /// None: the list failed, so the documents shown stay as they were.
+    docs: Option<Vec<DocRow>>,
 }
 impl Update {
     /// From a `list` answer (`bridge::list`, here or over the bridge).
@@ -319,12 +329,14 @@ impl Update {
                     })
                     .unwrap_or_default(),
                 connected: v["connected"].as_bool().unwrap_or(false),
+                docs: Some(docs::parse(machine, &v)),
             },
             Err(e) => Update {
                 machine: machine.into(),
                 agents: Err(format!("{e:#}")),
                 projects: vec![],
                 connected: false,
+                docs: None,
             },
         }
     }
@@ -338,6 +350,8 @@ enum SideRow {
     Note(String),
     Project(Id),
     Agent(Id),
+    /// A document of the project: the computer and the document's ID.
+    Doc(Id),
     Add(Id),
 }
 
@@ -398,6 +412,8 @@ enum Then {
     Opened(Id, String),
     /// The new-agent form's: also close the form.
     Form(Id, String),
+    /// A document's reader is running: put it in a cell.
+    Doc(DocRow),
 }
 
 struct App {
@@ -410,6 +426,8 @@ struct App {
     /// This computer first, then the enabled saved machines in file order.
     machines: Vec<Mach>,
     agents: Vec<Agent>,
+    /// The documents of every computer, newest first within a computer.
+    docs: Vec<DocRow>,
     project: Option<Id>,
     tab: HashMap<Id, String>,
     collapsed: HashSet<Id>,
@@ -451,6 +469,10 @@ struct App {
     sel: Option<(u32, term::Cell, term::Cell)>,
     /// When each agent was last announced, for the 10-second limit.
     notified: HashMap<Id, Instant>,
+    /// The same for documents, keyed by computer and document.
+    doc_notified: HashMap<Id, Instant>,
+    /// Document readers whose cell went, to be ended.
+    ending: Vec<Id>,
     /// Keys typed in the events just read, for the agent they were typed to: text to send with
     /// `-l` (true) or a key name. They go out as one tmux call, see `flush_typed`.
     typed: Option<(Agent, Vec<(bool, String)>)>,
@@ -644,6 +666,7 @@ pub fn run(core: &Core) -> Result<()> {
                 dirty = true;
             }
             dirty |= app.tick();
+            dirty |= app.end_viewers(core);
             dirty |= app.capture_due(core);
             let live = app.notice_live();
             dirty |= live != std::mem::replace(&mut notice, live);
@@ -672,6 +695,16 @@ pub fn run(core: &Core) -> Result<()> {
     // signal handler would need a new dependency. Reopening the app and leaving clears them.
     for pane in &app.touched {
         let _ = core.tm(&["set-option", "-wu", "-t", pane, "window-size"]);
+    }
+    // A reader without a cell would run unseen; those on this computer end with the app.
+    // shortcut: a reader on another computer stays until that computer's app is opened and its
+    // cell closed, or `pctl session remove`.
+    for a in app
+        .agents
+        .iter()
+        .filter(|a| a.viewer && a.machine.is_empty())
+    {
+        let _ = core.doc_close(&a.name);
     }
     shown?;
     println!("{}", quips::goodbye(app.keys.wit));
@@ -709,6 +742,9 @@ impl App {
             keys,
             machines: vec![Mach::local(bridge::hostname())],
             agents: vec![],
+            docs: vec![],
+            doc_notified: HashMap::new(),
+            ending: vec![],
             project: None,
             tab: HashMap::new(),
             collapsed: HashSet::new(),
@@ -900,9 +936,7 @@ impl App {
                             self.modal = None;
                         }
                         self.say(ok);
-                        if let Then::Opened(p, name) | Then::Form(p, name) = then {
-                            self.opened(&p, &name);
-                        }
+                        self.after(then);
                     }
                 }
                 self.recapture();
@@ -971,6 +1005,16 @@ impl App {
             .filter(|a| a.machine == u.machine)
             .map(|a| (a.id(), a.status.clone()))
             .collect();
+        let doc_before: Vec<DocRow> = self
+            .docs
+            .iter()
+            .filter(|d| d.machine == u.machine)
+            .cloned()
+            .collect();
+        if let Some(docs) = u.docs {
+            self.docs.retain(|d| d.machine != u.machine);
+            self.docs.extend(docs);
+        }
         let watched = self.machines[mi].loaded;
         self.machines[mi].loaded = true;
         self.machines[mi].connected = u.connected;
@@ -986,6 +1030,7 @@ impl App {
                     pane: s["pane"].as_str().map(String::from),
                     run: s["run_id"].as_str().map(String::from),
                     queued: s["tell_queue"].as_u64().unwrap_or(0) as usize,
+                    viewer: s["viewer"].as_bool().unwrap_or(false),
                 }));
             }
             Err(e) => {
@@ -1062,7 +1107,9 @@ impl App {
                 .agents
                 .iter()
                 .filter(|a| {
-                    a.machine == u.machine && (!seen.contains(&a.id()) || shown == Some(a.id()))
+                    !a.viewer
+                        && a.machine == u.machine
+                        && (!seen.contains(&a.id()) || shown == Some(a.id()))
                 })
                 .cloned()
                 .collect();
@@ -1081,6 +1128,34 @@ impl App {
                 }
             }
         }
+        // A document that arrived is announced; nothing opens and no focus moves.
+        let now: Vec<DocRow> = self
+            .docs
+            .iter()
+            .filter(|d| d.machine == u.machine)
+            .cloned()
+            .collect();
+        for d in docs::arrivals(&doc_before, &now, watched) {
+            let at = Instant::now();
+            let key = Id::new(&d.machine, &d.id);
+            if may_notify(self.doc_notified.get(&key).copied(), at) {
+                self.doc_notified.insert(key, at);
+                let who = d.by.as_deref().unwrap_or("pctl");
+                let who = if d.machine.is_empty() {
+                    who.to_string()
+                } else {
+                    format!("{}/{who}", self.label(&d.machine))
+                };
+                let text = format!("wants you to read {}", sanitize(&d.title));
+                write_out(&notice_sequence(&who, &text, false));
+                crate::notify::desktop(&notice_body(&who, &text));
+            }
+        }
+        self.doc_notified.retain(|k, _| {
+            self.docs
+                .iter()
+                .any(|d| d.machine == k.machine && d.id == k.name)
+        });
     }
     /// The agent in the focused cell.
     fn current(&self) -> Option<&Agent> {
@@ -1095,7 +1170,7 @@ impl App {
     fn project_agents(&self, project: &Id) -> Vec<&Agent> {
         self.agents
             .iter()
-            .filter(|a| a.machine == project.machine && a.project == project.name)
+            .filter(|a| a.machine == project.machine && a.project == project.name && !a.viewer)
             .collect()
     }
 
@@ -1257,12 +1332,36 @@ impl App {
         match self.tree.close(self.tree.focus) {
             Some(id) => {
                 // Only the view goes; the agent keeps running in its tmux window.
-                self.panes.remove(&id);
+                let gone = self.panes.remove(&id).and_then(|p| p.agent);
+                self.release(gone);
                 self.laid_out();
             }
             None if leaves.len() < 2 => self.say("The last cell cannot be closed"),
             None => {}
         }
+    }
+    /// A cell stopped showing this: a document's reader is ended (the document stays), an agent
+    /// keeps running.
+    fn release(&mut self, agent: Option<Id>) {
+        if let Some(v) = agent
+            && self.agents.iter().any(|a| a.id() == v && a.viewer)
+        {
+            self.ending.push(v);
+        }
+    }
+    /// End the readers whose cells are gone; nothing is left running unseen. Whether anything went.
+    fn end_viewers(&mut self, core: &Core) -> bool {
+        let ending = std::mem::take(&mut self.ending);
+        for v in &ending {
+            self.act_on(
+                core,
+                &v.machine,
+                json!({"action": "doc_close", "agent": v.name}),
+                String::new(),
+                Then::Nothing,
+            );
+        }
+        !ending.is_empty()
     }
     fn move_focus(&mut self, toward: Side) {
         let cells = self.tree.areas(self.term);
@@ -1309,8 +1408,9 @@ impl App {
             Some(i) => self.focus_index(i),
             None => {
                 let pane = self.panes.entry(self.focused()).or_default();
-                pane.agent = Some(id.clone());
+                let old = pane.agent.replace(id.clone());
                 pane.view.next = None;
+                self.release(old);
             }
         }
     }
@@ -1766,7 +1866,7 @@ impl App {
             return self.action(core, a);
         }
         if self.in_sidebar {
-            return self.sidebar_key(k);
+            return self.sidebar_key(core, k);
         }
         self.send_key(core, &k);
     }
@@ -1884,13 +1984,22 @@ impl App {
                     for a in self.project_agents(&pid) {
                         rows.push(SideRow::Agent(a.id()));
                     }
+                    // shortcut: only the newest few; older ones wait for a document list of their own.
+                    for d in self
+                        .docs
+                        .iter()
+                        .filter(|d| d.machine == m.id && &d.project == p)
+                        .take(DOCS_PER_PROJECT)
+                    {
+                        rows.push(SideRow::Doc(Id::new(&d.machine, &d.id)));
+                    }
                     rows.push(SideRow::Add(pid));
                 }
             }
         }
         rows
     }
-    fn sidebar_key(&mut self, k: KeyEvent) {
+    fn sidebar_key(&mut self, core: &Core, k: KeyEvent) {
         let rows = self.side_rows();
         match k.code {
             KeyCode::Up => self.side_sel = self.side_sel.saturating_sub(1),
@@ -1910,6 +2019,10 @@ impl App {
                 Some(SideRow::Project(p)) => self.click_project(&p),
                 Some(SideRow::Agent(a)) => {
                     self.open_agent(&a);
+                    self.in_sidebar = false;
+                }
+                Some(SideRow::Doc(d)) => {
+                    self.open_doc(core, &d);
                     self.in_sidebar = false;
                 }
                 Some(SideRow::Add(p)) => self.agent_form(&p),
@@ -2098,6 +2211,10 @@ impl App {
             Hit::Project(p) => self.click_project(&p),
             Hit::Agent(a) | Hit::Tab(a) => {
                 self.open_agent(&a);
+                self.in_sidebar = false;
+            }
+            Hit::Doc(d) => {
+                self.open_doc(core, &d);
                 self.in_sidebar = false;
             }
             Hit::NewAgent(p) => self.agent_form(&p),
@@ -2297,9 +2414,7 @@ impl App {
             match bridge::act(core, &req) {
                 Ok(_) => {
                     self.say(ok);
-                    if let Then::Opened(p, name) | Then::Form(p, name) = then {
-                        self.opened(&p, &name);
-                    }
+                    self.after(then);
                 }
                 Err(e) => self.say(format!("{e:#}")),
             }
@@ -2421,6 +2536,80 @@ impl App {
             Then::Opened(project.clone(), name),
         );
     }
+    fn after(&mut self, then: Then) {
+        match then {
+            Then::Opened(p, name) | Then::Form(p, name) => self.opened(&p, &name),
+            Then::Doc(d) => self.doc_opened(&d),
+            Then::Nothing => {}
+        }
+    }
+    /// The person chose a document: its reader starts where the document is, and shows in a cell
+    /// when it is up. Opening marks it read. Nothing here runs unless the person clicked.
+    fn open_doc(&mut self, core: &Core, id: &Id) {
+        let Some(d) = self
+            .docs
+            .iter()
+            .find(|d| d.machine == id.machine && d.id == id.name)
+            .cloned()
+        else {
+            return;
+        };
+        let viewer = Id::new(&d.machine, &crate::docs::viewer_name(&d.id));
+        let project = Id::new(&d.machine, &d.project);
+        if self.project.as_ref() == Some(&project)
+            && let Some(cell) = self.pane_of(&viewer)
+        {
+            return self.focus_pane(cell);
+        }
+        let req = json!({"action": "doc_open", "doc": d.id});
+        let ok = format!("Opened {}", d.title);
+        self.act_on(core, &d.machine.clone(), req, ok, Then::Doc(d));
+    }
+    /// The reader runs: in a new cell right of the one that shows the agent which showed the
+    /// document, else of the focused one.
+    fn doc_opened(&mut self, d: &DocRow) {
+        let project = Id::new(&d.machine, &d.project);
+        self.collapsed.remove(&project);
+        self.set_project(Some(project.clone()));
+        let viewer = Id::new(&d.machine, &crate::docs::viewer_name(&d.id));
+        let beside =
+            d.by.as_ref()
+                .and_then(|by| self.pane_of(&Id::new(&d.machine, by)));
+        if let Some(cell) = beside {
+            self.focus_pane(cell);
+        }
+        if self.pane_of(&viewer).is_none() {
+            // Without room the reader takes the focused cell rather than not showing at all.
+            self.split(Dir::Right);
+            let a = Agent {
+                machine: viewer.machine.clone(),
+                name: viewer.name.clone(),
+                project: project.name.clone(),
+                status: "starting".into(),
+                pane: None,
+                run: None,
+                queued: 0,
+                viewer: true,
+            };
+            self.fresh.insert(a.id(), (a.clone(), Instant::now()));
+            self.agents.push(a);
+            let pane = self.panes.entry(self.focused()).or_default();
+            pane.agent = Some(viewer.clone());
+            pane.view.next = None;
+        } else if let Some(cell) = self.pane_of(&viewer) {
+            self.focus_pane(cell);
+        }
+        for doc in self
+            .docs
+            .iter_mut()
+            .filter(|x| x.machine == d.machine && x.id == d.id)
+        {
+            doc.new = false;
+        }
+        self.sel = None;
+        self.recapture();
+        self.poke_machine(&d.machine);
+    }
     /// An agent just added: listed at once, even if the next refresh does not have it yet, and
     /// shown in its project.
     fn opened(&mut self, project: &Id, name: &str) {
@@ -2432,6 +2621,7 @@ impl App {
             pane: None,
             run: None,
             queued: 0,
+            viewer: false,
         };
         self.agents.push(a.clone());
         self.fresh.insert(a.id(), (a.clone(), Instant::now()));
@@ -2871,7 +3061,7 @@ impl App {
                     let blocked = self
                         .agents
                         .iter()
-                        .filter(|a| &a.machine == id && a.status == "blocked")
+                        .filter(|a| &a.machine == id && a.status == "blocked" && !a.viewer)
                         .count();
                     let st = if muted(id) {
                         Style::default().fg(p.muted).add_modifier(Modifier::BOLD)
@@ -2963,6 +3153,33 @@ impl App {
                     }
                     line(f, y, spans, st);
                     self.hit(rect, Hit::Agent(id.clone()));
+                }
+                SideRow::Doc(id) => {
+                    let d = self
+                        .docs
+                        .iter()
+                        .find(|d| d.machine == id.machine && d.id == id.name);
+                    let (title, new) =
+                        d.map_or((String::new(), false), |d| (d.title.clone(), d.new));
+                    let st = if muted(&id.machine) {
+                        Style::default().fg(p.muted).bg(base.bg.unwrap_or(p.bg))
+                    } else {
+                        base
+                    };
+                    let room = r.width.saturating_sub(10 + step) as usize;
+                    let mut spans = vec![
+                        Span::raw(pad(3)),
+                        Span::raw("📄 "),
+                        Span::raw(docs::fit_cells(&title, room)),
+                    ];
+                    if new {
+                        spans.push(Span::styled(
+                            " new",
+                            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    line(f, y, spans, st);
+                    self.hit(rect, Hit::Doc(id.clone()));
                 }
                 SideRow::Add(project) => {
                     line(
@@ -3159,6 +3376,19 @@ impl App {
         let p = self.pal;
         let a = self.agent_in(id);
         let (text, glyph) = match a {
+            Some(a) if a.viewer => {
+                let title = self
+                    .docs
+                    .iter()
+                    .find(|d| d.machine == a.machine && crate::docs::viewer_name(&d.id) == a.name)
+                    .map_or(a.name.as_str(), |d| d.title.as_str());
+                let done = if a.status == "exited" {
+                    " · closed"
+                } else {
+                    ""
+                };
+                (format!(" 📄 {title}{done} "), Some(self.glyph(&a.status)))
+            }
             Some(a) => {
                 let name = if self.multi() {
                     format!(" {} · {} ", self.label(&a.machine), a.name)
@@ -3405,7 +3635,11 @@ impl App {
                 Style::default().fg(p.warn),
             ));
         }
-        let blocked = self.agents.iter().filter(|a| a.status == "blocked").count();
+        let blocked = self
+            .agents
+            .iter()
+            .filter(|a| a.status == "blocked" && !a.viewer)
+            .count();
         if blocked > 0 {
             left.push(Span::styled(
                 format!("   {}", quips::waiting(self.keys.wit, blocked)),
@@ -3848,6 +4082,7 @@ mod tests {
             pane: Some("%1".into()),
             run: Some("r".into()),
             queued: 0,
+            viewer: false,
         }
     }
     fn agent(name: &str, status: &str) -> Agent {
@@ -4129,6 +4364,105 @@ mod tests {
                 .iter()
                 .all(|id| app.panes[*id].agent.is_none())
         );
+    }
+    fn doc_row(id: &str, by: &str, new: bool) -> DocRow {
+        DocRow {
+            machine: String::new(),
+            id: id.into(),
+            project: "p".into(),
+            title: format!("Doc {id}"),
+            by: Some(by.into()),
+            new,
+            shown: 1,
+        }
+    }
+    fn viewer_of(id: &str) -> Agent {
+        Agent {
+            name: crate::docs::viewer_name(id),
+            viewer: true,
+            ..agent("x", "idle")
+        }
+    }
+    #[test]
+    fn documents_list_after_the_agents_and_readers_are_not_agents() {
+        let mut app = app_with(&["a", "b"]);
+        app.machines[0].projects = vec![("p".into(), "/".into())];
+        app.agents.push(viewer_of("d1"));
+        app.docs = vec![doc_row("d1", "a", true), doc_row("d2", "a", false)];
+        let rows = app.side_rows();
+        let at = |r: &SideRow| rows.iter().position(|x| x == r).unwrap();
+        let (b, d1, d2, add) = (
+            at(&SideRow::Agent(a_id("b"))),
+            at(&SideRow::Doc(Id::new("", "d1"))),
+            at(&SideRow::Doc(Id::new("", "d2"))),
+            at(&SideRow::Add(Id::new("", "p"))),
+        );
+        assert!(
+            b < d1 && d1 < d2 && d2 < add,
+            "agents, documents, then +agent"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| matches!(r, SideRow::Agent(i) if i.name.starts_with("doc-")))
+        );
+        assert_eq!(
+            app.project_agents(&Id::new("", "p")).len(),
+            2,
+            "no tab for a reader"
+        );
+        app.docs = (0..20)
+            .map(|i| doc_row(&format!("x{i}"), "a", false))
+            .collect();
+        assert_eq!(
+            app.side_rows()
+                .iter()
+                .filter(|r| matches!(r, SideRow::Doc(_)))
+                .count(),
+            DOCS_PER_PROJECT
+        );
+    }
+    #[test]
+    fn an_arriving_document_moves_nothing_and_opening_it_splits_right_of_its_agent() {
+        let mut app = app_with(&["a", "b"]);
+        app.open_agent(&a_id("a"));
+        app.split(Dir::Right);
+        app.open_agent(&a_id("b"));
+        app.focus_index(0);
+        let before = (in_cells(&app), app.tree.focus, app.panes.len());
+        // The list answer brings a new document (this computer was already watched).
+        let answer = json!({"sessions": [], "projects": [{"name": "p", "root": "/"}], "connected": true,
+            "docs": [{"id": "d1", "project": "p", "title": "Plan", "by": "a", "new": true, "shown": 1}]});
+        app.apply(Update::from_list("", Ok(answer)));
+        assert_eq!(app.docs.len(), 1);
+        assert_eq!(
+            (in_cells(&app), app.tree.focus, app.panes.len()),
+            before,
+            "nothing opened, no focus moved"
+        );
+        // Only the person's click opens it: right of the cell of the agent that showed it.
+        app.focus_index(1);
+        let doc = app.docs[0].clone();
+        app.doc_opened(&doc);
+        let viewer = crate::docs::viewer_name("d1");
+        assert_eq!(in_cells(&app), [name("a"), name(&viewer), name("b")]);
+        assert_eq!(app.tree.focus, 1, "the reader's cell has the focus");
+        assert!(!app.docs[0].new, "opening marks it read");
+        // A second click finds the open cell instead of starting another.
+        app.focus_index(0);
+        app.doc_opened(&doc);
+        assert_eq!((in_cells(&app).len(), app.tree.focus), (3, 1));
+        // Closing the cell ends the reader, and only the reader.
+        app.close_cell();
+        assert_eq!(in_cells(&app), [name("a"), name("b")]);
+        assert_eq!(app.ending, [Id::new("", &viewer)]);
+    }
+    #[test]
+    fn a_failed_list_keeps_the_documents_shown() {
+        let mut app = app_with(&["a"]);
+        app.docs = vec![doc_row("d1", "a", true)];
+        app.apply(Update::from_list("", Err(anyhow::anyhow!("down"))));
+        assert_eq!(app.docs.len(), 1);
     }
     #[test]
     fn the_agent_typed_to_is_the_one_in_the_focused_cell() {
