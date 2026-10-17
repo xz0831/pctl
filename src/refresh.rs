@@ -123,6 +123,15 @@ impl Activity {
         Ok(())
     }
     fn hook(&mut self, v: &Value, at: u64) -> Result<()> {
+        // Claude Code's own agents (empty agent_type) send SubagentStop with no SubagentStart, even after Stop.
+        if v["hook_event_name"] == "SubagentStop"
+            && v["agent_type"] == ""
+            && !v["agent_id"]
+                .as_str()
+                .is_some_and(|id| self.subagents.contains(id))
+        {
+            return Ok(());
+        }
         self.event("hook", at)?;
         self.ready = false;
         let event = v["hook_event_name"].as_str().unwrap_or("");
@@ -513,7 +522,16 @@ impl Core {
                                 && activity.conversation == a.conversation
                         })
                     {
-                        held.push("readiness_unknown".into());
+                        // No hook ever came from this run (hooks off, e.g. --restricted): the session stays
+                        // manual, and the project is judged on the screen evidence used for other harnesses.
+                        held.push(
+                            if activity.is_none_or(|act| act.last_hook.is_none()) {
+                                "hooks_unobserved"
+                            } else {
+                                "readiness_unknown"
+                            }
+                            .into(),
+                        );
                     }
                     for b in view["swap_blockers"]
                         .as_array()
@@ -531,7 +549,7 @@ impl Core {
                     Err(_) => held.push("tell_queue_unknown".into()),
                     _ => {}
                 }
-                for reason in &held {
+                for reason in held.iter().filter(|r| *r != "hooks_unobserved") {
                     reasons.insert(format!("{}:{reason}", a.name));
                 }
                 let attached = run.and_then(|run| {
@@ -654,6 +672,44 @@ mod tests {
         assert!(!a.instrumented);
         a.hook(&hook("SessionStart"), 16).unwrap();
         assert!(a.tools.is_empty() && a.subagents.is_empty());
+    }
+    #[test]
+    fn background_subagent_turn_from_real_claude_payloads_ends_ready() {
+        // Order seen from Claude Code 2.1.302 with a background subagent.
+        let mut a = Activity::default();
+        a.bind("run");
+        let stop = |bg: Value| json!({"hook_event_name":"Stop","background_tasks":bg,"session_crons":[],"stop_hook_active":false});
+        let sub =
+            |event, id, kind| json!({"hook_event_name":event,"agent_id":id,"agent_type":kind});
+        for (i, v) in [
+            json!({"hook_event_name":"SessionStart"}),
+            json!({"hook_event_name":"UserPromptSubmit"}),
+            json!({"hook_event_name":"PreToolUse","tool_use_id":"t1"}),
+            json!({"hook_event_name":"PostToolUse","tool_use_id":"t1"}),
+            sub("SubagentStart", "a1", "general-purpose"),
+            stop(json!([{}])),
+            sub("SubagentStop", "a1", "general-purpose"),
+            json!({"hook_event_name":"UserPromptSubmit"}),
+            sub("SubagentStop", "internal", ""),
+            stop(json!([])),
+        ]
+        .iter()
+        .enumerate()
+        {
+            a.hook(v, i as u64).unwrap();
+            assert_eq!(a.ready, i == 9, "event {i}");
+        }
+        a.hook(&sub("SubagentStop", "internal-2", ""), 10).unwrap();
+        assert!(
+            a.ready && a.instrumented,
+            "an internal stop after Stop keeps readiness"
+        );
+        a.hook(&sub("SubagentStop", "unknown", "general-purpose"), 11)
+            .unwrap();
+        assert!(
+            !a.ready && !a.instrumented,
+            "an unmatched typed stop still fails closed"
+        );
     }
     #[test]
     fn idle_window_requires_continuity_and_resets_for_activity_or_clock_changes() {

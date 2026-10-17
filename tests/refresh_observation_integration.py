@@ -56,7 +56,7 @@ try:
   # Replacement makes all three stale without touching installed harnesses.
   with fake.open('a') as f:f.write('# replacement\n')
   v=dry();assert v['policy']['idle_for_secs']==1800 and v['policy']['enabled'] is False and not v['would_swap']
-  assert all('readiness_unknown' in row(v,n)['reasons'] for n in sessions)
+  assert all('hooks_unobserved' in row(v,n)['reasons'] for n in sessions)
   assert cli('session','refresh','--idle',ok=False)
   assert cli('session','refresh','--dry-run',ok=False)
  case('defaults are disabled/1800 seconds; uninstrumented runs and execution syntax refuse',setup)
@@ -67,6 +67,17 @@ try:
   assert all(s['reservation']['active'] is False and s['reservation']['project_epoch'] and 'cohort' not in s['reservation'] for s in v['would_swap'])
   assert v['execution_supported'] is False
  case('all eligible projects considered; readiness and quiet window gate inactive proposals',candidates)
+ def unobserved_member():
+  add('g-main','gamma');add('g-quiet','gamma');ready('g-main')
+  with fake.open('a') as f:f.write('# gamma stale\n')
+  v=dry()
+  g=next(p for p in v['projects'] if p['name']=='gamma')
+  assert g['eligible'] and 'g-main' in {s['name'] for s in v['would_swap']} and 'g-quiet' not in {s['name'] for s in v['would_swap']},v
+  assert 'hooks_unobserved' in row(v,'g-quiet')['reasons']
+  hook('g-quiet','SessionStart');v=dry()
+  assert 'g-quiet:readiness_unknown' in next(p for p in v['projects'] if p['name']=='gamma')['reasons']
+  for n in ('g-main','g-quiet'):s=sessions.pop(n);cli('agent','terminate','--agent',s['agent_id'],'--expected-run',s['run_id']);cli('session','remove',n)
+ case('a run that never sent a hook stays manual without holding its project',unobserved_member)
  def no_mutations():
   before=(state/'registry.json').read_bytes();screens={n:tm('capture-pane','-p','-t',s['pane']) for n,s in sessions.items()}
   for _ in range(2):dry()
