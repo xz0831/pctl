@@ -489,6 +489,7 @@ impl Core {
         a: &Agent,
         panes: Option<&[crate::Pane]>,
         known: &HashMap<String, &'static str>,
+        paths: &mut HashMap<String, Option<String>>,
     ) -> Value {
         let run = r.runs.iter().find(|x| x.agent_id == a.id);
         let pane = Self::pane_of(r, a, panes);
@@ -496,6 +497,13 @@ impl Core {
             (None, _) => ("stopped", "stopped"),
             (Some(_), None) => ("lost", "lost"),
             (Some(_), Some(p)) if p.dead => ("exited", "exited"),
+            (Some(run), Some(p))
+                if crate::check_identity(run, p).is_err()
+                    || crate::process_start(&p.pid).ok().as_deref()
+                        != Some(run.process_start.as_str()) =>
+            {
+                ("unknown", "unknown")
+            }
             (Some(_), Some(p)) => (
                 "running",
                 known.get(&p.pane).copied().unwrap_or_else(|| {
@@ -510,7 +518,7 @@ impl Core {
             ),
         };
         let project = r.projects.iter().find(|p| p.id == a.project_id);
-        json!({
+        let mut value = json!({
             "name": a.name, "agent_id": a.id, "project": project.map(|p| &p.name),
             "cwd": a.cwd, "harness": harness(&a.argv), "conversation": a.conversation,
             "run_id": run.map(|x| &x.id), "pane": run.map(|x| &x.pane),
@@ -519,7 +527,17 @@ impl Core {
             "tell_queue": crate::tellq::len(&self.state, &a.name),
             "tell_dropped": crate::tellq::dropped(&self.state, &a.name),
             "viewer": crate::docs::is_viewer(&a.argv),
-        })
+        });
+        value
+            .as_object_mut()
+            .expect("session view is an object")
+            .extend(
+                self.build_fields(a, run, status, paths)
+                    .as_object()
+                    .expect("build fields are an object")
+                    .clone(),
+            );
+        value
     }
     /// Live panes, or None when no server owns this state (after a reboot).
     fn live_panes(&self, r: &Registry) -> Option<Vec<crate::Pane>> {
@@ -575,10 +593,11 @@ impl Core {
             .collect();
         let known = self.activities(&reading);
         // Kept tell messages go in once a session reads idle; its status here is the one before.
+        let mut paths = HashMap::new();
         Ok(r.agents
             .iter()
             .map(|a| {
-                let mut v = self.view(&r, a, panes.as_deref(), &known);
+                let mut v = self.view(&r, a, panes.as_deref(), &known, &mut paths);
                 crate::tellq::after_read(self, &mut v);
                 v
             })
@@ -587,9 +606,29 @@ impl Core {
     pub fn session_get(&self, name: &str) -> Result<Value> {
         let (r, panes) = self.discover()?;
         let a = self.by_name(&r, name)?;
-        Ok(self.view(&r, a, panes.as_deref(), &HashMap::new()))
+        Ok(self.view(
+            &r,
+            a,
+            panes.as_deref(),
+            &HashMap::new(),
+            &mut HashMap::new(),
+        ))
     }
     pub fn session_explain(&self, name: &str) -> Result<Value> {
+        let mut result = self.status_explain(name)?;
+        let view = self.session_get(name)?;
+        for key in [
+            "running_build",
+            "installed_build",
+            "stale",
+            "protected",
+            "swap_blockers",
+        ] {
+            result[key] = view[key].clone();
+        }
+        Ok(result)
+    }
+    fn status_explain(&self, name: &str) -> Result<Value> {
         let (r, panes) = self.discover()?;
         let a = self.by_name(&r, name)?;
         let pane = Self::pane_of(&r, a, panes.as_deref());
@@ -612,6 +651,123 @@ impl Core {
         };
         Ok(json!({"status": reason.split(':').next(), "rule": reason,
             "row": null, "text": null, "considered_rows": [], "pane_title": null}))
+    }
+    /// Explicit only: no installer, force flag, new conversation or fallback build.
+    pub fn session_refresh(&self, name: &str) -> Result<Value> {
+        let before = self.session_get(name)?;
+        Self::refresh_allowed(&before)?;
+        let expected = before["run_id"].as_str().context("no current run")?;
+        let mut receipt = json!({"name":name, "before":before, "after":null, "outcome":"checking"});
+        let started = (|| -> Result<Run> {
+            let _lock = self.lock()?;
+            let mut r = self.registry()?;
+            let a = self.by_name(&r, name)?.clone();
+            let run = r
+                .runs
+                .iter()
+                .find(|r| r.agent_id == a.id)
+                .context("no current run")?;
+            ensure!(run.id == expected, "stale_run: run changed during refresh");
+            ensure!(
+                a.conversation
+                    == receipt["before"]["conversation"]
+                        .as_str()
+                        .map(str::to_string),
+                "conversation changed during refresh"
+            );
+            self.fresh_or_known(&a, false)?;
+            receipt["outcome"] = json!("prepared");
+            self.refresh_receipt(&receipt)?;
+            self.restart_locked(
+                &mut r,
+                &a.id,
+                expected,
+                Some(&serde_json::from_value::<crate::build::Build>(
+                    receipt["before"]["installed_build"].clone(),
+                )?),
+            )
+        })();
+        let outcome = started.and_then(|run| self.settled_session(name, &run));
+        receipt["after"] = self.session_get(name).unwrap_or(Value::Null);
+        match &outcome {
+            Ok(after) => {
+                receipt["outcome"] = json!("refreshed");
+                if after["conversation"] != receipt["before"]["conversation"]
+                    || after["running_build"] != receipt["before"]["installed_build"]
+                {
+                    receipt["outcome"] = json!("verification_failed");
+                }
+            }
+            Err(e) => {
+                receipt["outcome"] = json!("failed");
+                receipt["error"] = json!(format!("{e:#}"));
+            }
+        }
+        self.refresh_receipt(&receipt)?;
+        ensure!(
+            receipt["outcome"] == "refreshed",
+            "refresh_failed: {receipt}"
+        );
+        Ok(receipt)
+    }
+    pub(crate) fn check_refresh_locked(
+        &self,
+        r: &Registry,
+        agent: &str,
+        expected: &str,
+        required: &crate::build::Build,
+    ) -> Result<()> {
+        let a = r
+            .agents
+            .iter()
+            .find(|a| a.id == agent)
+            .context("agent not found")?;
+        self.guard(r, agent, expected, true)?;
+        let panes = self.live_panes(r);
+        let view = self.view(r, a, panes.as_deref(), &HashMap::new(), &mut HashMap::new());
+        Self::refresh_allowed(&view)?;
+        ensure!(
+            view["installed_build"] == serde_json::to_value(required)?,
+            "installed build changed; old run kept"
+        );
+        Ok(())
+    }
+    fn refresh_allowed(view: &Value) -> Result<()> {
+        let blockers = view["swap_blockers"]
+            .as_array()
+            .context("missing refresh evidence")?;
+        ensure!(blockers.is_empty(), "refresh_refused: {}", json!(blockers));
+        Ok(())
+    }
+    fn refresh_receipt(&self, value: &Value) -> Result<()> {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.state.join("refresh.jsonl"))?;
+        fs2::FileExt::try_lock_exclusive(&file)
+            .context("refresh receipt log busy; inspect the session before retrying")?;
+        let mut entry = value.clone();
+        if let Some(error) = value["error"].as_str() {
+            // Screen tails are for the caller, not the persistent metadata receipt.
+            entry["error"] = json!(error.split("; last screen lines:").next().unwrap_or(error));
+        }
+        writeln!(file, "{entry}")?;
+        file.sync_data()?;
+        Ok(())
+    }
+    pub fn session_protect(&self, name: &str, off: bool) -> Result<Value> {
+        let _lock = self.lock()?;
+        let mut r = self.registry()?;
+        let id = self.by_name(&r, name)?.id.clone();
+        let a = r
+            .agents
+            .iter_mut()
+            .find(|a| a.id == id)
+            .context("agent not found")?;
+        a.protected = !off;
+        self.save(&r)?;
+        Ok(json!({"name":name,"protected":!off}))
     }
     fn current(&self, name: &str) -> Result<(Agent, Run)> {
         let r = self.registry()?;
@@ -1213,6 +1369,7 @@ mod tests {
             input_mode: "terminal-line".into(),
             collaboration_mode: "mailbox".into(),
             conversation: None,
+            protected: false,
             worktree: None,
         };
         r.agents.push(mk("c", &["/x/claude", "--model", "m"]));
@@ -1250,6 +1407,7 @@ mod tests {
             input_mode: "terminal-line".into(),
             collaboration_mode: "mailbox".into(),
             conversation: None,
+            protected: false,
             worktree: None,
         };
         // --model stores OpenCode's config in front of the command, as session add writes it.
@@ -1345,6 +1503,7 @@ mod tests {
             input_mode: "native".into(),
             collaboration_mode: "disabled".into(),
             conversation: None,
+            protected: false,
             worktree: None,
         };
         let mut b = a.clone();
@@ -1363,6 +1522,7 @@ mod tests {
             pid: "1".into(),
             process_start: "x".into(),
             started_at: now(),
+            running_build: None,
         };
         assert_eq!(
             discover_codex(&r, &a, &run, d.path()).map(|v| v.id),

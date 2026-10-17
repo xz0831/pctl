@@ -93,6 +93,14 @@ try:
         assert until(lambda: 'ready in a-main' in screen()), screen()
         assert 'alpha / ● a-main idle' in status() and '! 1 waiting for you' in status(), status()
     case('pctl alone opens the app: projects, agents and their state, tabs, the live terminal', opens)
+    def stale_view():
+        assert until(lambda: 'app_visible' in cli('session', 'get', 'a-main')['swap_blockers'])
+        assert 'app_visible' not in cli('session', 'get', 'b-main')['swap_blockers']
+        with (bindir / 'plain').open('a') as f: f.write('# installed replacement\n')
+        assert until(lambda: 'a-main ↑' in screen()), screen()
+        assert cli('session', 'explain', 'a-main')['stale'] is True
+    case('stale sidebar marker and only visible app cells block refresh', stale_view)
+
     def typing():
         text('hello app'); keys('Enter')
         assert until(lambda: 'got: hello app' in cli('session', 'read', 'a-main', '--lines', '10'))

@@ -150,6 +150,7 @@ struct Agent {
     name: String,
     project: String,
     status: String,
+    stale: bool,
     pane: Option<String>,
     run: Option<String>,
     /// Tell messages kept for it while it waited for a decision.
@@ -660,6 +661,7 @@ pub fn run(core: &Core) -> Result<()> {
         terminal.clear()?;
         // Draw only what changed: an event, a new list, a different screen, or a notice running out.
         let (mut dirty, mut notice) = (true, false);
+        let mut viewed: HashMap<String, Vec<String>> = HashMap::new();
         while !app.quit {
             while let Ok(u) = rx.try_recv() {
                 app.apply(u);
@@ -668,6 +670,26 @@ pub fn run(core: &Core) -> Result<()> {
             dirty |= app.tick();
             dirty |= app.end_viewers(core);
             dirty |= app.capture_due(core);
+            for machine in &app.machines {
+                if machine.unusable().is_some() {
+                    viewed.remove(&machine.id);
+                    continue;
+                }
+                let runs: Vec<String> = app
+                    .on_screen()
+                    .iter()
+                    .filter(|id| id.machine == machine.id)
+                    .filter_map(|id| app.agents.iter().find(|a| a.id() == *id)?.run.clone())
+                    .collect();
+                if viewed.get(&machine.id) != Some(&runs) {
+                    if machine.is_local() {
+                        core.set_app_viewed(&runs)?;
+                    } else {
+                        let _ = machine.request(json!({"op":"view", "runs":runs}), None);
+                    }
+                    viewed.insert(machine.id.clone(), runs);
+                }
+            }
             let live = app.notice_live();
             dirty |= live != std::mem::replace(&mut notice, live);
             if std::mem::take(&mut dirty) {
@@ -690,6 +712,7 @@ pub fn run(core: &Core) -> Result<()> {
         }
         Ok(())
     })();
+    let _ = core.set_app_viewed(&[]);
     // Hand the windows back to tmux's own sizing, also after a draw or read error.
     // shortcut: a killed app (SIGHUP) leaves windows that had a client attached at manual; a
     // signal handler would need a new dependency. Reopening the app and leaving clears them.
@@ -1027,6 +1050,7 @@ impl App {
                     name: s["name"].as_str().unwrap_or_default().into(),
                     project: s["project"].as_str().unwrap_or_default().into(),
                     status: s["status"].as_str().unwrap_or("unknown").into(),
+                    stale: s["stale"] == true,
                     pane: s["pane"].as_str().map(String::from),
                     run: s["run_id"].as_str().map(String::from),
                     queued: s["tell_queue"].as_u64().unwrap_or(0) as usize,
@@ -2590,6 +2614,7 @@ impl App {
                 run: None,
                 queued: 0,
                 viewer: true,
+                stale: false,
             };
             self.fresh.insert(a.id(), (a.clone(), Instant::now()));
             self.agents.push(a);
@@ -2618,6 +2643,7 @@ impl App {
             name: name.into(),
             project: project.name.clone(),
             status: "starting".into(),
+            stale: false,
             pane: None,
             run: None,
             queued: 0,
@@ -3136,17 +3162,23 @@ impl App {
                         base
                     };
                     let kept = a.as_ref().map_or(0, |a| a.queued);
+                    let stale = a.as_ref().is_some_and(|a| a.stale);
                     let tag = if kept > 0 {
                         format!(" ✉{kept}")
                     } else {
                         String::new()
                     };
+                    let mark = if stale { " ↑" } else { "" };
                     let room = r.width.saturating_sub(6 + step) as usize;
                     let mut spans = vec![
                         Span::raw(pad(3)),
                         Span::styled(g, gs),
                         Span::raw(" "),
-                        Span::raw(fit(&id.name, room.saturating_sub(tag.chars().count()))),
+                        Span::raw(fit(
+                            &id.name,
+                            room.saturating_sub(tag.chars().count() + mark.chars().count()),
+                        )),
+                        Span::raw(mark),
                     ];
                     if kept > 0 {
                         spans.push(Span::styled(tag, Style::default().fg(p.accent)));
@@ -4079,6 +4111,7 @@ mod tests {
             name: name.into(),
             project: "p".into(),
             status: status.into(),
+            stale: false,
             pane: Some("%1".into()),
             run: Some("r".into()),
             queued: 0,

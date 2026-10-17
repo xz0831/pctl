@@ -12,6 +12,7 @@ use std::{
 use uuid::Uuid;
 pub mod app;
 pub mod bridge;
+pub mod build;
 pub mod clipboard;
 pub mod collaboration;
 pub mod docs;
@@ -61,6 +62,8 @@ pub struct Agent {
     /// Harness conversation ID (Claude session, Codex thread); starts resume it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    #[serde(default)]
+    pub protected: bool,
     /// Set when `session add --worktree` created the session's git worktree (cwd).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<worktree::Worktree>,
@@ -77,6 +80,8 @@ pub struct Run {
     pub pid: String,
     pub process_start: String,
     pub started_at: u64,
+    #[serde(default)]
+    pub running_build: Option<build::Build>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Registry {
@@ -452,6 +457,7 @@ impl Core {
             input_mode: native_input(),
             collaboration_mode: collaboration::disabled_collaboration(),
             conversation: None,
+            protected: false,
             worktree: None,
         };
         r.agents.push(a.clone());
@@ -600,7 +606,12 @@ impl Core {
         }
         Ok(())
     }
-    fn start_locked(&self, r: &mut Registry, agent: &str) -> Result<Run> {
+    fn start_locked(
+        &self,
+        r: &mut Registry,
+        agent: &str,
+        required_build: Option<&build::Build>,
+    ) -> Result<Run> {
         let a = r
             .agents
             .iter()
@@ -626,6 +637,19 @@ impl Core {
         let launcher = self.state.join("launchers").join(format!("{run_id}.sh"));
         let event = self.state.join("events").join(format!("{run_id}.json"));
         let gate = self.state.join("launchers").join(format!("{run_id}.ready"));
+        let mut argv = session::launch_argv(r, agent)?;
+        let running_build = self.resolve_build(&a).map(|(index, build)| {
+            if required_build.is_some() {
+                argv[index] = build.resolved_path.to_string_lossy().into_owned();
+            }
+            build
+        });
+        if let Some(required) = required_build {
+            ensure!(
+                running_build.as_ref() == Some(required),
+                "installed build changed; session left stopped"
+            );
+        }
         let script = format!(
             "#!/bin/sh\nwhile [ ! -f {} ]; do sleep 0.05; done\ncd -- {} || exit 126\nexport PCTL_RUN_ID={}\nexport PCTL_EVENT_FILE={}\nexport PCTL_BIN={}\nexport PCTL_STATE={}\nexport PCTL_TMUX={}\nexport PCTL_PROJECT_ID={}\nexport PCTL_AGENT_ID={}\nexec {}\n",
             shell_quote(&gate.to_string_lossy()),
@@ -637,8 +661,7 @@ impl Core {
             shell_quote(&self.tmux.to_string_lossy()),
             shell_quote(&a.project_id),
             shell_quote(&a.id),
-            session::launch_argv(r, agent)?
-                .iter()
+            argv.iter()
                 .map(|s| shell_quote(s))
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -725,6 +748,7 @@ impl Core {
                 "cannot identify new pane process; launch remains gated; inspect before retrying",
             )?,
             started_at: now(),
+            running_build,
         };
         // Commit the generation before enabling the real command. Any subsequent failure leaves
         // a blocked launcher and registered run; Start cannot accidentally duplicate the command.
@@ -763,7 +787,7 @@ impl Core {
     pub fn start(&self, agent: &str) -> Result<Run> {
         let _lock = self.lock()?;
         let mut r = self.registry()?;
-        self.start_locked(&mut r, agent)
+        self.start_locked(&mut r, agent, None)
     }
     fn guard(&self, r: &Registry, agent: &str, expected: &str, alive: bool) -> Result<Pane> {
         let run = r
@@ -1044,20 +1068,43 @@ impl Core {
     pub fn restart(&self, agent: &str, expected: &str) -> Result<Run> {
         let _lock = self.lock()?;
         let mut r = self.registry()?;
-        self.restart_locked(&mut r, agent, expected)
+        self.restart_locked(&mut r, agent, expected, None)
     }
-    fn restart_locked(&self, r: &mut Registry, agent: &str, expected: &str) -> Result<Run> {
+    fn restart_locked(
+        &self,
+        r: &mut Registry,
+        agent: &str,
+        expected: &str,
+        required_build: Option<&build::Build>,
+    ) -> Result<Run> {
         let p = self.guard(r, agent, expected, false)?;
+        let old = r
+            .runs
+            .iter()
+            .find(|r| r.agent_id == agent)
+            .context("no current run")?
+            .clone();
         self.retire_old_panel()?;
+        if let Some(required) = required_build {
+            self.check_refresh_locked(r, agent, expected, required)?;
+        }
         self.tm(&["kill-pane", "-t", &p.pane])?;
         ensure!(
             !self.panes()?.iter().any(|v| v.pane == p.pane),
             "restart outcome_unknown; no new run created"
         );
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !process_ended(&old)? {
+            ensure!(
+                Instant::now() < deadline,
+                "old_process_survived: no new run created"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
         r.runs.retain(|x| x.agent_id != agent);
         self.save(r)?;
         self.audit("restart", expected, "old_pane_removed")?;
-        self.start_locked(r, agent)
+        self.start_locked(r, agent, required_build)
     }
     pub fn save_draft(&self, agent: &str, expected: &str, text: &str) -> Result<()> {
         let _lock = self.lock()?;
@@ -1506,6 +1553,29 @@ fn check_identity(run: &Run, p: &Pane) -> Result<()> {
         "process identity changed (external respawn); controls locked"
     );
     Ok(())
+}
+fn process_ended(run: &Run) -> Result<bool> {
+    if let Ok(start) = process_start(&run.pid) {
+        return Ok(start != run.process_start);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("/bin/ps")
+            .args(["-p", &run.pid, "-o", "pid="])
+            .output()?;
+        ensure!(
+            out.status.code() == Some(1) && out.stdout.is_empty(),
+            "old process state unknown; no new run created"
+        );
+        Ok(true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        match fs::metadata(format!("/proc/{}", run.pid)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            _ => bail!("old process state unknown; no new run created"),
+        }
+    }
 }
 #[cfg(target_os = "macos")]
 fn process_start(pid: &str) -> Result<String> {

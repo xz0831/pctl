@@ -603,9 +603,9 @@ fn launch(
     });
     save(core, s)?; // Durable debit and intent BEFORE any pane/process mutation.
     let result = if let Some(run) = old {
-        core.restart_locked(r, &run.agent_id, &run.id)
+        core.restart_locked(r, &run.agent_id, &run.id, None)
     } else {
-        core.start_locked(r, &target.id)
+        core.start_locked(r, &target.id, None)
     };
     match result {
         Ok(run) => {
@@ -852,6 +852,7 @@ mod tests {
             input_mode: "native".into(),
             collaboration_mode: "disabled".into(),
             conversation: None,
+            protected: false,
             worktree: None,
         };
         let mut child = actor.clone();
@@ -1000,6 +1001,7 @@ mod tests {
             input_mode: "native".into(),
             collaboration_mode: "disabled".into(),
             conversation: None,
+            protected: false,
             worktree: None,
         };
         let g = Grant {
