@@ -25,7 +25,7 @@ A drag in the agent's terminal copies the text. pctl does two things:
 
    The command gets two seconds.
 
-The status line says `Copied N characters` only when the command worked or the terminal is one known to honour OSC 52 (Ghostty, iTerm2, WezTerm, kitty, Alacritty, foot; the list comes from those terminals' documentation, only Ghostty is in daily use with pctl). Otherwise:
+The status line says `Copied N characters` only when the command worked or the terminal is one whose documentation says an OSC 52 write copies by default (Ghostty, WezTerm, kitty, Alacritty; only Ghostty is in daily use with pctl). iTerm2 is not on that list: it asks you to allow OSC 52 first (on macOS `pbcopy` covers it). Otherwise:
 - `Sent N characters (the terminal may not copy; Shift+drag does)`
 - `This terminal ignores copying: Shift+drag, then ctrl+shift+c` when `VTE_VERSION` is set (a VTE terminal) and no command worked.
 
@@ -35,7 +35,7 @@ Selections over 100,000 characters are refused.
 
 When an agent that was working goes idle or waits for you, pctl writes an OSC 777 notification (and a bell when it waits). At most one per agent every 10 seconds, never for the agent on screen. On a local Linux desktop (not ssh, `DISPLAY` or `WAYLAND_DISPLAY` set) it also runs `notify-send -- pctl "<name>: done"` (or `needs you`), if `notify-send` is installed, so a terminal that ignores OSC 777 still shows a notice.
 
-On macOS pctl does nothing beyond OSC 777. A macOS terminal that ignores OSC 777 would need a call to `osascript -e 'display notification …'` or `terminal-notifier`; this is not built.
+The Linux call applies to any terminal, so it also helps Alacritty, which ignores OSC 9 and OSC 777 (from its documentation, not tried). On macOS pctl does nothing beyond OSC 777. A macOS terminal that ignores OSC 777 (iTerm2 v3.6.11 does, from its source) would need a call to `osascript -e 'display notification …'` or `terminal-notifier`; this is not built.
 
 ## Ghostty
 
@@ -65,3 +65,23 @@ Keys MATE Terminal takes before pctl or the agent sees them:
 - `ctrl+shift+t`, `ctrl+shift+n`, `ctrl+shift+f`, `ctrl+shift+page up/down`, and the zoom keys (`ctrl+minus`, `ctrl+shift+plus`, `ctrl+0`).
 
 `ctrl+b`, the pctl prefix, reaches pctl; `ctrl+b ctrl+b` sends a literal `ctrl+b` to the agent.
+
+## Other terminals: from docs, not measured
+
+Everything in this table comes from the terminals' documentation and source at the versions named, collected for this project; none of it was tried with pctl. "Not tried" is not "does not work": an empty or conditional cell means check before relying on it. The multiplexer between the terminal and the app (tmux) must also let each feature through.
+
+| Terminal (version read) | OSC 52 write | OSC 777 / OSC 9 notice | `Shift`+mouse selects locally | IME composing text | Things to know |
+|---|---|---|---|---|---|
+| Ghostty v1.3.1 | yes, on by default | both | yes (`mouse-shift-capture`) | drawn at the cursor | OSC 52 read asks first |
+| iTerm2 v3.6.11 | only after you allow it (off by default) | 9 yes, **777 no** | **`Option`**, not `Shift` | drawn at the cursor | notifications need the OS allowed too |
+| Apple Terminal (macOS Tahoe 26) | not documented | not documented | not documented; `View > Allow Mouse Reporting` off instead | not documented | truecolor announced for 26 |
+| WezTerm 20240203 | yes | both | yes (`Shift`) | yes | OSC 52 read not supported |
+| kitty v0.49.2 | yes, on by default | both | yes (`Shift`+left) | yes | OSC 52 read asks first |
+| Alacritty v0.17.0 | yes, only while the window has focus | **neither** | yes (`Shift`) | yes | |
+| GNOME Terminal (VTE 0.82.2 and 0.85.0) | **no** | **no** (a limited, off-by-default OSC 777 form exists, for "Command completed" only; OSC 9 only for progress) | yes | drawn at the cursor | same engine as MATE Terminal |
+| MATE Terminal (VTE 0.82.2 and 0.85.0) | **no** | **no** (as above) | yes | drawn at the cursor | measured on VTE 0.64.2 above: same results |
+| Konsole (26.11.70 development) | yes | 777 yes, 9 only progress | yes | yes | |
+| Windows Terminal (development source) | yes | 777 only if switched on (`compatibility.allowOSC777`), 9 no | yes (`Shift`) | yes | only as the window an ssh session shows in |
+| xterm #411 | possible, but blocked by default (`allowWindowOps`) | neither | yes (`shiftEscape`) | via XIM, build-dependent | |
+
+The mouse reporting pctl needs (SGR 1006), bracketed paste and the wheel-to-arrow-keys fallback are listed as supported (some only under a setting or mode) for all of these except where Apple Terminal is "not documented". IME rows say a composing-text path exists in the source, not that a given Korean input method places its candidate window correctly.

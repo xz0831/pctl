@@ -203,6 +203,13 @@ pub fn write_text(text: &str) -> Result<()> {
     }
 }
 
+/// Terminals whose documentation says an OSC 52 write reaches the clipboard by default. iTerm2 is
+/// not one: it asks the person to allow it first.
+fn honours_osc52(program: &str, term: &str) -> bool {
+    ["ghostty", "WezTerm"].contains(&program)
+        || ["xterm-ghostty", "xterm-kitty", "alacritty"].contains(&term)
+}
+
 /// What the terminal is known to do with an OSC 52 write.
 pub struct CopyWay {
     /// `write_text` put the text on the clipboard.
@@ -216,11 +223,9 @@ pub struct CopyWay {
 impl CopyWay {
     pub fn from_env(command_ok: bool) -> Self {
         let var = |k: &str| std::env::var(k).unwrap_or_default();
-        let (program, term) = (var("TERM_PROGRAM"), var("TERM"));
         CopyWay {
             command_ok,
-            honours_osc52: ["ghostty", "iTerm.app", "WezTerm"].contains(&program.as_str())
-                || ["xterm-ghostty", "xterm-kitty", "alacritty", "foot"].contains(&term.as_str()),
+            honours_osc52: honours_osc52(&var("TERM_PROGRAM"), &var("TERM")),
             vte: std::env::var_os("VTE_VERSION").is_some(),
         }
     }
@@ -389,6 +394,22 @@ mod tests {
             "no display at all"
         );
         assert_eq!(text_tool(false, false, true, |_| false), None, "no tool");
+    }
+
+    #[test]
+    fn only_terminals_that_copy_by_default_count_as_honouring_osc52() {
+        assert!(honours_osc52("ghostty", "xterm-ghostty"));
+        assert!(honours_osc52("", "xterm-kitty"));
+        assert!(honours_osc52("WezTerm", "xterm-256color"));
+        assert!(
+            !honours_osc52("iTerm.app", "xterm-256color"),
+            "off until allowed"
+        );
+        assert!(!honours_osc52("", "xterm-256color"));
+        assert!(
+            !honours_osc52("tmux", "screen-256color"),
+            "a multiplexer says nothing of the terminal behind it"
+        );
     }
 
     #[test]
