@@ -212,6 +212,14 @@ struct Pane {
     inner: Rect,
 }
 
+impl View {
+    /// How far back the view can go in a cell `height` rows tall: the history, and the rows of a
+    /// taller pane that sit above what the cell shows live.
+    fn max_scroll(&self, height: u16) -> usize {
+        self.history + self.size.1.saturating_sub(height) as usize
+    }
+}
+
 struct Update {
     machine: String,
     agents: std::result::Result<Vec<Value>, String>,
@@ -1395,6 +1403,7 @@ impl App {
     }
     /// Take a screen as a cell's view. Whether it differs from the one shown.
     fn show(&mut self, id: u32, s: Screen) -> bool {
+        let inner_h = self.panes.get(&id).map_or(0, |p| p.inner.height);
         let view = self.view(id);
         if view.last.as_ref() == Some(&s) {
             return false;
@@ -1403,7 +1412,7 @@ impl App {
         view.size = s.size;
         view.history = s.history;
         (view.alt, view.mouse, view.sgr) = (s.alt, s.mouse, s.sgr);
-        view.scroll = view.scroll.min(s.history);
+        view.scroll = view.scroll.min(view.max_scroll(inner_h));
         view.rows = term::parse_capture(&s.text);
         view.last = Some(s);
         true
@@ -1950,8 +1959,9 @@ impl App {
             MouseEventKind::ScrollUp => {
                 if let Some(Hit::Pane(id)) = hit {
                     self.sel = None;
+                    let inner_h = self.panes.get(&id).map_or(0, |p| p.inner.height);
                     let view = self.view(id);
-                    view.scroll = (view.scroll + 3).min(view.history);
+                    view.scroll = (view.scroll + 3).min(view.max_scroll(inner_h));
                     view.next = None;
                 }
             }
@@ -3944,6 +3954,30 @@ mod tests {
         // A cell with no agent has nobody to type to.
         app.split(Dir::Down);
         assert!(app.current().is_none());
+    }
+    #[test]
+    fn a_taller_pane_can_be_scrolled_back_over_its_own_hidden_top() {
+        let view = View {
+            history: 100,
+            size: (80, 40),
+            ..View::default()
+        };
+        assert_eq!(
+            view.max_scroll(24),
+            116,
+            "history plus the 16 rows above the cell"
+        );
+        assert_eq!(view.max_scroll(40), 100, "a pane as tall as its cell");
+        assert_eq!(view.max_scroll(60), 100, "a cell taller than the pane");
+        let flat = View {
+            size: (80, 40),
+            ..View::default()
+        };
+        assert_eq!(
+            flat.max_scroll(24),
+            16,
+            "no history: the rows the cell hides"
+        );
     }
     #[test]
     fn a_list_answer_becomes_an_update() {
