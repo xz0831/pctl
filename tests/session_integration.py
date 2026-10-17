@@ -3,7 +3,7 @@
 read/wait/whoami, blocked sessions are never typed into or restarted, conversation IDs survive
 restart and restore, and the SessionStart hook records Codex threads. Fake harnesses only."""
 import argparse, json, os, pathlib, subprocess, tempfile, time
-p = argparse.ArgumentParser(); p.add_argument('--bin', required=True); p.add_argument('--tmux', required=True); p.add_argument('--report', required=True); a = p.parse_args()
+p = argparse.ArgumentParser(); p.add_argument('--bin', required=True); p.add_argument('--tmux', required=True); p.add_argument('--report', required=True); p.add_argument('--before-bin'); a = p.parse_args()
 B = str(pathlib.Path(a.bin).resolve()); T = str(pathlib.Path(a.tmux).resolve())
 root = pathlib.Path(tempfile.mkdtemp(prefix='pctl-sess-', dir=os.path.realpath('/tmp'))); state = root / 's'; home = root / 'home'; results = []
 bindir = root / 'bin'; bindir.mkdir()
@@ -66,6 +66,24 @@ try:
         names = [s['name'] for s in cli('session', 'list')]
         assert names == ['c-main', 'x-work', 'p-shell'], names
     case('session add registers, opts in and starts; names are unique', add)
+    def explain():
+        assert until(lambda: '>' in cli('session', 'read', 'p-shell'))
+        def output(binary, *args):
+            q = subprocess.run([binary, '--state', str(state), '--tmux', T, *args],
+                               env=ENV, capture_output=True, check=True)
+            return q.stdout
+        before_list = output(B, 'session', 'list')
+        before_get = output(B, 'session', 'get', 'p-shell')
+        e = cli('session', 'explain', 'p-shell')
+        assert e['status'] == 'idle' and e['rule'] == 'idle: no rule matched', e
+        assert e['row'] is None and e['text'] is None and e['considered_rows'], e
+        assert isinstance(e['pane_title'], str), e
+        assert output(B, 'session', 'list') == before_list
+        assert output(B, 'session', 'get', 'p-shell') == before_get
+        if a.before_bin:
+            assert output(str(pathlib.Path(a.before_bin).resolve()), 'session', 'list') == before_list
+            assert output(str(pathlib.Path(a.before_bin).resolve()), 'session', 'get', 'p-shell') == before_get
+    case('explain shares status and leaves list/get byte-identical on a fixed fixture (optional pre-change binary)', explain)
     def no_leak():
         env = cwd('p-shell') / 'env.txt'
         assert until(env.exists)
@@ -99,6 +117,8 @@ try:
     def blocked():
         cli('session', 'prompt', 'p-shell', 'block')
         assert until(lambda: cli('session', 'get', 'p-shell')['status'] == 'blocked', 3)
+        e = cli('session', 'explain', 'p-shell')
+        assert e['status'] == 'blocked' and e['row'] > 0 and e['text'], e
         assert 'blocked' in cli('session', 'prompt', 'p-shell', 'yes', ok=False)
         assert 'blocked' in cli('session', 'restart', 'p-shell', '--force', ok=False)
         assert 'got: yes' not in cli('session', 'read', 'p-shell')
@@ -129,6 +149,8 @@ try:
         s = cli('session', 'get', 'c-moved')
         cli('agent', 'terminate', '--agent', s['agent_id'], '--expected-run', s['run_id'])
         assert cli('session', 'get', 'c-moved')['process'] == 'stopped'
+        e = cli('session', 'explain', 'c-moved')
+        assert e['status'] == 'stopped' and e['considered_rows'] == [] and e['pane_title'] is None, e
         v = cli('session', 'start', 'c-moved')
         assert v['process'] == 'running' and v['conversation'] == 'moved-convo-1', v
         log = cwd('c-moved') / 'argv.log'
@@ -187,6 +209,8 @@ try:
         assert err['error_code'] == 'server_start_not_allowed', err
         assert subprocess.run([T, '-S', str(state / 'tmux.sock'), 'ls'], capture_output=True).returncode != 0, 'no server created'
         assert all(s['process'] == 'lost' for s in cli('session', 'list', env=outside)), 'refused restore keeps every run'
+        e = cli('session', 'explain', 'p-shell')
+        assert e['status'] == 'lost' and e['row'] is None, e
     case('without start_env set to 1 (or with no [server] start_env) no server is created: add and restore are refused', gate)
     def restore():
         before = {s['name']: s['conversation'] for s in cli('session', 'list')}

@@ -370,6 +370,12 @@ tmux display for plain clients:
 - The status line reruns the hidden `pctl session marks` every 5 seconds while a client is attached.
 - `^b s` is a names-and-state `choose-tree`, and `^b q` detaches.
 
+## Explaining session status
+
+`pctl session explain <name>` prints `{status,rule,row,text,considered_rows,pane_title}` without adding fields to `session list` or `session get`. Rows are 1-based positions in the visible screen. `considered_rows` contains the last 12 nonempty rows as `{row,text}` (ANSI styling removed); the OpenCode footer rule uses only the last four. A title-spinner match or no match has null `row` and `text`. Stopped, lost and exited sessions have no considered rows and a null title. A failed capture reports `unknown` with the error in `rule`.
+
+Without a free `❯`/`›` input row, question words require dialog controls (a numbered choice, confirmation/cancellation hint, or Allow once/Reject choices). Quoted question words in ordinary answer or shell output do not block input.
+
 ## Worktree workers
 
 `pctl session add --name <name> --cwd <repo> --worktree <branch> [--base <ref>] [--model <provider/model>] -- <argv>` gives a worker its own branch and checkout.

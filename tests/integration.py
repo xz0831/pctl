@@ -73,9 +73,10 @@ try:
  def generic():
   a,r=start_agent(ps[0]['id']);v=inspect(a['id']);assert v['process']=='running';assert v['task']=='unknown';e=send(a['id'],r['id'],'hello',ok=False);assert 'unsupported' in e['error']
   a2,r2=start_agent(ps[0]['id'],'exit-zero',['/bin/sh','-c','exit 0'])
-  for _ in range(40):
+  deadline=time.monotonic()+10
+  while True:
    v=inspect(a2['id'])
-   if v['process']!='starting' and v['process']!='running':break
+   if v['process']=='exited(0)' or time.monotonic()>=deadline:break
    time.sleep(.05)
   assert v["process"]=="exited(0)",v;assert v['task']=='unknown';e=cli('agent','start','--agent',a2['id'],ok=False);assert 'existing run' in e['error']
  case('silent generic running and exit-zero never imply task completion',generic)

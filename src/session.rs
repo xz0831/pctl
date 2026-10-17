@@ -167,53 +167,78 @@ fn plain(raw: &str) -> String {
 /// text streams, and a dimmed input prompt "❯" for the whole turn (default color when idle).
 // shortcut: the dimmed-prompt cue is Claude Code's rendering, not an API; if a Claude update
 // breaks it, report state from UserPromptSubmit/Stop hooks the way `session hook` does.
+#[derive(serde::Serialize)]
+struct Activity {
+    status: &'static str,
+    rule: String,
+    row: Option<usize>,
+    text: Option<String>,
+    considered_rows: Vec<ScreenRow>,
+    pane_title: String,
+}
+#[derive(serde::Serialize)]
+struct ScreenRow {
+    row: usize,
+    text: String,
+}
 fn activity(raw: &str, title: &str) -> &'static str {
-    let rows: Vec<(&str, String)> = raw
+    activity_reason(raw, title).status
+}
+fn activity_reason(raw: &str, title: &str) -> Activity {
+    let rows: Vec<_> = raw
         .lines()
-        .map(|l| (l, plain(l).trim().to_lowercase()))
-        .filter(|(_, l)| !l.is_empty())
+        .enumerate()
+        .map(|(i, l)| (i + 1, l, plain(l).trim().to_lowercase()))
+        .filter(|(_, _, l)| !l.is_empty())
         .collect();
     let tail = &rows[rows.len().saturating_sub(12)..];
-    let spinner_line =
-        |l: &str| l.starts_with(['✢', '✳', '✶', '✻', '✽', '*', '·']) && l.contains('…');
-    // The last prompt row: its color code is written right before the "❯". A numbered menu row
-    // ("❯ 1. Yes", often coloured) is a question waiting for a person, not a dim prompt.
-    let dim_prompt = tail
-        .iter()
-        .rev()
-        .find(|(_, l)| l.starts_with('❯') && !menu_row(l))
-        .is_some_and(|(r, _)| {
-            r.split('❯').next().is_some_and(|before| {
-                before
-                    .rfind("\x1b[")
-                    .is_some_and(|i| !before[i..].starts_with("\x1b[39m"))
+    let decide = |status, rule: String, matched: Option<usize>| Activity {
+        status,
+        rule,
+        row: matched.map(|i| tail[i].0),
+        text: matched.map(|i| plain(tail[i].1)),
+        considered_rows: tail
+            .iter()
+            .map(|(row, raw, _)| ScreenRow {
+                row: *row,
+                text: plain(raw),
             })
-        });
-    let spinner_title = title
+            .collect(),
+        pane_title: title.into(),
+    };
+    if title
         .chars()
         .next()
-        .is_some_and(|c| ('\u{2801}'..='\u{28ff}').contains(&c) || "◐◓◑◒".contains(c));
-    let busy = spinner_title
-        || tail
-            .iter()
-            .any(|(_, l)| l.contains("esc to interrupt") || spinner_line(l));
-    // OpenCode 2.0 shows "esc interrupt" (no "to") in its footer while it works, next to its
-    // progress glyphs ("⬝⬝⬝■■ esc interrupt …") or its "ctrl+p commands" hint. Only a footer row
-    // counts: prose that says "esc interrupt" has neither.
-    let opencode_footer = rows[rows.len().saturating_sub(4)..].iter().any(|(_, l)| {
-        l.contains("esc interrupt") && (l.contains(['⬝', '■']) || l.contains("ctrl+p commands"))
-    });
-    // A question beats the dim-prompt hint: when both show, refusing input is the safe side.
-    // Only rows below the last free input row count: prose an agent wrote above its own prompt
-    // ("if the reviewer approves") is not a question. Dialogs replace the input row or sit below
-    // it (Claude's trust dialog: "❯ No, exit" … "Enter to confirm").
-    let below = tail
+        .is_some_and(|c| ('\u{2801}'..='\u{28ff}').contains(&c) || "◐◓◑◒".contains(c))
+    {
+        return decide("working", "spinner in pane title".into(), None);
+    }
+    for (i, (_, _, l)) in tail.iter().enumerate() {
+        if l.contains("esc to interrupt") {
+            return decide("working", "footer \"esc to interrupt\"".into(), Some(i));
+        }
+        if l.starts_with(['✢', '✳', '✶', '✻', '✽', '*', '·']) && l.contains('…') {
+            return decide("working", "spinner".into(), Some(i));
+        }
+    }
+    let input = tail
         .iter()
-        .rposition(|(_, l)| l.starts_with(['❯', '›']) && !menu_row(l))
-        .map_or(0, |i| i + 1);
-    let question = tail[below..].iter().any(|(_, l)| {
+        .rposition(|(_, _, l)| l.starts_with(['❯', '›']) && !menu_row(l));
+    let below = input.map_or(0, |i| i + 1);
+    // Without an input row, prose needs dialog controls before question words count.
+    let dialog = tail[below..].iter().any(|(_, _, l)| {
         menu_row(l)
-            || [
+            || l.contains("enter to confirm")
+            || l.contains("esc to cancel")
+            || l.contains("enter confirm")
+            || (l.contains("allow once") && l.contains("reject"))
+    });
+    for (i, (_, _, l)) in tail.iter().enumerate().skip(below) {
+        if menu_row(l) {
+            return decide("blocked", "numbered menu".into(), Some(i));
+        }
+        if (input.is_some() || dialog)
+            && let Some(word) = [
                 "do you want to",
                 "would you like to",
                 "allow command",
@@ -221,22 +246,44 @@ fn activity(raw: &str, title: &str) -> &'static str {
                 "enter to confirm",
                 "esc to cancel",
                 "trust this folder",
-                // OpenCode's permission dialog: "Allow once / Always allow / Reject", no ❯ row.
                 "permission required",
                 "enter confirm",
             ]
             .iter()
-            .any(|k| l.contains(k))
-    });
-    if busy {
-        "working"
-    } else if question {
-        "blocked"
-    } else if opencode_footer || dim_prompt {
-        "working"
-    } else {
-        "idle"
+            .find(|word| l.contains(**word))
+        {
+            let scope = if input.is_some() {
+                "below the last input row"
+            } else {
+                "in dialog"
+            };
+            return decide(
+                "blocked",
+                format!("question word {word:?} {scope}"),
+                Some(i),
+            );
+        }
     }
+    for (i, (_, _, l)) in tail.iter().enumerate().skip(tail.len().saturating_sub(4)) {
+        if l.contains("esc interrupt") && (l.contains(['⬝', '■']) || l.contains("ctrl+p commands"))
+        {
+            return decide("working", "opencode footer".into(), Some(i));
+        }
+    }
+    if let Some(i) = tail
+        .iter()
+        .rposition(|(_, _, l)| l.starts_with('❯') && !menu_row(l))
+    {
+        let raw = tail[i].1;
+        if raw.split('❯').next().is_some_and(|before| {
+            before
+                .rfind("\x1b[")
+                .is_some_and(|j| !before[j..].starts_with("\x1b[39m"))
+        }) {
+            return decide("working", "dim prompt".into(), Some(i));
+        }
+    }
+    decide("idle", "idle: no rule matched".into(), None)
 }
 /// A numbered choice under the cursor ("› 1. Update now", "❯ 2. No") waits for a person: Codex
 /// update and trust menus carry none of the question words, and Enter would pick the choice.
@@ -415,6 +462,31 @@ impl Core {
         let r = self.discover()?;
         let a = self.by_name(&r, name)?;
         Ok(self.view(&r, a, self.live_panes(&r).as_deref(), &HashMap::new()))
+    }
+    pub fn session_explain(&self, name: &str) -> Result<Value> {
+        let r = self.discover()?;
+        let a = self.by_name(&r, name)?;
+        let panes = self.live_panes(&r);
+        let pane = Self::pane_of(&r, a, panes.as_deref());
+        let reason = match (r.runs.iter().any(|x| x.agent_id == a.id), pane) {
+            (false, _) => "stopped: no run",
+            (true, None) => "lost: no matching live pane",
+            (_, Some(p)) if p.dead => "exited: pane is dead",
+            (_, Some(p)) => {
+                let title = self
+                    .tm(&["display-message", "-p", "-t", &p.pane, "#{pane_title}"])
+                    .unwrap_or_default();
+                return match self.tm(&["capture-pane", "-p", "-e", "-t", &p.pane]) {
+                    Ok(raw) => Ok(serde_json::to_value(activity_reason(&raw, &title))?),
+                    Err(e) => Ok(
+                        json!({"status": "unknown", "rule": format!("capture failed: {e}"),
+                        "row": null, "text": null, "considered_rows": [], "pane_title": title}),
+                    ),
+                };
+            }
+        };
+        Ok(json!({"status": reason.split(':').next(), "rule": reason,
+            "row": null, "text": null, "considered_rows": [], "pane_title": null}))
     }
     fn current(&self, name: &str) -> Result<(Agent, Run)> {
         let r = self.registry()?;
@@ -806,6 +878,52 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn activity_explains_and_ignores_quoted_questions_without_input() {
+        for raw in [
+            "The command reports permission required.\n\n  Build  model\n  tab agents  ctrl+p commands\n",
+            "$ echo approve\napprove\n$ ",
+        ] {
+            assert_eq!(activity(raw, ""), "idle");
+        }
+        let raw = "heading\n\n• Working (5s • Esc to interrupt)\n› \n";
+        let v = activity_reason(raw, "title");
+        assert_eq!(v.status, activity(raw, "title"));
+        assert_eq!(v.rule, "footer \"esc to interrupt\"");
+        assert_eq!(v.row, Some(3));
+        assert_eq!(v.text.as_deref(), Some("• Working (5s • Esc to interrupt)"));
+        assert_eq!(
+            v.considered_rows.iter().map(|r| r.row).collect::<Vec<_>>(),
+            [1, 3, 4]
+        );
+        assert_eq!(v.pane_title, "title");
+        for (screen, rule, row) in [
+            ("✢ Vibing…\n❯ ", "spinner", 1),
+            ("⬝■ esc interrupt ctrl+p commands", "opencode footer", 1),
+            ("\x1b[90m❯ ", "dim prompt", 1),
+            ("❯ 2. Skip", "numbered menu", 1),
+            (
+                "❯ \npermission required",
+                "question word \"permission required\" below the last input row",
+                2,
+            ),
+            (
+                "△ Permission required\nAllow once Always allow Reject",
+                "question word \"permission required\" in dialog",
+                1,
+            ),
+        ] {
+            let v = activity_reason(screen, "");
+            assert_eq!(v.rule, rule);
+            assert_eq!(v.row, Some(row));
+        }
+        let title = activity_reason("› ", "⠧ task");
+        assert_eq!(title.rule, "spinner in pane title");
+        assert_eq!(title.row, None);
+        let tail = activity_reason(&format!("{}› \n", "old\n".repeat(15)), "");
+        assert_eq!(tail.considered_rows.len(), 12);
+        assert_eq!(tail.considered_rows[0].row, 5);
+    }
     #[test]
     fn keys_are_the_allowed_names_only() {
         for key in [
