@@ -27,7 +27,7 @@ ssh.chmod(0o755)
 for tag in ('L', 'R'):  # a fake agent: says which computer it runs on
     (bindir / f'plain{tag}').write_text(f'#!/bin/bash\necho "ready {tag} in $(basename "$PWD")"\necho "> "\nwhile IFS= read -r line; do echo "got {tag}: $line"; echo "> "; done\n')
     (bindir / f'plain{tag}').chmod(0o755)
-ENV = {k: v for k, v in os.environ.items() if not k.startswith(('PCTL_', 'TMUX', 'XDG_CONFIG'))}
+ENV = {k: v for k, v in os.environ.items() if not k.startswith(('PCTL_', 'TMUX', 'XDG_CONFIG', 'NO_COLOR'))}
 ENV.update(XDG_CONFIG_HOME=str(cfg), TERM='xterm-256color', SHELL='/bin/bash', PS1='$ ')
 machines = cfg / 'pctl' / 'machines'; machines.parent.mkdir(parents=True)
 machines.write_text('rm\tfake\tenabled\n')

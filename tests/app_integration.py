@@ -13,7 +13,7 @@ root = pathlib.Path(tempfile.mkdtemp(prefix='pctl-app-', dir=os.path.realpath('/
 V = root / 'v.sock'; bindir = root / 'bin'; bindir.mkdir(); cfg = root / 'cfg'
 (bindir / 'plain').write_text('#!/bin/bash\nif [ "$(basename "$PWD")" = b-block ]; then echo "Do you want to proceed?"; echo "❯ 1. Yes"; fi\necho "ready in $(basename "$PWD")"\necho "> "\nwhile IFS= read -r line; do echo "got: $line"; echo "> "; done\n')
 (bindir / 'plain').chmod(0o755)
-ENV = {k: v for k, v in os.environ.items() if not k.startswith(('PCTL_', 'TMUX', 'XDG_CONFIG'))}
+ENV = {k: v for k, v in os.environ.items() if not k.startswith(('PCTL_', 'TMUX', 'XDG_CONFIG', 'NO_COLOR'))}  # NO_COLOR (some agent shells set it) would turn the app's colours off
 ENV['XDG_CONFIG_HOME'] = str(root / 'no-config')  # the person's own config.toml stays out
 ENV.update(TERM='xterm-256color', SHELL='/bin/bash', PS1='$ ')
 def cli(*args, ok=True, st=None):

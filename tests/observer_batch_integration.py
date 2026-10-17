@@ -52,6 +52,8 @@ try:
         got = {x['name']: x['status'] for x in cli('session', 'list', env=dict(ENV, BAD=bad))}
         assert got.pop('w05') == 'unknown'; want.pop('w05')
         assert got == want, 'the other agents keep their status'
+        e = cli('session', 'explain', 'w05', env=dict(ENV, BAD=bad))
+        assert e['status'] == 'unknown' and e['rule'].startswith('capture failed:') and e['considered_rows'] == [], e
     case('a pane that cannot be read is unknown; the others are not blanked', one_gone)
     json.dump(results, open(a.report, 'w'), indent=2)
 finally:

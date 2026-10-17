@@ -6,7 +6,7 @@ import argparse, json, os, pathlib, shutil, subprocess, tempfile, time
 p = argparse.ArgumentParser(); p.add_argument('--bin', required=True); p.add_argument('--tmux', required=True); p.add_argument('--report', required=True); a = p.parse_args()
 B = str(pathlib.Path(a.bin).resolve()); T = str(pathlib.Path(a.tmux).resolve())
 root = pathlib.Path(tempfile.mkdtemp(prefix='pctl-input-', dir=os.path.realpath('/tmp'))); state = root / 's'; V = root / 'v.sock'; log = root / 'typed'; results = []
-ENV = {k: v for k, v in os.environ.items() if not k.startswith(('PCTL_', 'TMUX', 'XDG_CONFIG'))}
+ENV = {k: v for k, v in os.environ.items() if not k.startswith(('PCTL_', 'TMUX', 'XDG_CONFIG', 'NO_COLOR'))}
 ENV.update(XDG_CONFIG_HOME=str(root / 'no-config'), TERM='xterm-256color', SHELL='/bin/bash', PS1='$ ', PCTL_STANDALONE='1')
 def vt(*args): return subprocess.run([T, '-S', str(V), *map(str, args)], text=True, capture_output=True, timeout=10).stdout
 def st(*args): return subprocess.run([T, '-S', str(state / 'tmux.sock'), *map(str, args)], text=True, capture_output=True, timeout=10).stdout.strip()

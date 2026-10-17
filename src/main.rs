@@ -416,6 +416,10 @@ enum WorktreeCmd {
 }
 #[derive(Subcommand)]
 enum SessionCmd {
+    /// Explain the screen status, matching rule and considered rows (1-based screen rows).
+    Explain {
+        name: String,
+    },
     /// Every registered session with process, screen status and conversation ID.
     List,
     Get {
@@ -952,6 +956,7 @@ fn run() -> Result<()> {
         },
         Cmd::Session { cmd } => match cmd {
             SessionCmd::List => print(&core.session_list()?)?,
+            SessionCmd::Explain { name } => print(&core.session_explain(&name)?)?,
             SessionCmd::Get { name } => print(&core.session_get(&name)?)?,
             SessionCmd::Add {
                 name,

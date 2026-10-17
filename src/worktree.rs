@@ -76,6 +76,17 @@ fn same(a: &str, b: &Path) -> bool {
     let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     canon(Path::new(a)) == canon(b)
 }
+fn no_symlinks(path: &Path) -> Result<bool> {
+    for component in path.ancestors() {
+        match fs::symlink_metadata(component) {
+            Ok(meta) if meta.file_type().is_symlink() => return Ok(false),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("checking {}", component.display())),
+        }
+    }
+    Ok(true)
+}
 fn first_lines(s: &str) -> String {
     let lines: Vec<_> = s.lines().collect();
     let more = lines.len().saturating_sub(5);
@@ -291,7 +302,7 @@ impl Core {
         // Any symlink on the way (the folder itself or a parent): git would answer for wherever it
         // points, so the wrong folder's record could move.
         ensure!(
-            fs::canonicalize(path).map_or(true, |c| c == path),
+            no_symlinks(path)?,
             "symlink: {} now goes through a symbolic link; nothing removed",
             a.cwd
         );
@@ -382,6 +393,22 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unicode_paths_allow_normalization_but_never_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let nfd = root.join("cafe\u{301}");
+        fs::create_dir(&nfd).unwrap();
+        fs::create_dir(nfd.join("child")).unwrap();
+        assert!(no_symlinks(&nfd.join("child")).unwrap());
+        #[cfg(target_os = "macos")]
+        assert!(no_symlinks(&root.join("café/child")).unwrap());
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&nfd, &link).unwrap();
+        assert!(!no_symlinks(&link).unwrap());
+        assert!(!no_symlinks(&link.join("child")).unwrap());
+        assert!(!no_symlinks(&link.join("missing")).unwrap());
+    }
     #[test]
     fn model_goes_into_a_private_server_environment() {
         let v = with_model(vec!["/bin/opencode".into()], "opencode/glm-5.3-flash-free").unwrap();
