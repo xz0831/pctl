@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Build the offline "lite" ZIP: static binary, installer, quick start, smoke test, licenses, checksums.
-# Usage: scripts/package-lite.sh [target]   (default x86_64-unknown-linux-musl; needs `rustup target add`)
-# Output: dist/pctl-lite-<version>-<target>.zip and .zip.sha256. Refuses to overwrite.
+# Build the offline install ZIP: static binary, installer, quick start, smoke test, licenses, checksums.
+# Usage: scripts/package.sh [target]   (default x86_64-unknown-linux-musl; needs `rustup target add`)
+# Output: dist/pctl-<version>-<target>.zip and .zip.sha256. Refuses to overwrite.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 target=${1:-x86_64-unknown-linux-musl}
 ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-name=pctl-lite-$ver-$target
+name=pctl-$ver-$target
 zip=$PWD/dist/$name.zip
 [ ! -e "$zip" ] || { echo "$zip exists; move it away first" >&2; exit 1; }
 # Panic locations embed source paths; keep home and checkout paths out of the binary.
@@ -19,12 +19,12 @@ cargo build --release --locked --target "$target"
 stage=$(mktemp -d)/$name
 mkdir -p "$stage/bin"
 cp "target/$target/release/pctl" "$stage/bin/pctl"
-cp LICENSE THIRD_PARTY_NOTICES.txt lite/QUICKSTART.md lite/install.sh lite/pctl.env.example "$stage/"
-cp scripts/lite-smoke.sh "$stage/smoke.sh"
+cp LICENSE THIRD_PARTY_NOTICES.txt packaging/QUICKSTART.md packaging/install.sh packaging/pctl.env.example "$stage/"
+cp scripts/smoke.sh "$stage/smoke.sh"
 chmod 755 "$stage/bin/pctl" "$stage/install.sh" "$stage/smoke.sh"
 dirty=$(git status --porcelain --untracked-files=no | grep -q . && echo " (uncommitted changes)" || true)
 cat >"$stage/BUILDINFO.txt" <<EOF
-pctl lite $ver
+pctl $ver
 target: $target
 source: $(git rev-parse HEAD)$dirty
 rustc: $(rustc -V)
