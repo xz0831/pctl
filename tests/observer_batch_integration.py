@@ -2,7 +2,7 @@
 """`pctl session list` reads every agent's screen and title in one tmux call per 16 agents (the app's
 observer runs it every 1.5 s). Same answer as asking one agent at a time (`session get`), also with more
 than 16 agents; a pane that cannot be read fails the batch, and then each agent is asked on its own, so
-one gone pane is `unknown` and never blanks the others. Stopped agents cost no call."""
+one gone pane is `unknown` and never blanks the others. Stopped agents cost no screen call; build PATH is shared per project."""
 import argparse, json, os, pathlib, subprocess, tempfile, time
 p = argparse.ArgumentParser(); p.add_argument('--bin', required=True); p.add_argument('--tmux', required=True); p.add_argument('--report', required=True); a = p.parse_args()
 B = str(pathlib.Path(a.bin).resolve()); T = str(pathlib.Path(a.tmux).resolve())

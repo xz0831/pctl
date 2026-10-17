@@ -462,6 +462,16 @@ enum WorktreeCmd {
 }
 #[derive(Subcommand)]
 enum SessionCmd {
+    /// Swap an idle, stale Claude session to its installed build, preserving its conversation.
+    Refresh {
+        name: String,
+    },
+    /// Hold this session out of refresh until --off.
+    Protect {
+        name: String,
+        #[arg(long)]
+        off: bool,
+    },
     /// Explain the screen status, matching rule and considered rows (1-based screen rows).
     Explain {
         name: String,
@@ -975,6 +985,8 @@ fn run() -> Result<()> {
             } => print(&core.peers(&agent, &expected_run)?)?,
         },
         Cmd::Session { cmd } => match cmd {
+            SessionCmd::Refresh { name } => print(&core.session_refresh(&name)?)?,
+            SessionCmd::Protect { name, off } => print(&core.session_protect(&name, off)?)?,
             SessionCmd::List => print(&core.session_list()?)?,
             SessionCmd::Explain { name } => print(&core.session_explain(&name)?)?,
             SessionCmd::Get { name } => {

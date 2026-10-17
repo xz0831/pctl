@@ -104,6 +104,8 @@ try:
     def two_agents():
         click(*side('b-main'))
         assert until(lambda: tpos('b-main') >= 0 and 'ready L in b-main' in screen()), screen()
+        assert until(lambda: all('app_visible' in cli('session', 'get', n)['swap_blockers'] for n in ('a-main', 'b-main')))
+        assert 'app_visible' not in cli('session', 'get', 'a-two')['swap_blockers']
         say('b-main', 'to-b')
         assert 'to-b' not in read('a-main'), 'typed into the focused cell only'
         keys('C-b', 'Left'); say('a-main', 'to-a')
@@ -168,6 +170,8 @@ try:
         keys('C-b', 'z')
         assert until(lambda: 'zoomed' in status() and size('a-main') == f'{COLS - SIDE}x{ROWS - 2}'), (status(), size('a-main'))
         assert '│' not in cells()[5] and tpos('a-main') < 0 and tpos('b-main') < 0, titles()
+        assert until(lambda: 'app_visible' not in cli('session', 'get', 'b-main')['swap_blockers'])
+        assert 'app_visible' in cli('session', 'get', 'a-main')['swap_blockers']
         say('a-main', 'while-zoomed'); keys('C-b', 'z')
         assert until(lambda: 'zoomed' not in status() and tpos('b-main') >= 0), (status(), titles())
         assert size('a-main') != f'{COLS - SIDE}x{ROWS - 2}'

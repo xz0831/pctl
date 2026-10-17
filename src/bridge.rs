@@ -68,6 +68,7 @@ pub fn run(core: &Core) -> Result<()> {
         writeln!(out, "{}", answer(id, result))?;
         out.flush()?;
     }
+    core.set_app_viewed(&[])?;
     Ok(())
 }
 
@@ -88,6 +89,12 @@ fn op(
         .and_then(Value::as_str)
         .context("missing op")?
     {
+        "view" => {
+            let runs: Vec<String> = serde_json::from_value(req["runs"].clone())?;
+            ensure!(runs.len() <= 256, "too many viewed runs");
+            core.set_app_viewed(&runs)?;
+            Ok(json!({"viewed":runs.len()}))
+        }
         "list" => list(core),
         "doc_read" => core.doc_read(text("doc")?),
         "screen" => screen(core, text("agent")?, text("run")?, req, asked),
