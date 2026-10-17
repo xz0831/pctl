@@ -333,11 +333,13 @@ Mouse (SGR mouse reporting):
 - An open dialog takes every click; nothing behind it reacts.
 - The wheel over the terminal scrolls back (`capture-pane -S/-E`). Any key returns to live.
 - Dragging the sidebar edge resizes it.
+- The terminal area can be split into cells (a tree of splits, at most 16 cells). Each cell has a one-row title `<computer> · <agent> <state>` (the computer only when machines are saved), its own screen, scroll and read schedule, and its agent's tmux window is resized to the cell. An agent is shown in at most one cell. Typing, paste and the shortcuts act on the focused cell; a click focuses a cell, a drag selects inside one cell, the wheel acts on the cell under the pointer. Dragging a divider resizes; a divider's line is a column between side-by-side cells, or the title row of the lower cell. With one cell nothing is drawn but the terminal itself, as before. These are views only: agents keep one tmux window each, and closing a cell stops nothing.
 
 Shortcuts:
 - Defaults are a prefix (`ctrl+b`) and a key: `c` new bash tab, `a` new agent, `shift+c` new project, `n`/`p` tabs, `1`–`9` tab N, `x` stop, `r` restart, `b` sidebar, `w` keyboard sidebar, `?` help, `q` leave. Prefix twice sends the prefix to the session.
+  - Cells: `%` split right, `"` split down, `&` close the cell (never the agent), arrows move the focus, `alt`+arrows move a divider by 5 %, `{`/`}` swap with the previous/next cell, `z` zoom.
 - Override them in `$XDG_CONFIG_HOME/pctl/config.toml` or `~/.config/pctl/config.toml`, under `[keys]`, with `name = "key"`.
-  - Names: `prefix`, `new_tab`, `new_agent`, `new_project`, `next_tab`, `prev_tab`, `stop_agent`, `restart_agent`, `toggle_sidebar`, `focus_sidebar`, `help`, `detach`, `image_paste`.
+  - Names: `prefix`, `new_tab`, `new_agent`, `new_project`, `next_tab`, `prev_tab`, `stop_agent`, `restart_agent`, `toggle_sidebar`, `focus_sidebar`, `help`, `detach`, `split_right`, `split_down`, `close_cell`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `resize_left`, `resize_right`, `resize_up`, `resize_down`, `swap_prev`, `swap_next`, `zoom`, `image_paste`.
   - Keys look like `ctrl+b`, `alt+right`, `shift+c`, `f2` or `?`; a `prefix+` in front means after the prefix.
 - Unknown names and bad keys are reported in the status line, and the default is kept. An empty value (`image_paste = ""`) turns a shortcut off.
 - `image_paste` (default `ctrl+v`): with an agent of another computer on screen, an image on this computer's clipboard is sent to that computer's clipboard (PNG, at most 20 MB), then `ctrl+v` goes to the agent, so Claude Code there pastes it. With no image, or for an agent on this computer, it is an ordinary `ctrl+v`. Text needs no key: pasting (`⌘V`) already reaches agents on other computers. It reads the clipboard with `osascript` (macOS), `wl-paste` or `xclip`; the other computer sets it with the same tools.
@@ -359,7 +361,7 @@ Themes:
 - `[ui]` with `wit = false` in `config.toml` replaces the jokes with plain text (loading, empty screens, the stop question's last clause, tips, goodbye).
 
 Other behaviour:
-- The last project and tabs are kept in `<state>/app-view.json`.
+- The last project, its tabs and each project's cells (with the computer of each agent) are kept in `<state>/app-view.json`. A file from before cells loads as one cell per project.
 - Leaving the app stops nothing.
 - The app never starts a server. Adding a session goes through `session add`, which keeps its own server-start rule.
 

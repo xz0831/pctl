@@ -30,10 +30,24 @@ pub enum Action {
     Help,
     Detach,
     ImagePaste,
+    SplitRight,
+    SplitDown,
+    CloseCell,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    SwapPrev,
+    SwapNext,
+    Zoom,
 }
 
 /// Name in the config file, default key, and what the help screen says.
-pub const ACTIONS: [(&str, &str, Action, &str); 14] = [
+pub const ACTIONS: [(&str, &str, Action, &str); 28] = [
     (
         "new_tab",
         "prefix+c",
@@ -97,6 +111,90 @@ pub const ACTIONS: [(&str, &str, Action, &str); 14] = [
         "ctrl+v",
         Action::ImagePaste,
         "Paste an image copied here into an agent on another computer",
+    ),
+    (
+        "split_right",
+        "prefix+%",
+        Action::SplitRight,
+        "Split the cell: a new one on the right",
+    ),
+    (
+        "split_down",
+        "prefix+\"",
+        Action::SplitDown,
+        "Split the cell: a new one below",
+    ),
+    (
+        "close_cell",
+        "prefix+&",
+        Action::CloseCell,
+        "Close this cell (the agent keeps running)",
+    ),
+    (
+        "focus_left",
+        "prefix+left",
+        Action::FocusLeft,
+        "Focus the cell on the left",
+    ),
+    (
+        "focus_right",
+        "prefix+right",
+        Action::FocusRight,
+        "Focus the cell on the right",
+    ),
+    (
+        "focus_up",
+        "prefix+up",
+        Action::FocusUp,
+        "Focus the cell above",
+    ),
+    (
+        "focus_down",
+        "prefix+down",
+        Action::FocusDown,
+        "Focus the cell below",
+    ),
+    (
+        "resize_left",
+        "prefix+alt+left",
+        Action::ResizeLeft,
+        "Move the divider left by 5%",
+    ),
+    (
+        "resize_right",
+        "prefix+alt+right",
+        Action::ResizeRight,
+        "Move the divider right by 5%",
+    ),
+    (
+        "resize_up",
+        "prefix+alt+up",
+        Action::ResizeUp,
+        "Move the divider up by 5%",
+    ),
+    (
+        "resize_down",
+        "prefix+alt+down",
+        Action::ResizeDown,
+        "Move the divider down by 5%",
+    ),
+    (
+        "swap_prev",
+        "prefix+{",
+        Action::SwapPrev,
+        "Swap this cell with the previous one",
+    ),
+    (
+        "swap_next",
+        "prefix+}",
+        Action::SwapNext,
+        "Swap this cell with the next one",
+    ),
+    (
+        "zoom",
+        "prefix+z",
+        Action::Zoom,
+        "Show this cell full-size, and back",
     ),
 ];
 
@@ -394,5 +492,50 @@ mod tests {
         );
         assert_eq!(off.label(Action::ImagePaste), "");
         assert_eq!(d.label(Action::NewProject), "ctrl+b shift+c");
+    }
+    #[test]
+    fn the_cell_commands_have_their_own_keys() {
+        let d = Keymap::defaults();
+        let prefixed = |code, mods| d.action(true, &ev(code, mods));
+        let none = KeyModifiers::NONE;
+        assert_eq!(prefixed(KeyCode::Char('%'), none), Some(Action::SplitRight));
+        assert_eq!(
+            prefixed(KeyCode::Char('%'), KeyModifiers::SHIFT),
+            Some(Action::SplitRight)
+        );
+        assert_eq!(prefixed(KeyCode::Char('"'), none), Some(Action::SplitDown));
+        assert_eq!(prefixed(KeyCode::Char('&'), none), Some(Action::CloseCell));
+        assert_eq!(
+            prefixed(KeyCode::Char('x'), none),
+            Some(Action::StopAgent),
+            "x still stops"
+        );
+        assert_eq!(prefixed(KeyCode::Left, none), Some(Action::FocusLeft));
+        assert_eq!(prefixed(KeyCode::Down, none), Some(Action::FocusDown));
+        assert_eq!(
+            prefixed(KeyCode::Left, KeyModifiers::ALT),
+            Some(Action::ResizeLeft)
+        );
+        assert_eq!(
+            prefixed(KeyCode::Up, KeyModifiers::ALT),
+            Some(Action::ResizeUp)
+        );
+        assert_eq!(prefixed(KeyCode::Char('{'), none), Some(Action::SwapPrev));
+        assert_eq!(prefixed(KeyCode::Char('}'), none), Some(Action::SwapNext));
+        assert_eq!(prefixed(KeyCode::Char('z'), none), Some(Action::Zoom));
+        assert_eq!(d.label(Action::ResizeRight), "ctrl+b alt+right");
+        // No two commands share a key.
+        for (i, (_, a, ..)) in ACTIONS.iter().enumerate() {
+            for (_, b, ..) in &ACTIONS[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // They can be moved like the others.
+        let (m, warn) = Keymap::from_pairs(&section("[keys]\nclose_cell = \"prefix+k\"\n", "keys"));
+        assert!(warn.is_empty(), "{warn:?}");
+        assert_eq!(
+            m.action(true, &ev(KeyCode::Char('k'), none)),
+            Some(Action::CloseCell)
+        );
     }
 }

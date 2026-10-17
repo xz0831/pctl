@@ -77,6 +77,14 @@ Shortcuts: press `ctrl+b`, then:
 - `?`: help
 - `q`: leave
 
+Split the terminal area into cells, each with its own agent (from any computer). `ctrl+b`, then:
+- `%` / `"`: split right / down. The new cell is empty: pick an agent in the sidebar or a tab, and it goes into the focused cell. An agent already in a cell is focused instead, never shown twice.
+- arrows: focus the cell on that side. `alt` + arrow: move the divider 5 %. Dragging a divider with the mouse works too.
+- `{` / `}`: swap with the previous / next cell. `z`: show the cell full-size, and back.
+- `&`: close the cell. The agent keeps running; the last cell cannot be closed.
+
+Typing and paste go to the focused cell; a click focuses a cell; the wheel works on the cell under the pointer. Each project keeps its own cells.
+
 Change them in `~/.config/pctl/config.toml` (or under `$XDG_CONFIG_HOME`):
 
 ```toml
