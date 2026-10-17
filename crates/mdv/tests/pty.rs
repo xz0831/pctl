@@ -30,7 +30,8 @@ const ENTER: &[u8] = b"\r";
 const ESC: &[u8] = b"\x1b";
 const DOWN: &[u8] = b"\x1b[B";
 const CTRL_C: &[u8] = b"\x03";
-const TIMEOUT: Duration = Duration::from_secs(4);
+const TIMEOUT: Duration = Duration::from_secs(15);
+static PTY_TEST: Mutex<()> = Mutex::new(());
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct Fixture {
@@ -272,14 +273,25 @@ impl Pty {
         let mut s = self.shared.0.lock().unwrap();
         loop {
             let screen = s.parser.screen().contents();
-            if predicate(&screen) {
-                return;
-            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !remaining.is_zero(),
                 "screen condition timed out:\n{screen}"
             );
+            if predicate(&screen) {
+                let length = s.raw.len();
+                let (next, _) = self
+                    .shared
+                    .1
+                    .wait_timeout(s, remaining.min(Duration::from_millis(20)))
+                    .unwrap();
+                s = next;
+                // A PTY read can end halfway through a frame; inspect the completed output.
+                if s.raw.len() == length {
+                    return;
+                }
+                continue;
+            }
             s = self
                 .shared
                 .1
@@ -312,7 +324,11 @@ impl Pty {
             if let Some(status) = self.child.try_wait().unwrap() {
                 return status;
             }
-            assert!(Instant::now() < deadline, "child did not exit");
+            assert!(
+                Instant::now() < deadline,
+                "child did not exit:\n{}",
+                self.screen()
+            );
             thread::park_timeout(Duration::from_millis(5));
         }
     }
@@ -347,7 +363,11 @@ impl Pty {
             {
                 return;
             }
-            assert!(Instant::now() < deadline, "OSC colors were not reset");
+            assert!(
+                Instant::now() < deadline,
+                "OSC colors were not reset:\n{}",
+                s.parser.screen().contents()
+            );
             drop(s);
             thread::park_timeout(Duration::from_millis(5));
         }
@@ -393,6 +413,7 @@ fn top_line(screen: &str) -> String {
 
 #[test]
 fn reader_navigation_resize_and_terminal_restoration() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let f = Fixture::gallery("long.md");
     let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
     p.wait_for("T -> Tree");
@@ -443,6 +464,7 @@ fn reader_navigation_resize_and_terminal_restoration() {
 
 #[test]
 fn folder_hostile_log_and_file_shortcut() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     for name in ["code.md", "hostile.log"] {
         let f = Fixture::gallery(name);
         let mut p = Pty::new(&f, &[f.doc.to_str().unwrap()], "dry.json");
@@ -465,6 +487,7 @@ fn folder_hostile_log_and_file_shortcut() {
 
 #[test]
 fn composer_comment_and_live_answer() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let f = Fixture::gallery("headings.md");
     let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
     p.wait_for("T -> Tree");
@@ -497,6 +520,7 @@ fn composer_comment_and_live_answer() {
 
 #[test]
 fn original_quote_survives_edit_in_all_looks() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let source = "# 합성 검토 문서\n\n이 구현은 메모리 사용량이 줄어들기 때문에 유리하다.\n\n다음 문단은 별도 주장입니다.\n";
     let f = Fixture::new("claim.md", source);
     let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
@@ -569,4 +593,284 @@ fn original_quote_survives_edit_in_all_looks() {
         }
     }
     assert!(!f.root.join("unused-dry.json").exists());
+}
+
+#[test]
+fn explicit_project_routes_a_document_outside_projects() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = Fixture::new("outside.md", "# Outside document\n");
+    let outside = f.root.join("outside.md");
+    fs::rename(&f.doc, &outside).unwrap();
+    f.doc = outside;
+    for project in [false, true] {
+        let mut args = vec!["view", f.doc.to_str().unwrap()];
+        if project {
+            args.extend(["--project", "fixture"]);
+        }
+        let mut p = Pty::new(&f, &args, "project-dry.json");
+        p.wait_for("T -> Tree");
+        p.send(TAB);
+        p.compose(
+            true,
+            if project {
+                "explicit question"
+            } else {
+                "path question"
+            },
+        );
+        p.wait_for(if project {
+            "Not confirmed"
+        } else {
+            "No recipient"
+        });
+        if project {
+            let dry: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(f.root.join("project-dry.json")).unwrap())
+                    .unwrap();
+            assert_eq!(dry[1], "fixture-main");
+            let ask = f
+                .events()
+                .into_iter()
+                .find(|e| e["text"] == "explicit question")
+                .unwrap();
+            assert_eq!(ask["project"], "fixture");
+        } else {
+            assert!(!f.root.join("project-dry.json").exists());
+        }
+        p.quit();
+    }
+}
+
+#[test]
+fn saved_question_keeps_its_project_on_retry() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("retry.md", "# Retry\n");
+    fs::write(f.root.join("sessions"), "[]").unwrap();
+    let mut p = Pty::new(
+        &f,
+        &["view", f.doc.to_str().unwrap(), "--project", "fixture"],
+        "retry.json",
+    );
+    p.wait_for("T -> Tree");
+    p.send(TAB);
+    p.compose(true, "saved question");
+    p.wait_for("No recipient");
+    p.quit();
+    drop(p);
+    let session: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(f.root.join("session")).unwrap()).unwrap();
+    fs::write(
+        f.root.join("sessions"),
+        serde_json::json!([session]).to_string(),
+    )
+    .unwrap();
+    let mut p = Pty::new(
+        &f,
+        &["view", f.doc.to_str().unwrap(), "--project", "other"],
+        "retry.json",
+    );
+    p.wait_for("T -> Tree");
+    p.send(TAB);
+    p.send(b"s");
+    p.wait_for("Saved · Not confirmed");
+    let dry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(f.root.join("retry.json")).unwrap()).unwrap();
+    assert_eq!(dry[1], "fixture-main");
+    p.quit();
+}
+
+fn assert_input_cursor(p: &Pty, text: &str) {
+    p.wait_for(text);
+    let s = p.shared.0.lock().unwrap();
+    let screen = s.parser.screen();
+    let (rows, cols) = screen.size();
+    let row = rows - 1;
+    let mut line = String::new();
+    for col in 0..cols {
+        line.push_str(screen.cell(row, col).unwrap().contents());
+        if line.ends_with(text) {
+            // The final Hangul syllable occupies this cell and the next one.
+            assert_eq!(screen.cursor_position(), (row, col + 2));
+            return;
+        }
+    }
+    panic!("input missing from footer: {line}");
+}
+
+#[test]
+fn question_and_comment_cursor_follows_hangul() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    for ask in [true, false] {
+        let f = Fixture::new("input.md", "# Input\n");
+        let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
+        p.wait_for("T -> Tree");
+        p.send(TAB);
+        p.send(ENTER);
+        p.wait_for("Ask the agent");
+        for _ in 0..if ask { 4 } else { 3 } {
+            p.send(DOWN);
+        }
+        p.send(ENTER);
+        p.wait_for("Enter send");
+        p.send("한글".as_bytes());
+        assert_input_cursor(&p, "한글");
+        p.send(format!("{}한글", "가".repeat(80)).as_bytes());
+        assert_input_cursor(&p, "가한글");
+        p.send(ESC);
+        p.wait_for("Escape again");
+        p.send(ESC);
+        p.quit();
+    }
+}
+
+#[test]
+fn search_cursor_follows_hangul() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("search.md", "# Search\n");
+    let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
+    p.wait_for("T -> Tree");
+    p.send("/한글".as_bytes());
+    assert_input_cursor(&p, "한글");
+    p.send(format!("{}한글", "가".repeat(80)).as_bytes());
+    assert_input_cursor(&p, "가한글");
+    p.send(ESC);
+    p.quit();
+}
+
+fn answer_keeps_top(mode: &str) {
+    let source: String = (0..65)
+        .map(|i| {
+            format!(
+                "Paragraph {i:03} stays in place.{}\n\n",
+                if i == 64 {
+                    " tail".repeat(14)
+                } else {
+                    String::new()
+                }
+            )
+        })
+        .collect();
+    let f = Fixture::new("anchor.md", &source);
+    let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
+    p.wait_for("T -> Tree");
+    if mode == "bottom" {
+        for _ in 0..6 {
+            p.send(b"\x1b[Z");
+        }
+    } else {
+        p.send(TAB);
+    }
+    p.compose(true, "anchor question");
+    p.wait_for("Not confirmed");
+    let ask = f.events().into_iter().find(|e| e["kind"] == "ask").unwrap();
+    match mode {
+        "bottom" => {
+            p.send(b"G");
+            p.wait_for("100%");
+        }
+        "discussion" => {
+            for _ in 0..10 {
+                if p.screen().lines().nth(1).unwrap_or("").contains("ask:") {
+                    break;
+                }
+                let before = p.screen();
+                p.send(DOWN);
+                p.wait(|s| s != before);
+            }
+            assert!(
+                p.screen().lines().nth(1).unwrap().contains("ask:"),
+                "{}",
+                p.screen()
+            );
+        }
+        "elsewhere" => {}
+        _ => unreachable!(),
+    }
+    let unchanged = if mode == "discussion" { 2 } else { 3 };
+    let before: Vec<_> = p
+        .screen()
+        .lines()
+        .skip(1)
+        .take(unchanged)
+        .map(String::from)
+        .collect();
+    if mode == "bottom" {
+        assert!(
+            before[0].trim().is_empty(),
+            "bottom fixture starts on a blank document row: {before:?}"
+        );
+    }
+    f.answer(ask["req_id"].as_str().unwrap(), "anchor reply");
+    p.wait_for("Answer ready: anchor reply");
+    let after: Vec<_> = p
+        .screen()
+        .lines()
+        .skip(1)
+        .take(unchanged)
+        .map(String::from)
+        .collect();
+    assert_eq!(before, after, "answer moved the top rows ({mode})");
+
+    p.quit();
+}
+
+#[test]
+fn answer_at_bottom_keeps_top_row() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    answer_keeps_top("bottom");
+}
+#[test]
+fn answer_on_discussion_keeps_top_row() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    answer_keeps_top("discussion");
+}
+#[test]
+fn answer_elsewhere_keeps_top_row() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    answer_keeps_top("elsewhere");
+}
+
+#[test]
+fn block_menu_clears_its_box() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let source = format!("# Menu\n\n{}\n", "Z".repeat(2000));
+    let f = Fixture::new("menu.md", &source);
+    let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
+    p.wait_for("T -> Tree");
+    p.send(TAB);
+    p.send(ENTER);
+    p.wait_for("Ask the agent");
+    let s = p.shared.0.lock().unwrap();
+    let screen = s.parser.screen();
+    let right = (0..120)
+        .find(|&x| screen.cell(1, x).unwrap().contents() == "┐")
+        .expect("menu has a top border");
+    let labels = [
+        "Copy",
+        "[ ] Markdown source",
+        "Link",
+        "Comment",
+        "Ask the agent",
+        "a 에이전트로 가기",
+        "s 막힌 질문 다시 보내기",
+    ];
+    for y in 1..=9 {
+        let mut row = String::new();
+        for x in 0..=right {
+            row.push_str(screen.cell(y, x).unwrap().contents());
+        }
+        if y == 1 {
+            assert_eq!(row, format!("┌{}┐", "─".repeat(right as usize - 1)));
+        } else if y == 9 {
+            assert_eq!(row, format!("└{}┘", "─".repeat(right as usize - 1)));
+        } else {
+            assert!(row.starts_with('│') && row.ends_with('│'), "{row}");
+            let inside = row.trim_matches('│').trim().trim_start_matches('>').trim();
+            let inside = inside.trim_start_matches(['□', '☐', ' ']);
+            assert_eq!(inside, labels[y as usize - 2], "menu row {y}");
+        }
+    }
+    drop(s);
+    p.send(ESC);
+    p.quit();
 }

@@ -117,6 +117,9 @@ enum Cmd {
     /// agent about a passage. Needs an interactive terminal.
     View {
         path: PathBuf,
+        /// Project whose main receives questions; defaults to the document path.
+        #[arg(long)]
+        project: Option<String>,
         /// portal or garage.
         #[arg(long, value_parser = ["portal", "garage"])]
         look: Option<String>,
@@ -1252,6 +1255,7 @@ fn run() -> Result<()> {
         }
         Cmd::View {
             path,
+            project,
             look,
             dark,
             remote,
@@ -1259,6 +1263,7 @@ fn run() -> Result<()> {
             &core,
             &path,
             mdv::view::ViewOptions {
+                project,
                 look: look.map(|l| match l.as_str() {
                     "garage" => mdv::Look::Garage,
                     _ => mdv::Look::Portal,

@@ -15,6 +15,7 @@ fn event() -> Event {
         req_id: new_id(),
         path: "/synthetic.md".into(),
         feed_id: None,
+        project: None,
         block_id: 0,
         range: [0, 1],
         fingerprint: "ab".into(),

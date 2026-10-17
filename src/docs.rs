@@ -152,7 +152,15 @@ pub fn is_viewer(argv: &[String]) -> bool {
     match argv {
         [exe, view, _, rest @ ..] => {
             view == "view"
-                && (rest.is_empty() || rest == ["--remote"])
+                && match rest {
+                    [] => true,
+                    [remote] => remote == "--remote",
+                    [flag, name] => flag == "--project" && !name.is_empty(),
+                    [flag, name, remote] => {
+                        flag == "--project" && !name.is_empty() && remote == "--remote"
+                    }
+                    _ => false,
+                }
                 && Path::new(exe).file_stem().is_some_and(|n| n == "pctl")
         }
         _ => false,
@@ -363,6 +371,9 @@ impl Core {
                 };
                 let exe = std::env::current_exe()?.to_string_lossy().into_owned();
                 let mut argv = vec![exe, "view".into(), canon.to_string_lossy().into_owned()];
+                if !doc.project.is_empty() {
+                    argv.extend(["--project".into(), doc.project.clone()]);
+                }
                 // Asked over ssh: the person is at another computer, so no clipboard command here.
                 if std::env::var_os("SSH_CONNECTION").is_some() {
                     argv.push("--remote".into());
@@ -419,6 +430,40 @@ mod tests {
         let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(is_viewer(&argv(&["/bin/pctl", "view", "/d/a.md"])));
         assert!(is_viewer(&argv(&["pctl", "view", "/d/a.md", "--remote"])));
+        assert!(is_viewer(&argv(&[
+            "pctl",
+            "view",
+            "/d/a.md",
+            "--project",
+            "demo"
+        ])));
+        assert!(is_viewer(&argv(&[
+            "pctl",
+            "view",
+            "/d/a.md",
+            "--project",
+            "demo",
+            "--remote"
+        ])));
+        assert!(!is_viewer(&argv(&["pctl", "view", "/d/a.md", "--project"])));
+        assert!(!is_viewer(&argv(&[
+            "pctl",
+            "view",
+            "/d/a.md",
+            "--project",
+            ""
+        ])));
+        assert!(!is_viewer(&argv(&[
+            "pctl",
+            "view",
+            "/d/a.md",
+            "--remote",
+            "--project",
+            "demo"
+        ])));
+        assert!(!is_viewer(&argv(&[
+            "pctl", "view", "/d/a.md", "--look", "portal"
+        ])));
         assert!(!is_viewer(&argv(&["pctl", "view", "/d/a.md", "--dark"])));
         assert!(!is_viewer(&argv(&["claude", "view", "x"])));
         assert!(!is_viewer(&argv(&["pctl", "show", "x"])));

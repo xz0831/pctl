@@ -34,6 +34,7 @@ pub use mdv::threads::{AskHook, AskOutcome, AskRequest};
 
 #[derive(Default)]
 pub struct ViewOptions {
+    pub project: Option<String>,
     pub look: Option<mdv::Look>,
     pub dark: bool,
 }
@@ -342,6 +343,7 @@ struct App {
     src: String,
     layout: Layout,
     path: PathBuf,
+    project: Option<String>,
     tree: PathBuf,
     entries: Vec<PathBuf>,
     inbox: Inbox,
@@ -401,6 +403,7 @@ impl App {
             src: String::new(),
             layout,
             path: absolute.clone(),
+            project: None,
             tree,
             entries: Vec::new(),
             inbox: Inbox::default(),
@@ -511,14 +514,24 @@ impl App {
         self.layout.rows.len().saturating_sub(self.height())
     }
     fn rewrap(&mut self) {
-        let anchor_row = (self.state.top..self.layout.rows.len())
-            .find(|&i| !self.layout.rows[i].discussion)
-            .unwrap_or(self.state.top);
-        let anchor = self.layout.anchor(anchor_row);
+        let row = self.layout.rows.get(self.state.top).cloned();
+        let anchor = self.layout.anchor(self.state.top);
         self.layout = Layout::new(&self.doc, &self.src, self.width(), &self.style);
         self.insert_threads();
-        if let Some(p) = anchor {
-            self.state.top = self.layout.row_for(p).min(self.max_top());
+        if let Some(row) = row {
+            let exact = self.layout.rows.iter().position(|r| {
+                if row.discussion {
+                    r.thread == row.thread
+                } else {
+                    !r.discussion
+                        && r.line.block_id == row.line.block_id
+                        && r.range == row.range
+                        && r.line.plain == row.line.plain
+                }
+            });
+            if let Some(top) = exact.or_else(|| anchor.map(|p| self.layout.row_for(p))) {
+                self.state.top = top.min(self.max_top());
+            }
         }
     }
     fn insert_threads(&mut self) {
@@ -526,14 +539,19 @@ impl App {
         let original = std::mem::take(&mut self.layout.rows);
         let append = |rows: &mut Vec<mdv::reader::Row>,
                       e: &mdv::threads::Event,
+                      event: usize,
                       block_id: usize,
                       changed: bool| {
-            for mut line in mdv::threads::lines(e, changed, self.width(), &self.style) {
+            for (offset, mut line) in mdv::threads::lines(e, changed, self.width(), &self.style)
+                .into_iter()
+                .enumerate()
+            {
                 line.block_id = block_id;
                 rows.push(mdv::reader::Row {
                     line,
                     range: 0..0,
                     discussion: true,
+                    thread: Some((event, offset)),
                 });
             }
         };
@@ -545,20 +563,21 @@ impl App {
             {
                 continue;
             }
-            for e in self.threads.iter().filter(|e| {
+            for (event, e) in self.threads.iter().enumerate().filter(|(_, e)| {
                 e.path == self.path.to_string_lossy()
                     && mdv::threads::target(e, &self.doc) == Some(row.line.block_id)
             }) {
-                append(&mut rows, e, row.line.block_id, false);
+                append(&mut rows, e, event, row.line.block_id, false);
             }
         }
         // Detached history survives even if the entire current document is empty.
-        for e in self.threads.iter().filter(|e| {
+        for (event, e) in self.threads.iter().enumerate().filter(|(_, e)| {
             e.path == self.path.to_string_lossy() && mdv::threads::target(e, &self.doc).is_none()
         }) {
             append(
                 &mut rows,
                 e,
+                event,
                 self.doc.blocks.last().map_or(0, |b| b.id),
                 true,
             );
@@ -624,6 +643,7 @@ impl App {
         let mut event = mdv::threads::Event {
             kind,
             req_id: mdv::threads::new_id(),
+            project: Some(self.project()),
             feed_id: mdv::threads::feed(&path).and_then(|v| v["id"].as_str().map(String::from)),
             path,
             block_id: block.id,
@@ -674,9 +694,17 @@ impl App {
         self.message = "Saving".into();
         Ok(())
     }
+    fn project(&self) -> String {
+        self.project
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| mdv::threads::project(&self.path.to_string_lossy()))
+    }
     fn focus_agent(&mut self) {
         self.message =
-            mdv::threads::focus_agent(&self.path.to_string_lossy()).unwrap_or_else(|error| error);
+            mdv::threads::focus_agent(&self.path.to_string_lossy(), self.project.as_deref())
+                .unwrap_or_else(|error| error);
         self.menu = None;
     }
     fn retry_question(&mut self) -> io::Result<()> {
@@ -1699,54 +1727,60 @@ impl App {
                 "a 에이전트로 가기".into(),
                 "s 막힌 질문 다시 보내기".into(),
             ];
-            for (i, label) in labels.iter().enumerate() {
-                let y = (2 + i).min(self.height());
-                queue!(
-                    out,
-                    MoveTo(
-                        self.doc_x().min(self.size.0.saturating_sub(1) as usize) as u16,
-                        y as u16
-                    )
-                )?;
-                write!(
-                    out,
-                    "{}{}",
-                    if at == i {
-                        &self.style.focus_gutter
+            let x = self.doc_x().min(self.size.0.saturating_sub(1) as usize);
+            let gutter = UnicodeWidthStr::width(self.style.focus_gutter.as_str())
+                .max(UnicodeWidthStr::width(self.style.idle_gutter.as_str()));
+            let width = (labels
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.as_str()))
+                .max()
+                .unwrap_or(0)
+                + gutter
+                + 4)
+            .min((self.size.0 as usize).saturating_sub(x));
+            let height = (labels.len() + 2).min(self.height());
+            for row in 0..height {
+                queue!(out, MoveTo(x as u16, (row + 1) as u16))?;
+                if width < 2 {
+                    write!(out, "{}", " ".repeat(width))?;
+                    continue;
+                }
+                if row == 0 || row == height - 1 {
+                    let (left, right) = if row == 0 {
+                        ('┌', '┐')
                     } else {
-                        &self.style.idle_gutter
-                    },
-                    clip(
-                        label,
+                        ('└', '┘')
+                    };
+                    write!(out, "{left}{}{right}", "─".repeat(width - 2))?;
+                } else {
+                    let text = clip(
+                        &format!(
+                            " {}{} ",
+                            if at == row - 1 {
+                                &self.style.focus_gutter
+                            } else {
+                                &self.style.idle_gutter
+                            },
+                            labels[row - 1]
+                        ),
                         0,
-                        (self.size.0 as usize).saturating_sub(self.doc_x() + 2)
-                    )
-                )?;
+                        width - 2,
+                    );
+                    let pad = width - 2 - UnicodeWidthStr::width(text.as_str());
+                    write!(out, "│{text}{}│", " ".repeat(pad))?;
+                }
             }
         }
-        let project = self
-            .path
-            .ancestors()
-            .find_map(|p| {
-                let name = p.file_name()?.to_string_lossy();
-                if name.len() > 3
-                    && name.as_bytes()[0].is_ascii_digit()
-                    && name.as_bytes()[1].is_ascii_digit()
-                    && name.as_bytes()[2] == b'_'
-                {
-                    Some(name.into_owned())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| {
-                self.path
-                    .parent()
-                    .and_then(Path::file_name)
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
-            });
+        let project = match self.project() {
+            project if !project.is_empty() => project,
+            _ => self
+                .path
+                .parent()
+                .and_then(Path::file_name)
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        };
         let offer = self
             .inbox
             .entries
@@ -1813,7 +1847,30 @@ impl App {
             MoveTo(0, self.size.1.saturating_sub(1)),
             Clear(ClearType::CurrentLine)
         )?;
-        write!(out, "{}", clip(&footer, 0, self.size.0 as usize))?;
+        let caret = if self.composer.is_some() {
+            Some(footer.len() - " | Enter send · Esc cancel".len())
+        } else {
+            self.search.as_ref().map(|_| footer.len())
+        };
+        let width = self.size.0.max(1) as usize;
+        let mut start = 0;
+        if let Some(caret) = caret {
+            let cells = UnicodeWidthStr::width(&footer[..caret]);
+            start = cell_byte(&footer, cells.saturating_sub(width - 1));
+            if UnicodeWidthStr::width(&footer[start..caret]) >= width {
+                start += footer[start..].graphemes(true).next().map_or(0, str::len);
+            }
+        }
+        write!(out, "{}", clip(&footer[start..], 0, width))?;
+        if let Some(caret) = caret {
+            queue!(
+                out,
+                MoveTo(
+                    UnicodeWidthStr::width(&footer[start..caret]) as u16,
+                    self.size.1.saturating_sub(1)
+                )
+            )?;
+        }
         out.flush()
     }
 }
@@ -1840,6 +1897,7 @@ fn run_terminal(path: &Path, options: ViewOptions, hooks: Hooks) -> io::Result<(
         ));
     }
     let mut app = App::new(path, hooks)?;
+    app.project = options.project;
     if options.look.is_some() || options.dark {
         app.style = Style::for_look(options.look.unwrap_or(mdv::Look::Portal), options.dark);
         app.rewrap();
@@ -2042,6 +2100,7 @@ mod tests {
             src: src.into(),
             layout,
             path: PathBuf::new(),
+            project: None,
             tree: PathBuf::new(),
             entries: Vec::new(),
             inbox: Inbox::default(),
@@ -2195,12 +2254,13 @@ mod tests {
     }
     #[test]
     fn discussion_rows_never_enter_source_copy() {
-        let mut app = fixture("# Target\n\nbody");
+        let mut app = fixture(&format!("# Target\n\n{}", "body\n\n".repeat(40)));
         app.threads.push(mdv::threads::Event {
             kind: "answer".into(),
             req_id: "fixture".into(),
             path: String::new(),
             feed_id: None,
+            project: None,
             block_id: 0,
             range: [0, 9],
             fingerprint: format!("{:016x}", app.doc.blocks[0].fingerprint),
@@ -2219,6 +2279,22 @@ mod tests {
         assert!(app.layout.point(row, 0).is_none());
         assert!(!app.layout.texts[0].contains("reply only"));
         assert!(app.layout.rows[row].line.plain.contains("Answer ready"));
+        let mut answer = app.threads[0].clone();
+        answer.text = "second answer".into();
+        app.threads.push(answer.clone());
+        app.rewrap();
+        app.state.top = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| r.line.plain.contains("second answer"))
+            .unwrap();
+        let top = app.state.top;
+        answer.text = "third answer".into();
+        app.threads.push(answer);
+        app.rewrap();
+        assert_eq!(app.state.top, top);
+        assert!(app.layout.rows[top].line.plain.contains("second answer"));
     }
     #[test]
     fn search_does_not_fire_commands_and_side_changes_keep_selection() {

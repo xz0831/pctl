@@ -17,8 +17,8 @@ cargo build --release --locked
 ## Test
 
 ```sh
-cargo test --release --locked
-cargo clippy --release --locked --all-targets -- -D warnings
+cargo test --release --locked --workspace
+cargo clippy --release --locked --workspace --all-targets -- -D warnings
 ```
 
 The real-tmux suites start their own servers in temporary state directories. Each takes `--bin`, `--tmux` and `--report`, except `remote_quoting.py`, which takes only `--bin`:
