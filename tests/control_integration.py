@@ -145,6 +145,38 @@ try:
         assert b7.ask({'op': 'keys', 'agent': 'q2', 'run': S['q2']['run_id'], 'keys': [{'literal': True, 'key': 'back'}]})['ok']
         b7.close()
     case('keys typed over the control connection arrive as typed, and a changed run still gets nothing', keys_over_control)
+    def hostile_keys():
+        b8 = Bridge(); b8.watch([cell(S['q2'])]); assert until(lambda: len(controls()) == 1, 8)
+        time.sleep(1.2); b8.drain(); pane = S['q2']['pane']; mark = root / 'MUST-NOT-EXIST'
+        # A line break inside a quoted argument would end the command on a connection that reads
+        # lines, and the rest would run as another tmux command: it is typed as text instead.
+        evil = f'abc\nrun-shell "touch {mark}"\nrun-shell \'touch {mark}\'\n'
+        r = b8.ask({'op': 'keys', 'agent': 'q2', 'run': S['q2']['run_id'], 'keys': [{'literal': True, 'key': evil}]})
+        assert r['ok'], r
+        assert b8.take(lambda v: v.get('ev') == 'screen' and 'run-shell "touch' in v['rows'], 3), 'the text was typed'
+        time.sleep(0.5); assert not mark.exists(), 'the second line was not run by tmux'
+        r = b8.ask({'op': 'paste', 'agent': 'q2', 'run': S['q2']['run_id'], 'text': evil}); assert r['ok'], r
+        time.sleep(0.5); assert not mark.exists()
+        odd = "it's \\ \"q\" #{pane_id} #(echo x) %1 $HOME a;b; { } ~ \\'"
+        r = b8.ask({'op': 'keys', 'agent': 'q2', 'run': S['q2']['run_id'], 'keys': [{'literal': True, 'key': odd}, {'literal': False, 'key': 'Enter'}]}); assert r['ok'], r
+        assert b8.take(lambda v: v.get('ev') == 'screen' and any('got:' in l and odd in l for l in v['rows'].split('\n')), 3), 'quotes, backslashes, formats and semicolons arrive as typed'
+        b8.close()
+    case('text with a line break typed over the control connection is typed, never run as a tmux command', hostile_keys)
+    def two_projects():
+        b9 = Bridge(); b9.watch([cell(S['q1'], key='a'), cell(S['o1'], key='b')]); assert until(lambda: len(controls()) == 2, 10)
+        time.sleep(1.5); b9.drain()
+        both = lambda text: subprocess.run([T, '-S', str(state / 'tmux.sock'), 'send-keys', '-t', S['q1']['pane'], '-l', text, ';', 'send-keys', '-t', S['o1']['pane'], '-l', text])
+        for rnd in range(3):
+            # Both panes write in the same instant, over and over: the watcher reads them in one pass, and
+            # each pane has to be continued over the client that paused it, or it falls silent.
+            for i in range(25): both('.'); time.sleep(0.02)
+            time.sleep(0.4); b9.drain(0.2, 1.0)
+            both(f'end{rnd}'); t0 = time.monotonic()
+            for key, name in (('a', 'q1'), ('b', 'o1')):
+                ev = b9.take(lambda v: v.get('ev') == 'screen' and v['key'] == key and f'end{rnd}' in v['rows'], 2)
+                assert ev and ev[0] - t0 < 0.3, f'round {rnd}: {name} is read soon after its output, not at the one-second safety read'
+        b9.close()
+    case('cells of two sessions that write together are both continued over their own client and keep updating at once', two_projects)
     def killed():
         b4 = Bridge(); b4.watch([cell(S['q1'])]); assert until(lambda: len(controls()) == 1, 8)
         b4.take(lambda v: v.get('ev') == 'screen'); time.sleep(1.2); b4.drain()

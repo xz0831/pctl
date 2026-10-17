@@ -231,7 +231,10 @@ try:
         subprocess.run([T, '-S', str(C), '-f', '/dev/null', 'new-session', '-d', '-x', '100', '-y', '40', '-s', 'c',
                         f"env -u TMUX {T} -S {state / 'tmux.sock'} attach -t {sess}"], env=ENV, check=True, timeout=10)
         try:
-            assert until(lambda: size('session_attached') == 1), 'the client attached'
+            # The app's own tmux connection (control mode) is attached too, so count the people only.
+            people = lambda: len(st('list-clients', '-t', pane, '-f', '#{==:#{client_control_mode},0}', '-F', 'x').splitlines())
+            assert until(lambda: people() == 1), 'the client attached'
+            assert until(lambda: any(l.startswith('1 ') for l in st('list-clients', '-t', pane, '-F', '#{client_control_mode} #{client_flags}').splitlines())), 'the app reads this cell over a control connection'
             st('select-window', '-t', pane)
             assert until(lambda: size('window_width') == 100 and size('pane_height') > 30, 20), 'the client took the window'
             text('echo BOTTOM-MARK'); keys('Enter')

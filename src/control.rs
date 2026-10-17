@@ -147,6 +147,12 @@ impl Client {
         command: &str,
         until: Option<String>,
     ) -> Option<mpsc::Receiver<(bool, String)>> {
+        // The connection reads a line at a time: a line break (or NUL) in a quoted argument would end
+        // the command and run the rest as another, so text with one is never sent; the caller
+        // takes the process path, which passes arguments as they are.
+        if command.contains(['\n', '\r', '\0']) {
+            return None;
+        }
         let (tx, rx) = mpsc::channel();
         let mut input = lock(&self.input);
         if !self.alive.load(Ordering::Relaxed) {
@@ -396,9 +402,12 @@ impl Control {
         self: &Arc<Self>,
         cells: &[(&str, &str, u16)],
     ) -> Option<Vec<Result<Option<Screen>>>> {
-        let client = self.client_for(cells.first()?.0)?;
         let mut waits = vec![];
+        let mut clients = vec![];
         for (pane, ..) in cells {
+            // Pause and continue belong to the client that gets the output of the pane, so the
+            // pane is continued and read over its own session's client.
+            let client = self.client_for(pane)?;
             if lock(&self.paused).remove(*pane) {
                 client.send(&format!("refresh-client -A '{pane}:continue'"))?;
             }
@@ -408,13 +417,14 @@ impl Control {
                 CURSOR_FORMAT.replace('\'', "")
             ))?;
             waits.push((capture, fields));
+            clients.push(client);
         }
         let deadline = Instant::now() + REPLY_WITHIN;
         let wait = |rx: &mpsc::Receiver<(bool, String)>| {
             rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
         };
         let mut out = vec![];
-        for ((_, run, _), (capture, fields)) in cells.iter().zip(waits) {
+        for (((_, run, _), (capture, fields)), client) in cells.iter().zip(waits).zip(&clients) {
             let (Ok(capture), Ok(fields)) = (wait(&capture), wait(&fields)) else {
                 client.kill();
                 self.failed("no reply to a read");
@@ -540,6 +550,32 @@ mod tests {
                 Item::Exit,
             ]
         );
+    }
+
+    #[test]
+    fn a_command_with_a_line_break_is_never_sent() {
+        let mut child = std::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("cat");
+        let client = Client {
+            session: "$0".into(),
+            input: Mutex::new((child.stdin.take().expect("stdin"), VecDeque::new())),
+            child: Mutex::new(Some(child)),
+            alive: AtomicBool::new(true),
+            ready: AtomicBool::new(true),
+            used: Mutex::new(Instant::now()),
+        };
+        for hostile in ["a\nrun-shell x", "a\rb", "a\0b", "if-shell -F x 'y\nz'"] {
+            assert!(client.send(hostile).is_none(), "{hostile:?}");
+            assert!(client.send_until(hostile, Some("m".into())).is_none());
+        }
+        assert!(
+            lock(&client.input).1.is_empty(),
+            "nothing waits for a reply"
+        );
+        assert!(client.send("display-message -p ok").is_some());
     }
 
     #[test]

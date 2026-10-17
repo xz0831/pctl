@@ -1764,6 +1764,7 @@ impl App {
                 (v.next, v.safety)
             };
             let due = self.owner_changed(id)
+                || (self.resized(id) && next.is_none_or(|t| now >= t))
                 || match self.controlled_pane(id) {
                     // Read when the pane wrote (not more often than the rate below), and now and
                     // then in case something changed without output.
