@@ -1,4 +1,4 @@
-# Role-name workflow: 0.7.0
+# Role-name workflow: 0.8.0
 
 `pctl msg` is a convenience layer over the same durable local mailbox. It does not add transport. The earlier 0.4 low-level `message ack-reply` remains separate and unchanged.
 
