@@ -1863,13 +1863,18 @@ impl App {
         }
         write!(out, "{}", clip(&footer[start..], 0, width))?;
         if let Some(caret) = caret {
+            // Shown, not only moved: a viewer that copies the screen (a pctl cell) places the
+            // real cursor only where the pane's cursor is visible, and input methods draw there.
             queue!(
                 out,
                 MoveTo(
                     UnicodeWidthStr::width(&footer[start..caret]) as u16,
                     self.size.1.saturating_sub(1)
-                )
+                ),
+                Show
             )?;
+        } else {
+            queue!(out, Hide)?;
         }
         out.flush()
     }

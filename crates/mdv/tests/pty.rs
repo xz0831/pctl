@@ -691,6 +691,8 @@ fn assert_input_cursor(p: &Pty, text: &str) {
         if line.ends_with(text) {
             // The final Hangul syllable occupies this cell and the next one.
             assert_eq!(screen.cursor_position(), (row, col + 2));
+            // Visible: a pctl cell places the real cursor (where input methods draw) only then.
+            assert!(!screen.hide_cursor(), "the cursor is shown at the caret");
             return;
         }
     }
