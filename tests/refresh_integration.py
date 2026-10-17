@@ -90,7 +90,7 @@ try:
         s = add()
         assert s['stale'] is False and s['running_build'] == s['installed_build'], s
         assert s['running_build']['resolved_path'] == str(v1), s
-        assert s['running_build']['interpreter']['resolved_path'] == '/bin/bash', s
+        assert s['running_build']['interpreter']['resolved_path'] == os.path.realpath('/bin/bash'), s  # /bin is a symlink to /usr/bin on many Linux systems
         retarget(v2)
         s = get()
         assert s['stale'] is True and not s['swap_blockers'], s

@@ -217,6 +217,8 @@ try:
         assert s['viewer'] is True and argv[1] == 'view' and argv[-1] == '--remote', argv
         assert cli('show', '--list', st=remote)[0]['new'] is False
         (root / 'clip.out').unlink(missing_ok=True)
+        # The reader's status line is `<host> | <project> | <pct> | <message>`; in a narrow cell a long host name cuts the message.
+        vt('resize-window', '-t', 'view', '-x', '150'); time.sleep(1)
         keys('Tab', 'Tab'); keys('y')
         assert until(lambda: 'Copy failed: drag' in screen(), 8), screen()
         assert not (root / 'clip.out').exists(), 'no clipboard command ran for a document that is over ssh'
