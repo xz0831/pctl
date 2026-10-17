@@ -1812,7 +1812,30 @@ impl App {
             MoveTo(0, self.size.1.saturating_sub(1)),
             Clear(ClearType::CurrentLine)
         )?;
-        write!(out, "{}", clip(&footer, 0, self.size.0 as usize))?;
+        let caret = if self.composer.is_some() {
+            Some(footer.len() - " | Enter send · Esc cancel".len())
+        } else {
+            self.search.as_ref().map(|_| footer.len())
+        };
+        let width = self.size.0.max(1) as usize;
+        let mut start = 0;
+        if let Some(caret) = caret {
+            let cells = UnicodeWidthStr::width(&footer[..caret]);
+            start = cell_byte(&footer, cells.saturating_sub(width - 1));
+            if UnicodeWidthStr::width(&footer[start..caret]) >= width {
+                start += footer[start..].graphemes(true).next().map_or(0, str::len);
+            }
+        }
+        write!(out, "{}", clip(&footer[start..], 0, width))?;
+        if let Some(caret) = caret {
+            queue!(
+                out,
+                MoveTo(
+                    UnicodeWidthStr::width(&footer[start..caret]) as u16,
+                    self.size.1.saturating_sub(1)
+                )
+            )?;
+        }
         out.flush()
     }
 }

@@ -656,3 +656,58 @@ fn saved_question_keeps_its_project_on_retry() {
     p.quit();
 }
 
+fn assert_input_cursor(p: &Pty, text: &str) {
+    p.wait_for(text);
+    let s = p.shared.0.lock().unwrap();
+    let screen = s.parser.screen();
+    let (rows, cols) = screen.size();
+    let row = rows - 1;
+    let mut line = String::new();
+    for col in 0..cols {
+        line.push_str(&screen.cell(row, col).unwrap().contents());
+        if line.ends_with(text) {
+            // The final Hangul syllable occupies this cell and the next one.
+            assert_eq!(screen.cursor_position(), (row, col + 2));
+            return;
+        }
+    }
+    panic!("input missing from footer: {line}");
+}
+
+#[test]
+fn question_and_comment_cursor_follows_hangul() {
+    for ask in [true, false] {
+        let f = Fixture::new("input.md", "# Input\n");
+        let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
+        p.wait_for("T -> Tree");
+        p.send(TAB);
+        p.send(ENTER);
+        p.wait_for("Ask the agent");
+        for _ in 0..if ask { 4 } else { 3 } {
+            p.send(DOWN);
+        }
+        p.send(ENTER);
+        p.wait_for("Enter send");
+        p.send("한글".as_bytes());
+        assert_input_cursor(&p, "한글");
+        p.send(format!("{}한글", "가".repeat(80)).as_bytes());
+        assert_input_cursor(&p, "가한글");
+        p.send(ESC);
+        p.wait_for("Escape again");
+        p.send(ESC);
+        p.quit();
+    }
+}
+
+#[test]
+fn search_cursor_follows_hangul() {
+    let f = Fixture::new("search.md", "# Search\n");
+    let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
+    p.wait_for("T -> Tree");
+    p.send("/한글".as_bytes());
+    assert_input_cursor(&p, "한글");
+    p.send(format!("{}한글", "가".repeat(80)).as_bytes());
+    assert_input_cursor(&p, "가한글");
+    p.send(ESC);
+    p.quit();
+}
