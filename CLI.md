@@ -397,7 +397,7 @@ Where `<to>` goes:
   - The token is read from `token_file` (a file with `KEY=value` lines, the last one wins) when the message is sent and goes to `curl` on its standard input (`-H @-`). It is in no argument list, log or output.
 - `codex:<prefix>`: the session whose conversation starts with the prefix (at least 4 characters). It is the reply address for a sender that runs outside any pane.
 
-The sender line is `[from <me> <host> <cwd>]` (`$PWD` with `$HOME` as `~`). `<me>`, first match wins: the caller's own session (`PCTL_AGENT_ID`, as `session whoami`); the session holding `CODEX_THREAD_ID`'s conversation, else `codex:<first 8>`; a `door_services` value of `XPC_SERVICE_NAME` (the host name); any other `XPC_SERVICE_NAME` as `job:<name>` (without `job_prefix`); `ssh` in an ssh login; else `?`. An A2A message without `--wait` gets ` · reply with tell` inside the brackets. Telling yourself (`<me>` or `<host>:<me>`) prints and sends nothing, exit 0.
+The sender line is `[from <me> <host> <cwd>]` (`$PWD` with `$HOME` as `~`). `<me>`, first match wins: the caller's own session (`PCTL_AGENT_ID`, as `session whoami`); the session holding `CODEX_THREAD_ID`'s conversation, else `codex:<first 8>`; a `door_services` value of `XPC_SERVICE_NAME` (the host name); any other `XPC_SERVICE_NAME` as `job:<name>` (without `job_prefix`); `ssh` in an ssh login; else `?`. An A2A message without `--wait` gets ` · reply with tell` inside the brackets (`[tell] reply_hint` replaces the words). Telling yourself (`<me>` or `<host>:<me>`) prints and sends nothing, exit 0.
 
 Output is JSON `{to, result, context?, reply?, note?|error?}` or, with `--plain`, one line (`reached: <to> …`, then the reply). Results: `reached`, `queued`, `typed_unconfirmed`, `accepted`, `replied`, `self`, `refused`, `no_token`, `no_connection`, `not_sent`, `blocked`. Exit codes: 0 sent, 1 refused, 2 usage, 3 no token, 4 no connection, 5 could not send, 6 blocked. `<state>/tell.log` (mode 0600) gets one tab-separated line per send: time, sender, receiver, result, length of the text (never the text).
 
@@ -408,6 +408,7 @@ Configuration in `config.toml` (the small `[section]` / `name = "value"` reader 
 host = "alpha"                  # this computer's name in sender lines (default: hostname -s)
 door_services = "svc.door"      # XPC_SERVICE_NAME values meaning "this computer's front door", comma separated
 job_prefix = "jobs."            # stripped from other XPC_SERVICE_NAME values: job:<rest>
+reply_hint = "reply with tell"  # how an A2A agent not waited on is told to answer
 
 [tell.a2a.front]
 url = "http://127.0.0.1:9900/"

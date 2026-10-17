@@ -37,6 +37,8 @@ pub struct Config {
     pub door_services: Vec<String>,
     /// Stripped from the start of any other `XPC_SERVICE_NAME`; the sender is `job:<rest>`.
     pub job_prefix: String,
+    /// How an A2A agent not waited on is told to answer; default "reply with tell".
+    pub reply_hint: Option<String>,
     pub a2a: BTreeMap<String, A2a>,
 }
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -86,6 +88,7 @@ impl Config {
                 })
                 .unwrap_or_default(),
             job_prefix: get("job_prefix").unwrap_or_default(),
+            reply_hint: get("reply_hint"),
             a2a,
         }
     }
@@ -187,9 +190,10 @@ pub fn sender_line(me: &str, host: &str, cwd: &str) -> String {
     format!("[from {me} {host} {cwd}]")
 }
 
-/// An A2A agent that is not waited on is told how to answer.
-pub fn with_hint(line: &str) -> String {
-    format!("{} · reply with tell]", line.trim_end_matches(']'))
+/// An A2A agent that is not waited on is told how to answer (`[tell] reply_hint`).
+pub fn with_hint(line: &str, hint: Option<&str>) -> String {
+    let hint = hint.unwrap_or("reply with tell");
+    format!("{} · {hint}]", line.trim_end_matches(']'))
 }
 
 /// The sender and host in `[from <me> <host> <cwd>]`.
@@ -797,7 +801,7 @@ fn a2a(
         if req.wait {
             line.to_string()
         } else {
-            with_hint(line)
+            with_hint(line, cfg.reply_hint.as_deref())
         },
         req.text
     );
@@ -1037,7 +1041,14 @@ mod tests {
         assert_eq!(short_cwd("/x", ""), "/x");
         let line = sender_line("me", "alpha", "~/p");
         assert_eq!(line, "[from me alpha ~/p]");
-        assert_eq!(with_hint(&line), "[from me alpha ~/p · reply with tell]");
+        assert_eq!(
+            with_hint(&line, None),
+            "[from me alpha ~/p · reply with tell]"
+        );
+        assert_eq!(
+            with_hint(&line, Some("reply by msg")),
+            "[from me alpha ~/p · reply by msg]"
+        );
         assert_eq!(parse_line(&line), Some(("me".into(), "alpha".into())));
         assert!(valid_line(&line));
         for bad in [
