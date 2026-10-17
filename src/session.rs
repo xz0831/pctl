@@ -13,20 +13,43 @@ use std::{
 };
 use uuid::Uuid;
 
-/// The harness a profile runs, from its executable name.
+/// The harness a profile runs, from its executable name. `--model` passes OpenCode its config as
+/// `env NAME=VALUE … opencode`, so a leading `env` and its settings are skipped first.
 pub fn harness(argv: &[String]) -> &'static str {
     match argv
-        .first()
+        .iter()
+        .map(String::as_str)
+        .find(|a| *a != "env" && !env_assignment(a))
         .and_then(|a| Path::new(a).file_name())
         .and_then(|n| n.to_str())
     {
         Some("claude") => "claude",
         Some("codex") => "codex",
+        Some("opencode") => "opencode",
         _ => "",
     }
 }
-/// Command line for a new run. Claude gets a fixed session ID on first start and resumes it
-/// afterwards; Codex resumes its discovered thread. Profiles that already pick a conversation
+/// `env`'s `NAME=VALUE` setting (a command-line option like `--model=x` is not one).
+fn env_assignment(arg: &str) -> bool {
+    arg.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && name
+                .chars()
+                .enumerate()
+                .all(|(i, c)| c.is_ascii_alphabetic() || c == '_' || (i > 0 && c.is_ascii_digit()))
+    })
+}
+/// A conversation ID PCTL stores and passes on a command line: Claude UUIDs, Codex thread IDs and
+/// OpenCode session IDs (which opencode requires to start with `ses`) all fit.
+fn conversation_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|x| x.is_ascii_alphanumeric() || x == '-' || x == '_')
+}
+/// Command line for a new run. Claude and OpenCode get a fixed session ID on first start and resume
+/// it afterwards; Codex resumes its discovered thread. Profiles that already pick a conversation
 /// themselves are left alone.
 pub(crate) fn launch_argv(r: &mut Registry, agent: &str) -> Result<Vec<String>> {
     let a = r
@@ -47,6 +70,15 @@ pub(crate) fn launch_argv(r: &mut Registry, agent: &str) -> Result<Vec<String>> 
                 }
             }
         }
+        // OpenCode accepts any ID starting with "ses" and creates the session when the ID is new.
+        "opencode" if !chooses(&["-c", "--continue", "-s", "--session"]) => match &a.conversation {
+            Some(c) => argv.extend(["--session".into(), c.clone()]),
+            None => {
+                let c = format!("ses_{}", Uuid::new_v4().simple());
+                argv.extend(["--session".into(), c.clone()]);
+                a.conversation = Some(c);
+            }
+        },
         "codex" if argv.get(1).map(String::as_str) != Some("resume") => {
             if let Some(c) = &a.conversation {
                 argv.splice(1..1, ["resume".to_string(), c.clone()]);
@@ -57,8 +89,10 @@ pub(crate) fn launch_argv(r: &mut Registry, agent: &str) -> Result<Vec<String>> 
     Ok(argv)
 }
 /// Whether starting this profile again would land in a fresh conversation by accident: a
-/// Claude/Codex profile whose conversation PCTL does not know and that does not pick one itself.
+/// Claude/Codex/OpenCode profile whose conversation PCTL does not know and that does not pick one
+/// itself.
 fn conversation_unknown(a: &Agent) -> bool {
+    let own = harness(&a.argv) == "opencode";
     let picks = a.argv.iter().any(|x| {
         [
             "-r",
@@ -69,6 +103,8 @@ fn conversation_unknown(a: &Agent) -> bool {
             "resume",
         ]
         .contains(&x.as_str())
+            // `-s` is OpenCode's --session; for Codex it is --sandbox.
+            || (own && ["-s", "--session"].contains(&x.as_str()))
     });
     !harness(&a.argv).is_empty() && a.conversation.is_none() && !picks
 }
@@ -705,14 +741,9 @@ impl Core {
         if let Some(c) = conversation {
             ensure!(
                 !harness(&argv).is_empty(),
-                "--conversation needs a claude or codex command"
+                "--conversation needs a claude, codex or opencode command"
             );
-            ensure!(
-                !c.is_empty()
-                    && c.len() <= 128
-                    && c.chars().all(|x| x.is_ascii_alphanumeric() || x == '-'),
-                "invalid conversation ID"
-            );
+            ensure!(conversation_id(c), "invalid conversation ID");
         }
         check_codex_resume(&argv, conversation)?;
         let cwd = fs::canonicalize(cwd).context("cwd")?;
@@ -903,11 +934,7 @@ impl Core {
             return Ok(json!({"recorded": false, "reason": "not inside a PCTL session"}));
         };
         let v: Value = serde_json::from_str(input).context("hook input is not JSON")?;
-        let id = v["session_id"].as_str().filter(|s| {
-            !s.is_empty()
-                && s.len() <= 128
-                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        });
+        let id = v["session_id"].as_str().filter(|s| conversation_id(s));
         let Some(id) = id else {
             return Ok(json!({"recorded": false, "reason": "no session_id"}));
         };
@@ -1186,6 +1213,83 @@ mod tests {
             ["claude", "--resume", "fixed"]
         );
         assert!(r.agents[2].conversation.is_none());
+    }
+    #[test]
+    fn opencode_gets_a_ses_id_through_the_model_wrapper() {
+        let mut r = Registry::default();
+        let mk = |id: &str, argv: &[&str]| Agent {
+            id: id.into(),
+            project_id: "p".into(),
+            name: id.into(),
+            cwd: "/".into(),
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            adapter: "generic".into(),
+            input_mode: "terminal-line".into(),
+            collaboration_mode: "mailbox".into(),
+            conversation: None,
+            worktree: None,
+        };
+        // --model stores OpenCode's config in front of the command, as session add writes it.
+        r.agents.push(mk(
+            "m",
+            &[
+                "env",
+                "OPENCODE_CONFIG_CONTENT={\"model\":\"a/b\"}",
+                "/x/opencode",
+                "--standalone",
+            ],
+        ));
+        r.agents.push(mk("c", &["opencode", "--continue"]));
+        let conv = |r: &Registry, id: &str| {
+            r.agents
+                .iter()
+                .find(|a| a.id == id)
+                .unwrap()
+                .conversation
+                .clone()
+        };
+        let first = launch_argv(&mut r, "m").unwrap();
+        let id = conv(&r, "m").unwrap();
+        assert!(id.starts_with("ses_") && conversation_id(&id), "{id}");
+        assert_eq!(
+            first,
+            [
+                "env",
+                "OPENCODE_CONFIG_CONTENT={\"model\":\"a/b\"}",
+                "/x/opencode",
+                "--standalone",
+                "--session",
+                &id
+            ]
+        );
+        assert_eq!(
+            launch_argv(&mut r, "m").unwrap()[4..],
+            ["--session".to_string(), id]
+        );
+        // A profile that picks its own conversation is left alone, as for Claude.
+        assert_eq!(
+            launch_argv(&mut r, "c").unwrap(),
+            ["opencode", "--continue"]
+        );
+        assert!(conv(&r, "c").is_none() && !conversation_unknown(&r.agents[1]));
+        // `-s` picks a conversation for OpenCode but is Codex's --sandbox: no fresh start mistaken
+        // for a resume, and no resume mistaken for a fresh start.
+        r.agents.push(mk("s", &["codex", "-s", "workspace-write"]));
+        r.agents
+            .push(mk("t", &["opencode", "--session", "ses_known"]));
+        assert!(conversation_unknown(&r.agents[2]));
+        assert!(!conversation_unknown(&r.agents[3]));
+        // An ID opencode itself reported (12 hex + 14 base62) is valid too.
+        assert!(conversation_id("ses_0E0ECsa9BKTri5B3M"));
+        assert!(!conversation_id("ses_x;rm -rf") && !conversation_id(""));
+        assert_eq!(
+            harness(&["env".into(), "A=1".into(), "opencode".into()]),
+            "opencode"
+        );
+        assert_eq!(
+            harness(&["opencode".into(), "--model=x".into()]),
+            "opencode"
+        );
     }
     #[test]
     fn discover_codex_matches_cwd_and_skips_taken() {
