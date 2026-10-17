@@ -1,0 +1,13 @@
+# 원시 HTML
+
+<script>alert("synthetic")</script>
+
+<img src="https://example.invalid/never" onerror="alert(1)">
+
+<iframe src="https://example.invalid/never"></iframe>
+
+<details><summary>합성</summary>details text</details>
+
+inline <span style="color:red">합성 강조</span>
+
+Control bytes: ESC= BEL= C1= DEL=.

@@ -1,0 +1,3 @@
+합성 PDF 문서
+한글 표본 가나다 123.45
+Synthetic only.

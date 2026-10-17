@@ -1,0 +1,21 @@
+[package]
+name = "mdv"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A terminal document reader and Markdown renderer with source-linked discussions"
+readme = "README.md"
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+getrandom = "0.3"
+sha2 = "0.10.9"
+pulldown-cmark = { version = "0.13", default-features = false }
+unicode-width = "0.2"
+unicode-segmentation = "1.12"
+unicode-normalization = "0.1"
+crossterm = "0.29"
+
+[dev-dependencies]
+libc = "0.2"
+vt100 = "0.16"

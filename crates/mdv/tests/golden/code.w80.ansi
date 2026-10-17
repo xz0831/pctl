@@ -1,0 +1,10 @@
+[1;34m코드[0m
+
+[38;5;242mfn main() {[0m
+[38;5;242m    println!("synthetic");[0m
+[38;5;242m}[0m
+[38;5;242m// very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_very_long_code_[0m
+[38;5;242m// literal: \x1b[31m[0m
+[38;5;242m// actual: ␛]52;c;c3ludGhldGlj␇ ␛[31mred␛[0m[0m
+
+[38;5;242mprintf "\033[31m"[0m
