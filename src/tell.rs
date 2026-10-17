@@ -395,6 +395,8 @@ pub enum Verdict {
     /// Could not send: stopped, lost, exited, unknown, failed to type.
     NotSent,
     Blocked,
+    /// The session waits for a human decision: kept, typed in when it is idle.
+    QueuedBlocked,
 }
 impl Verdict {
     pub fn name(self) -> &'static str {
@@ -410,6 +412,7 @@ impl Verdict {
             Verdict::NoConnection => "no_connection",
             Verdict::NotSent => "not_sent",
             Verdict::Blocked => "blocked",
+            Verdict::QueuedBlocked => "queued_blocked",
         }
     }
     /// 0 sent, 1 refused, 3 no token, 4 connection, 5 could not send, 6 blocked.
@@ -417,6 +420,7 @@ impl Verdict {
         match self {
             Verdict::Reached
             | Verdict::Queued
+            | Verdict::QueuedBlocked
             | Verdict::TypedUnconfirmed
             | Verdict::Accepted
             | Verdict::Replied
@@ -441,6 +445,7 @@ impl Verdict {
             Verdict::NoConnection,
             Verdict::NotSent,
             Verdict::Blocked,
+            Verdict::QueuedBlocked,
         ]
         .into_iter()
         .find(|r| r.name() == name)
@@ -466,6 +471,8 @@ pub struct Outcome {
     pub reply: Option<String>,
     /// Why it was not sent or refused, or a note about a sent one.
     pub note: Option<String>,
+    /// Messages kept for the session now (queued_blocked).
+    pub queue: Option<usize>,
 }
 impl Outcome {
     fn new(result: Verdict, to: &str) -> Outcome {
@@ -475,6 +482,7 @@ impl Outcome {
             context: None,
             reply: None,
             note: None,
+            queue: None,
         }
     }
     fn because(result: Verdict, to: &str, note: impl Into<String>) -> Outcome {
@@ -491,6 +499,9 @@ impl Outcome {
         if let Some(r) = &self.reply {
             v["reply"] = json!(r);
         }
+        if let Some(q) = self.queue {
+            v["queue"] = json!(q);
+        }
         if let Some(n) = &self.note {
             v[if self.result.exit_code() == 0 {
                 "note"
@@ -506,6 +517,7 @@ impl Outcome {
         match (&self.note, self.result) {
             (Some(n), _) => s.push_str(&format!(" ({n})")),
             (None, Verdict::Queued) => s.push_str(" (it was working; it reads this next)"),
+            (None, Verdict::QueuedBlocked) => s.push_str(" (kept; typed in once it is idle)"),
             (None, Verdict::Reached) => s.push_str(" (it started reading)"),
             (None, Verdict::TypedUnconfirmed) => {
                 s.push_str(" (typed in; not seen to start; do not send again)")
@@ -537,7 +549,7 @@ fn date(format: &str) -> Option<String> {
 }
 
 /// One line per send, never the text: time, sender, receiver, result, length of the text.
-fn log(core: &Core, me: &str, to: &str, result: &str, len: usize) {
+pub(crate) fn log(core: &Core, me: &str, to: &str, result: &str, len: usize) {
     let line = format!(
         "{}\t{}\t{}\t{result}\t{len}\n",
         date("+%FT%T%z").unwrap_or_default(),
@@ -663,24 +675,57 @@ fn codex_session(core: &Core, prefix: &str) -> Option<String> {
 
 /// A session on this computer.
 fn local(core: &Core, to: &str, name: &str, line: &str, req: &Request) -> Outcome {
-    let before = match core.session_get(name) {
-        Ok(v) => v["status"].as_str().unwrap_or_default().to_string(),
+    let view = match core.session_get(name) {
+        Ok(v) => v,
         Err(e) => return Outcome::because(Verdict::NotSent, to, format!("{e:#}")),
     };
+    let mut before = view["status"].as_str().unwrap_or_default().to_string();
+    let text = format!("{line} {}", req.text);
+    // Messages kept earlier go first, so the order holds; if some are still waiting, this one
+    // waits behind them.
+    if crate::tellq::len(&core.state, name) > 0 && matches!(before.as_str(), "idle" | "working") {
+        crate::tellq::deliver(core, name, true);
+        if crate::tellq::len(&core.state, name) == 0 {
+            before = core
+                .session_get(name)
+                .map_or(before, |v| v["status"].as_str().unwrap_or_default().into());
+        } else {
+            before = "blocked".into();
+        }
+    }
     match before.as_str() {
         "blocked" => {
-            return Outcome::because(
-                Verdict::Blocked,
-                to,
-                "it waits for a human decision; nothing was typed",
-            );
+            return match crate::tellq::push(
+                &core.state,
+                name,
+                view["run_id"].as_str().unwrap_or_default(),
+                &text,
+            ) {
+                Ok(n) => Outcome {
+                    queue: Some(n),
+                    ..Outcome::because(
+                        Verdict::QueuedBlocked,
+                        to,
+                        format!(
+                            "it waits for a human decision; kept ({n} waiting), typed in once it is idle"
+                        ),
+                    )
+                },
+                Err(e) => Outcome::because(
+                    Verdict::Blocked,
+                    to,
+                    format!(
+                        "it waits for a human decision; nothing was typed, and keeping the message failed: {e}"
+                    ),
+                ),
+            };
         }
         "stopped" | "lost" | "exited" => {
             return Outcome::because(Verdict::NotSent, to, format!("the session is {before}"));
         }
         _ => {}
     }
-    if let Err(e) = core.session_prompt(name, &format!("{line} {}", req.text)) {
+    if let Err(e) = core.session_prompt(name, &text) {
         let why = format!("{e:#}");
         let result = if why.starts_with("blocked:") {
             Verdict::Blocked
@@ -793,6 +838,9 @@ fn remote(to: &str, machine: &str, name: &str, line: &str, req: &Request) -> Out
                     .or_else(|| v["error"].as_str())
                     .map(String::from)
             }),
+            queue: answer
+                .as_ref()
+                .and_then(|v| v["queue"].as_u64().map(|q| q as usize)),
         },
         // ssh itself failed (no route, refused, key).
         (None, 255) => Outcome::because(

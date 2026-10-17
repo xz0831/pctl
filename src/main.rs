@@ -943,7 +943,11 @@ fn run() -> Result<()> {
         Cmd::Session { cmd } => match cmd {
             SessionCmd::List => print(&core.session_list()?)?,
             SessionCmd::Explain { name } => print(&core.session_explain(&name)?)?,
-            SessionCmd::Get { name } => print(&core.session_get(&name)?)?,
+            SessionCmd::Get { name } => {
+                let mut v = core.session_get(&name)?;
+                pctl::tellq::after_read(&core, &mut v);
+                print(&v)?
+            }
             SessionCmd::Add {
                 name,
                 cwd,
@@ -969,12 +973,16 @@ fn run() -> Result<()> {
                 until,
                 matched,
                 timeout_ms,
-            } => print(&core.session_wait(
-                &name,
-                &until,
-                std::time::Duration::from_millis(timeout_ms),
-                matched.as_deref(),
-            )?)?,
+            } => {
+                let mut v = core.session_wait(
+                    &name,
+                    &until,
+                    std::time::Duration::from_millis(timeout_ms),
+                    matched.as_deref(),
+                )?;
+                pctl::tellq::after_read(&core, &mut v);
+                print(&v)?
+            }
             SessionCmd::Read { name, lines } => println!("{}", core.session_read(&name, lines)?),
             SessionCmd::Restart { name, force, new } => {
                 print(&core.session_restart(&name, force, new)?)?

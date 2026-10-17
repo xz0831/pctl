@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """`pctl tell`: agent-to-agent messages. Sessions on this computer (reached, queued, typed_unconfirmed,
-blocked -> exit 6 with nothing typed, stopped -> exit 5, self-send), the sender line (job, ssh, a Codex
+blocked -> kept and typed in once idle (queued_blocked), a restarted run drops it with the reason, stopped -> exit 5, self-send), the sender line (job, ssh, a Codex
 thread, a pctl session), `codex:<prefix>`, a session on another computer through a fake ssh with the
 sender kept, and an A2A agent through a fake curl first in PATH (accepted after the first stream frame
 only, --wait reply, anti-loop refusal and the retry key, missing token, connection failure, a context
@@ -33,7 +33,7 @@ token_key = "MISSING_KEY"
 (rcfg / 'pctl' / 'config.toml').write_text('[tell]\nhost = "hostb"\n')
 (cfg / 'pctl' / 'machines').write_text('rm\tfake-target\tenabled\n')
 results = []
-# A fake agent. WORK shows a working footer for 3 s, BLOCK a dialog that stays; anything else is echoed.
+# A fake agent. WORK shows a working footer for 3 s, BLOCK a dialog that stays until answered with 1; anything else is echoed.
 (bindir / 'agent').write_text(r'''#!/bin/bash
 echo "ready in $(basename "$PWD")"
 echo "> "
@@ -41,6 +41,7 @@ while IFS= read -r line; do
   case "$line" in
     *WORK*) echo "✻ Thinking… (3s · esc to interrupt)"; sleep 3; printf '\033[2J\033[Hdone: %s\n> \n' "$line" ;;
     *BLOCK*) echo "Do you want to proceed?"; echo "❯ 1. Yes" ;;
+    1) printf '\033[2J\033[Hanswered\n> \n' ;;
     *) echo "got: $line"; echo "> " ;;
   esac
 done
@@ -111,10 +112,10 @@ REJ = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"statusUpdate": {"taskId
 DONE = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"task": {"id": "t", "contextId": "c", "status": {"state": "TASK_STATE_COMPLETED", "message": {"parts": [{"text": "pong"}]}}}}})
 DAY = time.strftime('%Y%m%d')
 try:
-    for n in ('idle1', 'busy1', 'unconf1', 'blocked1', 'gone1', 'sender1'): add(n)
+    for n in ('idle1', 'busy1', 'unconf1', 'blocked1', 'blocked2', 'blocked3', 'blocked4', 'gone1', 'sender1'): add(n)
     add('cx', 'claude', None, 'p', '--conversation', 'convo-abcdef12-rest')
     add('rwork', st=rstate); add('rgone', st=rstate); add('rblock', st=rstate)
-    for n in ('idle1', 'busy1', 'unconf1', 'blocked1', 'gone1', 'sender1', 'cx'): assert until(lambda: 'ready in' in screen(n)), n
+    for n in ('idle1', 'busy1', 'unconf1', 'blocked1', 'blocked2', 'blocked3', 'blocked4', 'gone1', 'sender1', 'cx'): assert until(lambda: 'ready in' in screen(n)), n
     assert until(lambda: all('ready in' in screen(n, rstate) for n in ('rwork', 'rgone', 'rblock')))
 
     def reached():
@@ -137,16 +138,50 @@ try:
         assert rc == 0 and v['result'] == 'typed_unconfirmed' and time.monotonic() - t0 >= 7, (rc, v, err)
         assert 'got: [from hosta hosta ' in screen('unconf1') and 'plain hello' in screen('unconf1')
     case('typed in but never seen to start: typed_unconfirmed after 8 s, exit 0 (sending again would duplicate)', unconfirmed)
+    def block(n, st=None):
+        cli('session', 'prompt', n, 'BLOCK it', st=st); assert until(lambda: status(n, st) == 'blocked', 5), n
+    def answer(n): cli('session', 'keys', n, '1', 'Enter')
     def blocked():
-        cli('session', 'prompt', 'blocked1', 'BLOCK it')
-        assert until(lambda: status('blocked1') == 'blocked', 5)
-        before = screen('blocked1')
-        rc, v, err = tell('blocked1', 'must not arrive', env=DOOR)
-        assert rc == 6 and v['result'] == 'blocked' and 'human' in v['error'], (rc, v, err)
-        rc, out, err = run('tell', 'blocked1', 'must not arrive', '--plain', env=DOOR)
-        assert rc == 6 and out == '' and err.startswith('blocked: blocked1'), (rc, out, err)
-        time.sleep(1); assert screen('blocked1') == before and 'must not arrive' not in screen('blocked1'), 'nothing typed'
-    case('a session waiting for a human decision is refused with exit 6 and nothing typed', blocked)
+        block('blocked1'); before = screen('blocked1')
+        rc, v, err = tell('blocked1', 'first kept', env=DOOR)
+        assert rc == 0 and v['result'] == 'queued_blocked' and v['queue'] == 1 and 'human' in v['note'], (rc, v, err)
+        rc, out, err = run('tell', 'blocked1', 'second kept', '--plain', env=DOOR)
+        assert rc == 0 and out.startswith('queued blocked: blocked1') and '2 waiting' in out, (rc, out, err)
+        time.sleep(1); assert screen('blocked1') == before and 'kept' not in screen('blocked1'), 'nothing typed into the dialog'
+        assert cli('session', 'get', 'blocked1')['tell_queue'] == 2 and cli('session', 'list')[3]['tell_queue'] in (0, 2)
+        q = state / 'tell' / 'queue' / 'blocked1'
+        assert oct(q.stat().st_mode & 0o777) == '0o700' and all(oct(f.stat().st_mode & 0o777) == '0o600' for f in q.glob('*.json')), 'private files'
+        answer('blocked1'); assert until(lambda: 'answered' in screen('blocked1'), 5)
+        v = cli('session', 'get', 'blocked1')  # a status read of an idle session delivers
+        assert until(lambda: 'second kept' in screen('blocked1'), 8), screen('blocked1')
+        s = screen('blocked1'); assert s.index('first kept') < s.index('second kept') and s.count('got: [from') == 2, s
+        assert 'got: [from hosta hosta ' in s and cli('session', 'get', 'blocked1')['tell_queue'] == 0
+    case('a session waiting for a human decision keeps the message (queued_blocked, exit 0), types nothing into the dialog, and gets it once idle, in order, once each', blocked)
+    def queue_order():
+        block('blocked2')
+        assert tell('blocked2', 'one', env=DOOR)[1]['result'] == 'queued_blocked' and tell('blocked2', 'two', env=DOOR)[1]['result'] == 'queued_blocked'
+        answer('blocked2'); assert until(lambda: 'answered' in screen('blocked2'), 5)
+        rc, v, err = tell('blocked2', 'three', env=DOOR)  # no status read in between: the queue goes first
+        assert rc == 0 and v['result'] in ('reached', 'queued', 'typed_unconfirmed'), (rc, v, err)
+        assert until(lambda: 'three' in screen('blocked2'), 12), screen('blocked2')
+        s = screen('blocked2'); assert s.index('one') < s.index('two') < s.index('three'), s
+    case('a later tell to a session that has kept messages sends them first, so the order holds', queue_order)
+    def queue_listed():
+        block('blocked3'); tell('blocked3', 'via list', env=DOOR)
+        answer('blocked3'); assert until(lambda: 'answered' in screen('blocked3'), 5)
+        assert until(lambda: (cli('session', 'list'), 'via list' in screen('blocked3'))[1], 8), screen('blocked3')  # what the app polls
+    case('session list (what the app polls) delivers kept messages to a session that is idle', queue_listed)
+    def queue_run_changed():
+        block('blocked4'); tell('blocked4', 'for the old run', env=DOOR)
+        answer('blocked4'); assert until(lambda: 'answered' in screen('blocked4'), 5)  # no status read: nothing is delivered yet
+        cli('session', 'restart', 'blocked4', '--force'); assert until(lambda: 'ready in' in screen('blocked4'), 8)
+        v = cli('session', 'get', 'blocked4')
+        time.sleep(1)
+        v = cli('session', 'get', 'blocked4')
+        assert v['tell_queue'] == 0 and v['tell_dropped'] == 1 and 'old run' not in screen('blocked4'), (v, screen('blocked4'))
+        why = [json.loads(f.read_text()) for f in (state / 'tell' / 'dropped' / 'blocked4').glob('*.json')]
+        assert len(why) == 1 and 'another run' in why[0]['reason'] and why[0]['text'].endswith('for the old run'), why
+    case('a message kept for a run that was restarted is not typed into the new one: it is moved aside with the reason and counted in session get', queue_run_changed)
     def gone():
         pane = cli('session', 'get', 'gone1')['pane']
         subprocess.run([T, '-S', str(state / 'tmux.sock'), 'kill-pane', '-t', pane], check=True)
@@ -194,7 +229,8 @@ try:
     case('a session on another computer by saved label or ssh target: the sender stays the caller, not ssh', remote_session)
     def remote_refusals():
         cli('session', 'prompt', 'rblock', 'BLOCK it', st=rstate); assert until(lambda: status('rblock', rstate) == 'blocked', 5)
-        rc, v, err = tell('rm:rblock', 'nope', env=DOOR); assert rc == 6 and v['result'] == 'blocked' and v['to'] == 'rm:rblock', (rc, v, err)
+        rc, v, err = tell('rm:rblock', 'nope', env=DOOR); assert rc == 0 and v['result'] == 'queued_blocked' and v['to'] == 'rm:rblock' and v['queue'] == 1, (rc, v, err)
+        assert (rstate / 'tell' / 'queue' / 'rblock').is_dir() and 'nope' not in screen('rblock', rstate), 'kept on the other computer, not typed'
         pane = cli('session', 'get', 'rgone', st=rstate)['pane']
         subprocess.run([T, '-S', str(rstate / 'tmux.sock'), 'kill-pane', '-t', pane], check=True)
         assert until(lambda: status('rgone', rstate) in ('lost', 'exited', 'stopped'), 8)
@@ -270,7 +306,7 @@ try:
         rows = [l.split('\t') for l in text.splitlines()]
         assert all(len(r) == 5 for r in rows), rows
         assert any(r[1:] == ['hosta', 'front', 'accepted', str(len('hello front'))] for r in rows), rows
-        assert any(r[2] == 'blocked1' and r[3] == 'blocked' for r in rows) and any(r[3] == 'self' for r in rows), rows
+        assert any(r[2] == 'blocked1' and r[3] == 'queued_blocked' for r in rows) and any(r[3] == 'self' for r in rows), rows
         assert SECRET not in log('argv.log'), 'the token was never an argument'
         assert SECRET in log('stdin.log'), 'it did reach curl, on stdin'
         for f in (state, rstate):
