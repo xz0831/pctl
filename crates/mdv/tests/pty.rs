@@ -786,3 +786,47 @@ fn answer_on_discussion_keeps_top_row() {
 fn answer_elsewhere_keeps_top_row() {
     answer_keeps_top("elsewhere");
 }
+
+#[test]
+fn block_menu_clears_its_box() {
+    let source = format!("# Menu\n\n{}\n", "Z".repeat(2000));
+    let f = Fixture::new("menu.md", &source);
+    let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
+    p.wait_for("T -> Tree");
+    p.send(TAB);
+    p.send(ENTER);
+    p.wait_for("Ask the agent");
+    let s = p.shared.0.lock().unwrap();
+    let screen = s.parser.screen();
+    let right = (0..120)
+        .find(|&x| screen.cell(1, x).unwrap().contents() == "┐")
+        .expect("menu has a top border");
+    let labels = [
+        "Copy",
+        "[ ] Markdown source",
+        "Link",
+        "Comment",
+        "Ask the agent",
+        "a 에이전트로 가기",
+        "s 막힌 질문 다시 보내기",
+    ];
+    for y in 1..=9 {
+        let mut row = String::new();
+        for x in 0..=right {
+            row.push_str(&screen.cell(y, x).unwrap().contents());
+        }
+        if y == 1 {
+            assert_eq!(row, format!("┌{}┐", "─".repeat(right as usize - 1)));
+        } else if y == 9 {
+            assert_eq!(row, format!("└{}┘", "─".repeat(right as usize - 1)));
+        } else {
+            assert!(row.starts_with('│') && row.ends_with('│'), "{row}");
+            let inside = row.trim_matches('│').trim().trim_start_matches('>').trim();
+            let inside = inside.trim_start_matches(['□', '☐', ' ']);
+            assert_eq!(inside, labels[y as usize - 2], "menu row {y}");
+        }
+    }
+    drop(s);
+    p.send(ESC);
+    p.quit();
+}

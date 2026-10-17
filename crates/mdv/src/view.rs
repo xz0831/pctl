@@ -1727,29 +1727,48 @@ impl App {
                 "a 에이전트로 가기".into(),
                 "s 막힌 질문 다시 보내기".into(),
             ];
-            for (i, label) in labels.iter().enumerate() {
-                let y = (2 + i).min(self.height());
-                queue!(
-                    out,
-                    MoveTo(
-                        self.doc_x().min(self.size.0.saturating_sub(1) as usize) as u16,
-                        y as u16
-                    )
-                )?;
-                write!(
-                    out,
-                    "{}{}",
-                    if at == i {
-                        &self.style.focus_gutter
+            let x = self.doc_x().min(self.size.0.saturating_sub(1) as usize);
+            let gutter = UnicodeWidthStr::width(self.style.focus_gutter.as_str())
+                .max(UnicodeWidthStr::width(self.style.idle_gutter.as_str()));
+            let width = (labels
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.as_str()))
+                .max()
+                .unwrap_or(0)
+                + gutter
+                + 4)
+            .min((self.size.0 as usize).saturating_sub(x));
+            let height = (labels.len() + 2).min(self.height());
+            for row in 0..height {
+                queue!(out, MoveTo(x as u16, (row + 1) as u16))?;
+                if width < 2 {
+                    write!(out, "{}", " ".repeat(width))?;
+                    continue;
+                }
+                if row == 0 || row == height - 1 {
+                    let (left, right) = if row == 0 {
+                        ('┌', '┐')
                     } else {
-                        &self.style.idle_gutter
-                    },
-                    clip(
-                        label,
+                        ('└', '┘')
+                    };
+                    write!(out, "{left}{}{right}", "─".repeat(width - 2))?;
+                } else {
+                    let text = clip(
+                        &format!(
+                            " {}{} ",
+                            if at == row - 1 {
+                                &self.style.focus_gutter
+                            } else {
+                                &self.style.idle_gutter
+                            },
+                            labels[row - 1]
+                        ),
                         0,
-                        (self.size.0 as usize).saturating_sub(self.doc_x() + 2)
-                    )
-                )?;
+                        width - 2,
+                    );
+                    let pad = width - 2 - UnicodeWidthStr::width(text.as_str());
+                    write!(out, "│{text}{}│", " ".repeat(pad))?;
+                }
             }
         }
         let project = match self.project() {
