@@ -8,8 +8,9 @@
 pub(crate) mod keys;
 mod machines;
 mod quips;
-mod term;
+pub(crate) mod term;
 
+use crate::clipboard;
 use crate::{
     Core,
     bridge::{self, KINDS, Screen},
@@ -17,6 +18,7 @@ use crate::{
     ui::TerminalGuard,
 };
 use anyhow::Result;
+use bridge::CLIP_PIECE;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -33,7 +35,7 @@ use ratatui::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::{self, Write},
     sync::mpsc,
     thread,
@@ -51,6 +53,22 @@ fn capture_every(quiet: u32) -> Duration {
         5..=19 => 120,
         _ => 250,
     })
+}
+/// The requests that put an image on another computer's clipboard and then press the key that
+/// pastes it: the image in pieces, the set, the key.
+fn clip_ops(agent: &str, run: &str, png: &[u8]) -> VecDeque<Value> {
+    let mut ops: VecDeque<Value> = png
+        .chunks(CLIP_PIECE)
+        .enumerate()
+        .map(|(seq, piece)| {
+            json!({"op": "clip_put", "agent": agent, "run": run, "seq": seq, "data": term::base64(piece)})
+        })
+        .collect();
+    ops.push_back(
+        json!({"op": "clip_set", "agent": agent, "run": run, "kind": "png", "bytes": png.len()}),
+    );
+    ops.push_back(json!({"op": "keys", "agent": agent, "run": run, "keys": [{"literal": false, "key": "C-v"}]}));
+    ops
 }
 /// Typed text waits for the end of a burst of events, but never grows past this many bytes.
 const TYPED_MAX: usize = 2048;
@@ -233,11 +251,21 @@ enum SideRow {
     Add(Id),
 }
 
+/// The local clipboard's image, read on a thread of its own.
+type ClipRead = mpsc::Receiver<Result<Option<Vec<u8>>>>;
+
 /// What an answer from another computer was for.
 enum Task {
     /// Typed keys, or a paste, for this agent.
     Keys(Agent),
     Paste(Agent),
+    /// An image on its way to the clipboard of the agent's computer: the requests still to send
+    /// (pieces, the set, then the key that pastes) and its size in KB.
+    Image {
+        agent: Agent,
+        rest: VecDeque<Value>,
+        kb: usize,
+    },
     /// An action; on success say `ok` and then do `then`.
     Act {
         machine: String,
@@ -297,6 +325,8 @@ struct App {
     typed: Option<(Agent, Vec<(bool, String)>)>,
     /// Requests to other computers whose answer is still to come.
     tasks: Vec<(mpsc::Receiver<Result<Value>>, Task)>,
+    /// The local clipboard being read for this agent, on a thread of its own.
+    reading: Option<(Agent, ClipRead)>,
 }
 
 /// Write a complete escape sequence (a clipboard write, a notification) to the same terminal the
@@ -558,6 +588,7 @@ impl App {
             notified: HashMap::new(),
             typed: None,
             tasks: vec![],
+            reading: None,
         }
     }
     fn say(&mut self, text: impl Into<String>) {
@@ -658,12 +689,25 @@ impl App {
         for (task, answer) in done {
             self.finish(task, answer);
         }
+        if let Some((a, rx)) = self.reading.take() {
+            match rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => self.reading = Some((a, rx)),
+                read => {
+                    self.image_read(
+                        a,
+                        read.unwrap_or_else(|_| Err(anyhow::anyhow!("no answer"))),
+                    );
+                    dirty = true;
+                }
+            }
+        }
         dirty
     }
     /// Something is in flight, so the loop looks again soon.
     fn waiting(&self) -> bool {
         self.view.pending.is_some()
             || !self.tasks.is_empty()
+            || self.reading.is_some()
             || self.machines.iter().any(Mach::waiting)
     }
     /// An answer for a task: nothing to say when it went well; why it did not otherwise.
@@ -675,6 +719,11 @@ impl App {
         };
         let paste = matches!(task, Task::Paste(_));
         match task {
+            Task::Image { agent, rest, kb } => match failed {
+                Some(e) if e.starts_with("changed:") => self.changed(&agent),
+                Some(e) => self.say(format!("Image not sent: {e}")),
+                None => self.send_next(agent, rest, kb),
+            },
             Task::Keys(a) | Task::Paste(a) => match failed {
                 Some(e) if e.starts_with("changed:") => self.changed(&a),
                 Some(e) if paste => self.say(format!("Could not paste: {e}")),
@@ -1052,20 +1101,88 @@ impl App {
             return self.changed(&a);
         };
         if !a.machine.is_empty() {
-            let keys: Vec<Value> = parts
-                .iter()
-                .map(|(literal, key)| json!({"literal": literal, "key": key}))
-                .collect();
-            let op = json!({"op": "keys", "agent": a.name, "run": run, "keys": keys});
-            if let Some(rx) = self.request(&a.machine, op, None) {
-                self.tasks.push((rx, Task::Keys(a)));
-            }
-            return self.read_soon();
+            return self.remote_keys(a.clone(), run, &parts);
         }
         match bridge::type_keys(core, pane, run, &parts) {
             Ok(true) => {}
             Ok(false) => self.changed(&a),
             Err(e) => self.say(format!("Could not type into {}: {e:#}", a.name)),
+        }
+        self.read_soon();
+    }
+    /// Type the keys into an agent of another computer; the answer comes back as a task.
+    fn remote_keys(&mut self, a: Agent, run: &str, parts: &[(bool, String)]) {
+        let keys: Vec<Value> = parts
+            .iter()
+            .map(|(literal, key)| json!({"literal": literal, "key": key}))
+            .collect();
+        let op = json!({"op": "keys", "agent": a.name, "run": run, "keys": keys});
+        if let Some(rx) = self.request(&a.machine, op, None) {
+            self.tasks.push((rx, Task::Keys(a)));
+        }
+        self.read_soon();
+    }
+    /// The image-paste key. An agent here sees this clipboard itself, so it only gets the key. An
+    /// agent on another computer gets the clipboard's image first, when there is one.
+    fn image_paste(&mut self, core: &Core) {
+        let Some(a) = self.current().filter(|a| a.running()).cloned() else {
+            return;
+        };
+        if a.machine.is_empty() {
+            return self.queue(core, a, false, "C-v".into());
+        }
+        if self.reading.is_some()
+            || self
+                .tasks
+                .iter()
+                .any(|(_, t)| matches!(t, Task::Image { .. }))
+        {
+            return self.say("Still sending the last image");
+        }
+        if let Some(why) = self.refused(&a.machine) {
+            return self.say(format!("{why}; not pasting"));
+        }
+        let (tx, rx) = mpsc::channel();
+        // Its own thread: the clipboard command may be slow, and the drawing must not wait for it.
+        thread::spawn(move || {
+            let _ = tx.send(clipboard::read_image());
+        });
+        self.reading = Some((a, rx));
+    }
+    /// The local clipboard was read for an agent of another computer.
+    fn image_read(&mut self, a: Agent, read: Result<Option<Vec<u8>>>) {
+        let Some(run) = a.run.clone() else {
+            return self.changed(&a);
+        };
+        match read {
+            Err(e) => self.say(format!("Image not sent: {e:#}")),
+            Ok(None) => self.remote_keys(a, &run, &[(false, "C-v".into())]),
+            Ok(Some(png)) => {
+                let kb = png.len().div_ceil(1024);
+                self.send_next(a.clone(), clip_ops(&a.name, &run, &png), kb);
+            }
+        }
+    }
+    /// Send the next request of an image on its way. The key goes last, only after the clipboard
+    /// there was set, and ends the chain.
+    fn send_next(&mut self, a: Agent, mut rest: VecDeque<Value>, kb: usize) {
+        let Some(op) = rest.pop_front() else {
+            return;
+        };
+        let key = op["op"] == "keys";
+        if key {
+            self.say(format!(
+                "Sent image ({kb} KB) to {}",
+                self.label(&a.machine)
+            ));
+        }
+        if let Some(rx) = self.request(&a.machine, op, Some(ACT_WITHIN)) {
+            let task = if key {
+                Task::Keys(a)
+            } else {
+                Task::Image { agent: a, rest, kb }
+            };
+            self.tasks.push((rx, task));
         }
         self.read_soon();
     }
@@ -1237,6 +1354,8 @@ impl App {
             }
             Action::Help => self.modal = Some(Modal::Help),
             Action::Detach => self.quit = true,
+            Action::ImagePaste if !self.in_sidebar => self.image_paste(core),
+            Action::ImagePaste => {}
         }
     }
 
@@ -2661,6 +2780,9 @@ impl App {
                     Line::from(""),
                 ];
                 for (_, _, action, text) in ACTIONS {
+                    if self.keys.label(action).is_empty() {
+                        continue;
+                    }
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("{:>22}  ", self.keys.label(action)),
@@ -2947,6 +3069,32 @@ fn inner(r: Rect) -> Rect {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn an_image_goes_in_pieces_then_the_set_then_the_key() {
+        // Two whole pieces and a short one, so a piece boundary and a remainder both show.
+        let png: Vec<u8> = (0..CLIP_PIECE * 2 + 5).map(|i| (i % 251) as u8).collect();
+        let ops = clip_ops("a", "run-1", &png);
+        assert_eq!(ops.len(), 3 + 2);
+        let mut joined = vec![];
+        for (i, op) in ops.iter().take(3).enumerate() {
+            assert_eq!(
+                (op["op"].as_str(), op["seq"].as_u64()),
+                (Some("clip_put"), Some(i as u64))
+            );
+            let piece = term::unbase64(op["data"].as_str().expect("data")).expect("base64");
+            assert!(piece.len() <= CLIP_PIECE);
+            joined.extend(piece);
+        }
+        assert_eq!(joined, png);
+        assert_eq!(ops[3]["op"], "clip_set");
+        assert_eq!(ops[3]["bytes"], png.len());
+        assert_eq!(ops[4]["keys"], json!([{"literal": false, "key": "C-v"}]));
+        assert!(ops.iter().all(|o| o["agent"] == "a" && o["run"] == "run-1"));
+        // Each request line stays under the bridge's 1 MiB line limit.
+        assert!(ops.iter().all(|o| o.to_string().len() < 1 << 20));
+        assert_eq!(clip_ops("a", "r", &[1]).len(), 3, "one byte is one piece");
+    }
 
     fn agent_on(machine: &str, name: &str, status: &str) -> Agent {
         Agent {

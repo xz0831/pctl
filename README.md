@@ -84,7 +84,10 @@ Change them in `~/.config/pctl/config.toml` (or under `$XDG_CONFIG_HOME`):
 prefix = "ctrl+a"
 next_tab = "alt+right"   # a key without the prefix
 new_agent = "prefix+g"
+image_paste = ""         # empty turns a shortcut off
 ```
+
+`ctrl+v` over an agent on another computer sends the image on your clipboard there first, so a screenshot copied here can be pasted into Claude Code running there.
 
 Themes: `◐ Theme` (or `ctrl+b t`) picks one of the built-in themes:
 - `portal` (green), `garage` (amber), `nebula` (violet), `void` (deep blue)

@@ -3,12 +3,20 @@
 //! app shows an agent with (read a screen, type, paste, act, list) live here once: the app calls
 //! them for its own computer and a bridge calls them for the app of another. Nothing here starts a
 //! tmux server or the pctl app.
-use crate::{Core, human::literal};
+use crate::{
+    Core,
+    app::term::unbase64,
+    clipboard::{self, MAX_IMAGE},
+    human::literal,
+};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::{Map, Value, json};
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader, Write},
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc, Mutex, MutexGuard,
@@ -44,6 +52,7 @@ pub fn run(core: &Core) -> Result<()> {
     // The size this bridge last asked each pane for. Resizing only on a change keeps a second
     // viewer (the app on the other computer) from being resized back and forth.
     let mut asked: HashMap<String, (u16, u16)> = HashMap::new();
+    let mut clip = Clip::new(core);
     while let Some((line, over)) = next_line(&mut input)? {
         let (id, result) = if over {
             (None, Err(anyhow!("line over 1 MiB")))
@@ -52,7 +61,7 @@ pub fn run(core: &Core) -> Result<()> {
                 Err(_) => (None, Err(anyhow!("invalid json"))),
                 Ok(req) => match req.get("id").and_then(Value::as_u64) {
                     None => (None, Err(anyhow!("request needs a numeric id"))),
-                    Some(id) => (Some(id), op(core, &req, &mut asked)),
+                    Some(id) => (Some(id), op(core, &req, &mut asked, &mut clip)),
                 },
             }
         };
@@ -63,7 +72,12 @@ pub fn run(core: &Core) -> Result<()> {
 }
 
 /// One request. The run check happens before anything is touched.
-fn op(core: &Core, req: &Value, asked: &mut HashMap<String, (u16, u16)>) -> Result<Value> {
+fn op(
+    core: &Core,
+    req: &Value,
+    asked: &mut HashMap<String, (u16, u16)>,
+    clip: &mut Clip,
+) -> Result<Value> {
     let text = |name: &str| -> Result<&str> {
         req.get(name)
             .and_then(Value::as_str)
@@ -78,6 +92,8 @@ fn op(core: &Core, req: &Value, asked: &mut HashMap<String, (u16, u16)>) -> Resu
         "screen" => screen(core, text("agent")?, text("run")?, req, asked),
         "keys" => send_keys(core, text("agent")?, text("run")?, req),
         "paste" => paste(core, text("agent")?, text("run")?, req),
+        "clip_put" => clip.put(core, text("agent")?, text("run")?, req),
+        "clip_set" => clip.set(core, text("agent")?, text("run")?, req),
         "act" => act(core, req),
         other => bail!("unknown op {other}"),
     }
@@ -374,6 +390,116 @@ fn paste(core: &Core, agent: &str, run: &str, req: &Value) -> Result<Value> {
         "changed: pane {pane} no longer holds run {run}; touch nothing"
     );
     Ok(json!({}))
+}
+
+/// The largest piece of an image one `clip_put` carries, before base64.
+pub const CLIP_PIECE: usize = 512 << 10;
+
+/// An image on its way to this computer's clipboard: `clip_put` pieces are appended to a private
+/// file, `clip_set` checks it and puts it on the clipboard. One folder per bridge process, made on
+/// the first piece and removed with the bridge.
+struct Clip {
+    dir: PathBuf,
+    /// The pieces and bytes received so far; 0 when no image is under way.
+    pieces: u64,
+    size: usize,
+}
+
+impl Clip {
+    fn new(core: &Core) -> Self {
+        Self {
+            dir: core.state.join(format!("clip-{}", std::process::id())),
+            pieces: 0,
+            size: 0,
+        }
+    }
+
+    fn file(&self) -> PathBuf {
+        self.dir.join("image.png")
+    }
+
+    /// Forget the image and delete its file.
+    fn drop_image(&mut self) {
+        (self.pieces, self.size) = (0, 0);
+        let _ = fs::remove_file(self.file());
+    }
+
+    /// The pane is the agent's and still holds the run, so the clipboard is not touched for another.
+    fn check(core: &Core, agent: &str, run: &str) -> Result<()> {
+        verified(core, &pane_of(core, agent, run)?, run)
+    }
+
+    fn put(&mut self, core: &Core, agent: &str, run: &str, req: &Value) -> Result<Value> {
+        Self::check(core, agent, run)?;
+        let seq = number(req, "seq")?;
+        // Piece 0 starts an image over; the others must follow on.
+        ensure!(
+            seq == 0 || seq == self.pieces,
+            "clip_put: piece {seq} came after {} pieces",
+            self.pieces
+        );
+        let data = unbase64(
+            req.get("data")
+                .and_then(Value::as_str)
+                .context("missing data")?,
+        )
+        .context("clip_put: data is not base64")?;
+        ensure!(
+            data.len() <= CLIP_PIECE,
+            "clip_put: a piece is at most {} KB",
+            CLIP_PIECE >> 10
+        );
+        let size = if seq == 0 { 0 } else { self.size } + data.len();
+        ensure!(
+            size <= MAX_IMAGE,
+            "clip_put: the image is over {} MB",
+            MAX_IMAGE >> 20
+        );
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.dir)?;
+        let mut file = OpenOptions::new();
+        file.create(true).mode(0o600);
+        if seq == 0 {
+            file.write(true).truncate(true);
+        } else {
+            file.append(true);
+        }
+        file.open(self.file())?.write_all(&data)?;
+        (self.pieces, self.size) = (seq + 1, size);
+        Ok(json!({}))
+    }
+
+    fn set(&mut self, core: &Core, agent: &str, run: &str, req: &Value) -> Result<Value> {
+        let r = self.set_image(core, agent, run, req);
+        self.drop_image();
+        r.map(|()| json!({}))
+    }
+
+    fn set_image(&self, core: &Core, agent: &str, run: &str, req: &Value) -> Result<()> {
+        Self::check(core, agent, run)?;
+        ensure!(
+            req.get("kind").and_then(Value::as_str) == Some("png"),
+            "clip_set: only png"
+        );
+        let bytes = number(req, "bytes")?;
+        ensure!(
+            self.pieces > 0 && bytes <= MAX_IMAGE as u64 && bytes == self.size as u64,
+            "clip_set: {} bytes arrived, {bytes} expected",
+            self.size
+        );
+        let mut head = [0; 8];
+        fs::File::open(self.file())?.read_exact(&mut head)?;
+        ensure!(clipboard::is_png(&head), "clip_set: not a png");
+        clipboard::write_image(&self.file())
+    }
+}
+
+impl Drop for Clip {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
 }
 
 /// `s` in pieces of at most `max` bytes, cut on character boundaries.
