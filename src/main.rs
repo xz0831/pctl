@@ -805,7 +805,13 @@ fn run() -> Result<()> {
                 cwd,
                 adapter,
                 argv,
-            } => print(&core.update_agent(&agent, &name, &cwd, argv, &adapter)?)?,
+            } => {
+                let (edited, cleared) = core.update_agent(&agent, &name, &cwd, argv, &adapter)?;
+                let mut out = serde_json::to_value(&edited)?;
+                out["conversation"] = json!(edited.conversation);
+                out["conversation_cleared"] = json!(cleared);
+                print(&out)?;
+            }
             AgentCmd::ConfigureInput { agent, mode } => {
                 core.configure_input(&agent, &mode)?;
                 print(&json!({"ok":true,"input_mode":mode}))?;

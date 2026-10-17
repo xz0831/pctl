@@ -464,7 +464,7 @@ impl Core {
         cwd: &Path,
         argv: Vec<String>,
         adapter: &str,
-    ) -> Result<Agent> {
+    ) -> Result<(Agent, bool)> {
         validate_name(name)?;
         validate_argv(&argv)?;
         ensure!(
@@ -491,13 +491,18 @@ impl Core {
             .iter_mut()
             .find(|a| a.id == agent)
             .context("agent not found")?;
+        let conversation_cleared =
+            session::harness(&a.argv) != session::harness(&argv) && a.conversation.is_some();
+        if conversation_cleared {
+            a.conversation = None;
+        }
         a.name = name.into();
         a.cwd = cwd.to_string_lossy().into();
         a.argv = argv;
         a.adapter = adapter.into();
         let result = a.clone();
         self.save(&r)?;
-        Ok(result)
+        Ok((result, conversation_cleared))
     }
     pub fn configure_input(&self, agent: &str, mode: &str) -> Result<()> {
         ensure!(
@@ -1714,6 +1719,65 @@ mod tests {
         assert_eq!(a.input_mode, "native");
     }
     #[test]
+    fn editing_harness_clears_only_the_other_harness_conversation() {
+        let d = tempfile::tempdir().unwrap();
+        let c = Core::new(d.path().join("state"), "tmux".into()).unwrap();
+        let p = c.register_project("p", d.path()).unwrap();
+        for (before, after, cleared) in [
+            (vec!["opencode"], vec!["codex"], true),
+            (vec!["codex"], vec!["claude"], true),
+            (vec!["claude"], vec!["/bin/cat"], true),
+            (
+                vec!["env", "MODEL=x", "/bin/opencode"],
+                vec!["opencode", "--standalone"],
+                false,
+            ),
+            (vec!["claude"], vec!["claude", "--model", "x"], false),
+        ] {
+            let a = c
+                .register_agent(
+                    &p.id,
+                    "profile",
+                    d.path(),
+                    before.into_iter().map(String::from).collect(),
+                    "generic",
+                )
+                .unwrap();
+            let mut r = c.registry().unwrap();
+            r.agents
+                .iter_mut()
+                .find(|x| x.id == a.id)
+                .unwrap()
+                .conversation = Some("original-id".into());
+            c.save(&r).unwrap();
+            let (edited, flag) = c
+                .update_agent(
+                    &a.id,
+                    "renamed",
+                    d.path(),
+                    after.into_iter().map(String::from).collect(),
+                    "generic",
+                )
+                .unwrap();
+            assert_eq!(flag, cleared);
+            assert_eq!(
+                edited.conversation.as_deref(),
+                (!cleared).then_some("original-id")
+            );
+            assert_eq!(edited.id, a.id);
+            assert_eq!(
+                c.registry()
+                    .unwrap()
+                    .agents
+                    .iter()
+                    .find(|x| x.id == a.id)
+                    .unwrap()
+                    .conversation,
+                edited.conversation
+            );
+        }
+    }
+    #[test]
     fn stopped_profile_edit_and_capability_changes_keep_identity() {
         let d = tempfile::tempdir().unwrap();
         let c = Core::new(d.path().join("state"), "tmux".into()).unwrap();
@@ -1727,7 +1791,7 @@ mod tests {
                 .to_string()
                 .contains("unsupported")
         );
-        let b = c
+        let (b, _) = c
             .update_agent(
                 &a.id,
                 "second",

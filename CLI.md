@@ -181,7 +181,7 @@ Draft JSON is `{"ok":true,"text":"..."}` or `text:null` when none exists for tha
 
 ## Success and observation shape
 
-For compatibility, project/agent add and agent edit return the object directly. Lists return either arrays (`project list`, `client list`) or a snapshot (`agent list`). Start/restart return a run object. Control results typically return `{"ok":true,"result":"..."}`. `layout` and some simple changes return `{"ok":true}`. There is no universal success envelope or generated request ID in this build.
+For compatibility, project/agent add and agent edit return the object directly. Edit also returns `conversation` (null when absent) and `conversation_cleared`: switching the detected harness clears the previous harness's saved ID, while name, directory, flags and env-wrapper edits within the same harness preserve it. Starting a freshly changed harness still follows `session start --new` when its conversation is unknown. Lists return either arrays (`project list`, `client list`) or a snapshot (`agent list`). Start/restart return a run object. Control results typically return `{"ok":true,"result":"..."}`. `layout` and some simple changes return `{"ok":true}`. There is no universal success envelope or generated request ID in this build.
 
 `agent inspect` returns:
 
@@ -413,6 +413,8 @@ Without a free `❯`/`›` input row, question words require dialog controls (a 
   - a detached HEAD without `--base`, or a bare repository;
   - a session name other than letters, digits, `-`, `_` and `.`.
 - `--model` is for OpenCode. OpenCode 2's TUI has no model flag. Its shared background service ignores the caller's environment and keeps a folder's config from first use. pctl therefore launches `env OPENCODE_CONFIG_CONTENT={"model":"<model>"} <argv> --standalone`, a private OpenCode server. No file is written to the worktree. Other harnesses take their model flag in `<argv>`.
+- New OpenCode conversation IDs use its native 12-hex descending timestamp plus 14 base62 characters after `ses_`. With OpenCode 2.0.32, the earlier PCTL UUID-length ID caused the free-tier refusal even in the official standalone TUI; native-format IDs work with the same model/config path. Existing stored or explicit IDs are preserved. If an older PCTL-created session still gets that refusal, explicitly use `session restart <name> --new` for a fresh native-format session (the old conversation is not deleted). Check the provider error if a refusal persists; PCTL does not alter provider headers, permissions, or model billing.
+
 - `session list`/`get` show `branch` for these sessions.
 
 `pctl worktree list` → `[{session,status,path,branch,base,exists,checked_out,dirty,ahead,merged,locked}]`
