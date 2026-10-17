@@ -48,6 +48,21 @@ fn conversation_id(id: &str) -> bool {
             .chars()
             .all(|x| x.is_ascii_alphanumeric() || x == '-' || x == '_')
 }
+/// OpenCode IDs use 12 descending timestamp hex digits followed by 14 base62 characters.
+/// The free gateway rejected PCTL's former UUID suffix, despite the session API accepting it.
+fn opencode_id() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let timestamp = !(millis * 4096 + 1) & 0xffff_ffff_ffff;
+    let alphabet = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let suffix: String = Uuid::new_v4().as_bytes()[..14]
+        .iter()
+        .map(|byte| char::from(alphabet[usize::from(*byte) % alphabet.len()]))
+        .collect();
+    format!("ses_{timestamp:012x}{suffix}")
+}
 /// Command line for a new run. Claude and OpenCode get a fixed session ID on first start and resume
 /// it afterwards; Codex resumes its discovered thread. Profiles that already pick a conversation
 /// themselves are left alone.
@@ -74,7 +89,7 @@ pub(crate) fn launch_argv(r: &mut Registry, agent: &str) -> Result<Vec<String>> 
         "opencode" if !chooses(&["-c", "--continue", "-s", "--session"]) => match &a.conversation {
             Some(c) => argv.extend(["--session".into(), c.clone()]),
             None => {
-                let c = format!("ses_{}", Uuid::new_v4().simple());
+                let c = opencode_id();
                 argv.extend(["--session".into(), c.clone()]);
                 a.conversation = Some(c);
             }
@@ -1251,6 +1266,9 @@ mod tests {
         let first = launch_argv(&mut r, "m").unwrap();
         let id = conv(&r, "m").unwrap();
         assert!(id.starts_with("ses_") && conversation_id(&id), "{id}");
+        assert_eq!(id.len(), 30);
+        assert!(id[4..16].bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(id[16..].bytes().all(|b| b.is_ascii_alphanumeric()));
         assert_eq!(
             first,
             [

@@ -148,7 +148,7 @@ try:
         # The fake is reached by absolute path, never the real binary or its storage.
         cli('session', 'add', '--name', 'o-main', '--cwd', cwd('o-main'), '--', bindir / 'opencode')
         c = cli('session', 'get', 'o-main')['conversation']
-        assert c and c.startswith('ses_'), c
+        assert c and c.startswith('ses_') and len(c) == 30, c
         log = cwd('o-main') / 'argv.log'
         assert until(lambda: log.exists() and log.read_text().strip())
         assert log.read_text().splitlines()[0] == f'opencode --session {c}'
@@ -160,7 +160,7 @@ try:
     def opencode_model():
         cli('session', 'add', '--name', 'o-model', '--cwd', cwd('o-model'), '--model', 'opencode/glm-5.3-flash-free', '--', bindir / 'opencode')
         c = cli('session', 'get', 'o-model')['conversation']
-        assert c and c.startswith('ses_'), c
+        assert c and c.startswith('ses_') and len(c) == 30, c
         log = cwd('o-model') / 'argv.log'
         assert until(lambda: log.exists() and log.read_text().strip())
         assert log.read_text().splitlines()[0] == f'opencode --standalone --session {c}'
@@ -183,6 +183,33 @@ try:
         assert until(lambda: log.exists() and log.read_text().strip())
         assert log.read_text().splitlines()[0] == 'opencode --continue'
     case('opencode: --conversation resumes a known id; a profile that picks its own is untouched', opencode_moved)
+    def edit_harness():
+        original = cli('session', 'add', '--name', 'edit-harness', '--cwd', cwd('edit-harness'), '--', bindir / 'opencode')
+        def stop():
+            v = cli('session', 'get', 'edit-harness')
+            cli('agent', 'terminate', '--agent', v['agent_id'], '--expected-run', v['run_id'])
+        def edit(exe, *args):
+            return cli('agent', 'edit', '--agent', original['agent_id'], '--name', 'edit-harness', '--cwd', cwd('edit-harness'), '--', *exe, *args)
+        stop()
+        same = edit(['env', 'MODEL=fake', bindir / 'opencode'], '--standalone')
+        assert same['conversation'] == original['conversation'] and same['conversation_cleared'] is False
+        changed = edit([bindir / 'codex'])
+        assert changed['conversation'] is None and changed['conversation_cleared'] is True, changed
+        v = cli('session', 'start', 'edit-harness', '--new')
+        day = home / '.codex/sessions/2026/10/17'; day.mkdir(parents=True, exist_ok=True)
+        (day / 'rollout-edit-thread.jsonl').write_text(json.dumps({'type': 'session_meta', 'payload': {'id': 'edit-thread', 'cwd': str(cwd('edit-harness'))}}) + '\n')
+        env = dict(ENV, PCTL_AGENT_ID=v['agent_id'], PCTL_RUN_ID=v['run_id'])
+        cli('session', 'hook', env=env, stdin='{"session_id":"edit-thread"}')
+        assert cli('session', 'get', 'edit-harness')['conversation'] == 'edit-thread'
+        stop()
+        changed = edit([bindir / 'claude'])
+        assert changed['conversation'] is None and changed['conversation_cleared'] is True
+        v = cli('session', 'start', 'edit-harness', '--new')
+        assert v['conversation'] != original['conversation'] and v['conversation'] != 'edit-thread'
+        log = (cwd('edit-harness') / 'argv.log').read_text().splitlines()
+        assert log[-1] == 'claude --session-id ' + v['conversation'], log
+        stop(); cli('session', 'remove', 'edit-harness')
+    case('agent edit clears OpenCode→Codex and Codex→Claude IDs, reports it, preserves same-harness ID and starts fresh', edit_harness)
     def start_stopped():
         assert 'has_run' in cli('session', 'start', 'c-moved', ok=False)
         s = cli('session', 'get', 'c-moved')
