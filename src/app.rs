@@ -4,8 +4,10 @@
 //! Shortcuts come from `keys` and can be changed in a config file. tmux stays behind the app and
 //! keeps the agents running; leaving the app stops nothing. With saved machines (`pctl machine
 //! add`) the sidebar shows this computer first and each of them after it, and everything works on
-//! their agents too, through the bridge on that computer.
+//! their agents too, through the bridge on that computer. The terminal area can be split into cells,
+//! each showing one agent (from any computer); see `layout`.
 pub(crate) mod keys;
+mod layout;
 mod machines;
 mod quips;
 pub(crate) mod term;
@@ -24,6 +26,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use keys::{ACTIONS, Action, Keymap};
+use layout::{Dir, Divider, Side, Tree};
 use machines::{ACT_WITHIN, Id, Mach};
 use ratatui::{
     Frame, Terminal,
@@ -108,7 +111,11 @@ enum Hit {
     NewAgent(Id),
     NewTab(Id),
     NewProject,
-    Terminal,
+    /// A cell's terminal area.
+    Pane(u32),
+    /// A cell's title row.
+    Title(u32),
+    Divider(Divider),
     Theme,
     Help,
     Detach,
@@ -134,6 +141,8 @@ enum Act {
     Theme(ThemeName),
     Custom(String),
     Reconnect(String),
+    /// A command on the focused cell, from the agent menu.
+    Cell(Action),
 }
 
 struct Field {
@@ -191,6 +200,16 @@ struct View {
     quiet: u32,
     /// The one screen request to another computer in flight.
     pending: Option<mpsc::Receiver<Result<Value>>>,
+}
+
+/// One cell of the terminal area: the agent it shows and everything it keeps about the screen.
+#[derive(Default)]
+struct Pane {
+    agent: Option<Id>,
+    view: View,
+    /// Where it is drawn, with its title row, and without it.
+    outer: Rect,
+    inner: Rect,
 }
 
 struct Update {
@@ -300,7 +319,14 @@ struct App {
     sidebar_w: u16,
     in_sidebar: bool,
     side_sel: usize,
-    view: View,
+    /// Every cell there is, by number; the trees below hold the numbers.
+    panes: HashMap<u32, Pane>,
+    next_pane: u32,
+    /// The cells of the project on screen, and of each other project that was shown.
+    tree: Tree<u32>,
+    layouts: HashMap<Id, Tree<u32>>,
+    /// A divider being dragged, and whether it moved.
+    dragging: Option<(Divider, bool)>,
     modal: Option<Modal>,
     prefix: bool,
     notice: String,
@@ -316,8 +342,8 @@ struct App {
     touched: HashSet<String>,
     /// The last left click, to tell a double-click.
     last_click: Option<(Instant, Hit)>,
-    /// The selection in the terminal view: where the drag began and where it is now.
-    sel: Option<(term::Cell, term::Cell)>,
+    /// The selection in a cell: which one, where the drag began and where it is now.
+    sel: Option<(u32, term::Cell, term::Cell)>,
     /// When each agent was last announced, for the 10-second limit.
     notified: HashMap<Id, Instant>,
     /// Keys typed in the events just read, for the agent they were typed to: text to send with
@@ -441,7 +467,18 @@ pub fn run(core: &Core) -> Result<()> {
         std::fs::read(&place).map(|b| serde_json::from_slice::<Value>(&b).unwrap_or_default())
     {
         let machine = v["machine"].as_str().unwrap_or_default();
-        app.project = v["project"].as_str().map(|p| Id::new(machine, p));
+        for l in v["layouts"].as_array().into_iter().flatten() {
+            let project = Id::new(
+                l["machine"].as_str().unwrap_or_default(),
+                l["project"].as_str().unwrap_or_default(),
+            );
+            if let Some(tree) = app.tree_from_json(l)
+                && tree.len() > 1
+            {
+                app.layouts.insert(project, tree);
+            }
+        }
+        app.set_project(v["project"].as_str().map(|p| Id::new(machine, p)));
         if let Some(tabs) = v["tabs"].as_object() {
             app.tab = tabs
                 .iter()
@@ -496,17 +533,13 @@ pub fn run(core: &Core) -> Result<()> {
                 dirty = true;
             }
             dirty |= app.tick();
-            if app.view.next.is_none_or(|t| Instant::now() >= t) {
-                dirty |= app.capture(core);
-            }
+            dirty |= app.capture_due(core);
             let live = app.notice_live();
             dirty |= live != std::mem::replace(&mut notice, live);
             if std::mem::take(&mut dirty) {
                 terminal.draw(|f| app.render(f))?;
             }
-            let wait = (app.view.next).map_or(Duration::ZERO, |t| {
-                t.saturating_duration_since(Instant::now())
-            });
+            let wait = app.due_in();
             let wait = if app.waiting() { wait.min(SOON) } else { wait };
             if event::poll(wait)? {
                 // Everything already waiting goes in one go, so fast typing is one tmux call.
@@ -517,6 +550,7 @@ pub fn run(core: &Core) -> Result<()> {
                     }
                 }
                 app.flush_typed(core);
+                app.place();
                 dirty = true;
             }
         }
@@ -542,11 +576,12 @@ pub fn run(core: &Core) -> Result<()> {
         .filter(|(p, _)| p.machine.is_empty())
         .map(|(p, a)| (p.name.as_str(), a.as_str()))
         .collect();
+    let layouts = app.layouts_json();
     let _ = std::fs::write(
         &place,
         json!({
             "machine": app.project.as_ref().map(|p| &p.machine), "project": app.project.as_ref().map(|p| &p.name),
-            "tabs": tabs, "remote_tabs": remote_tabs, "theme": app.custom,
+            "tabs": tabs, "remote_tabs": remote_tabs, "theme": app.custom, "layouts": layouts,
         })
         .to_string(),
     );
@@ -571,7 +606,11 @@ impl App {
             sidebar_w: 26,
             in_sidebar: false,
             side_sel: 0,
-            view: View::default(),
+            panes: HashMap::from([(0, Pane::default())]),
+            next_pane: 1,
+            tree: Tree::new(0),
+            layouts: HashMap::new(),
+            dragging: None,
             modal: None,
             prefix: false,
             notice: String::new(),
@@ -705,7 +744,7 @@ impl App {
     }
     /// Something is in flight, so the loop looks again soon.
     fn waiting(&self) -> bool {
-        self.view.pending.is_some()
+        self.panes.values().any(|p| p.view.pending.is_some())
             || !self.tasks.is_empty()
             || self.reading.is_some()
             || self.machines.iter().any(Mach::waiting)
@@ -751,41 +790,45 @@ impl App {
                         }
                     }
                 }
-                self.view.next = None;
+                self.recapture();
                 self.poke_machine(&machine);
             }
         }
     }
 
-    /// How many of the pane's own rows the view holds above the first drawn one.
-    fn rows_skip(&self) -> u16 {
-        if self.view.scroll == 0 {
-            self.view.size.1.saturating_sub(self.term.height)
-        } else {
-            0
-        }
+    /// How many of the pane's own rows a cell holds above the first drawn one.
+    fn rows_skip(&self, id: u32) -> u16 {
+        self.panes.get(&id).map_or(0, |p| {
+            if p.view.scroll == 0 {
+                p.view.size.1.saturating_sub(p.inner.height)
+            } else {
+                0
+            }
+        })
     }
-    fn cell_at(&self, column: u16, row: u16) -> term::Cell {
-        view_cell(
-            self.term,
-            self.rows_skip(),
-            self.view.rows.len(),
-            column,
-            row,
-        )
+    fn cell_at(&self, id: u32, column: u16, row: u16) -> term::Cell {
+        let (inner, rows) = self
+            .panes
+            .get(&id)
+            .map_or((Rect::default(), 0), |p| (p.inner, p.view.rows.len()));
+        view_cell(inner, self.rows_skip(id), rows, column, row)
     }
     /// Copy what the drag covers to the person's clipboard: an OSC 52 write on our own stdout,
     /// which every modern terminal turns into a clipboard (and tmux with `set-clipboard on` into
     /// a paste buffer). A plain click, or a drag over nothing, copies nothing.
     fn copy_selection(&mut self) {
-        let Some((a, b)) = self.sel else {
+        let Some((id, a, b)) = self.sel else {
             return;
         };
         if a == b {
             self.sel = None;
             return;
         }
-        let text = term::selection_text(&self.view.rows, a, b);
+        let text = self
+            .panes
+            .get(&id)
+            .map(|p| term::selection_text(&p.view.rows, a, b))
+            .unwrap_or_default();
         if text.is_empty() {
             return;
         }
@@ -852,7 +895,7 @@ impl App {
         if self.project.as_ref().is_some_and(|p| {
             self.mach(&p.machine).is_none() || (p.machine == u.machine && !names.contains(&p.name))
         }) {
-            self.project = None;
+            self.set_project(None);
         }
         if self.project.is_none() {
             let running = |m: &Mach| {
@@ -866,7 +909,8 @@ impl App {
                     .or(m.projects.first())
                     .map(|(p, _)| Id::new(&m.id, p))
             };
-            self.project = self.machines.iter().find_map(running);
+            let first = self.machines.iter().find_map(running);
+            self.set_project(first);
         }
         for p in &names {
             let pid = Id::new(&u.machine, p);
@@ -887,14 +931,19 @@ impl App {
                 };
             }
         }
+        self.settle();
         self.notified
             .retain(|id, _| self.agents.iter().any(|a| a.id() == *id));
         if watched {
             let shown = self.current().map(Agent::id);
+            // An agent in any cell on screen is being looked at, not only the focused one.
+            let seen = self.on_screen();
             let now: Vec<Agent> = self
                 .agents
                 .iter()
-                .filter(|a| a.machine == u.machine)
+                .filter(|a| {
+                    a.machine == u.machine && (!seen.contains(&a.id()) || shown == Some(a.id()))
+                })
                 .cloned()
                 .collect();
             for (id, text, bell) in notifications(&before, &now, shown.as_ref()) {
@@ -911,18 +960,237 @@ impl App {
             }
         }
     }
+    /// The agent in the focused cell.
     fn current(&self) -> Option<&Agent> {
-        let p = self.project.as_ref()?;
-        let name = self.tab.get(p)?;
+        self.agent_in(self.focused())
+    }
+    fn agent_in(&self, id: u32) -> Option<&Agent> {
+        let want = self.panes.get(&id)?.agent.as_ref()?;
         self.agents
             .iter()
-            .find(|a| a.machine == p.machine && &a.name == name)
+            .find(|a| a.machine == want.machine && a.name == want.name)
     }
     fn project_agents(&self, project: &Id) -> Vec<&Agent> {
         self.agents
             .iter()
             .filter(|a| a.machine == project.machine && a.project == project.name)
             .collect()
+    }
+
+    // ---- cells ----
+
+    fn focused(&self) -> u32 {
+        *self.tree.focused()
+    }
+    /// The cells on screen now, in reading order.
+    fn visible(&self) -> Vec<u32> {
+        let leaves = self.tree.leaves();
+        self.tree
+            .shown()
+            .into_iter()
+            .filter_map(|i| leaves.get(i).map(|id| **id))
+            .collect()
+    }
+    /// The agents in the cells on screen.
+    fn on_screen(&self) -> Vec<Id> {
+        self.visible()
+            .iter()
+            .filter_map(|id| self.panes.get(id)?.agent.clone())
+            .collect()
+    }
+    /// The cell on screen that shows this agent.
+    fn pane_of(&self, agent: &Id) -> Option<u32> {
+        self.visible().into_iter().find(|id| {
+            self.panes
+                .get(id)
+                .is_some_and(|p| p.agent.as_ref() == Some(agent))
+        })
+    }
+    fn view(&mut self, id: u32) -> &mut View {
+        &mut self.panes.entry(id).or_default().view
+    }
+    fn new_pane(&mut self, agent: Option<Id>) -> u32 {
+        let id = self.next_pane;
+        self.next_pane += 1;
+        self.panes.insert(
+            id,
+            Pane {
+                agent,
+                ..Pane::default()
+            },
+        );
+        id
+    }
+    /// Show another project: its cells come back as they were, or it starts with one.
+    fn set_project(&mut self, project: Option<Id>) {
+        if self.project == project {
+            return;
+        }
+        let fresh = match project.as_ref().and_then(|p| self.layouts.remove(p)) {
+            Some(tree) => tree,
+            None => Tree::new(self.new_pane(None)),
+        };
+        let old = std::mem::replace(&mut self.tree, fresh);
+        if let Some(p) = self.project.take() {
+            self.layouts.insert(p, old);
+        }
+        self.project = project;
+        self.sel = None;
+        self.dragging = None;
+        self.settle();
+        self.recapture();
+    }
+    /// A single cell shows the project's selected tab, like the app did before it had cells: it
+    /// is filled when empty and when its agent has left. With several cells nothing is filled in.
+    fn settle(&mut self) {
+        if self.tree.len() != 1 {
+            return;
+        }
+        let id = self.focused();
+        let there = self
+            .panes
+            .get(&id)
+            .and_then(|p| p.agent.as_ref())
+            .is_some_and(|a| {
+                self.agents
+                    .iter()
+                    .any(|x| x.machine == a.machine && x.name == a.name)
+            });
+        if there {
+            return;
+        }
+        let tab = self.project.as_ref().and_then(|p| {
+            let name = self.tab.get(p)?;
+            Some(Id::new(&p.machine, name))
+        });
+        if self.panes.get(&id).is_some_and(|p| p.agent != tab) {
+            let pane = self.panes.entry(id).or_default();
+            pane.agent = tab;
+            pane.view.next = None;
+        }
+    }
+    /// Read the screens again at once.
+    fn recapture(&mut self) {
+        for p in self.panes.values_mut() {
+            p.view.next = None;
+        }
+    }
+    /// The areas of the cells on screen, from the terminal area.
+    fn place(&mut self) {
+        if self.term.width == 0 {
+            return;
+        }
+        let titled = self.tree.titled();
+        let leaves: Vec<u32> = self.tree.leaves().into_iter().copied().collect();
+        for (i, outer) in self.tree.geometry(self.term).cells {
+            let Some(id) = leaves.get(i) else {
+                continue;
+            };
+            let inner = if titled {
+                Rect {
+                    y: outer.y + 1,
+                    height: outer.height.saturating_sub(1),
+                    ..outer
+                }
+            } else {
+                outer
+            };
+            let pane = self.panes.entry(*id).or_default();
+            pane.outer = outer;
+            pane.inner = inner;
+        }
+    }
+    /// Cells changed: place them and read what their sizes now ask for.
+    fn laid_out(&mut self) {
+        self.sel = None;
+        self.place();
+        self.recapture();
+    }
+    fn focus_index(&mut self, i: usize) {
+        if i < self.tree.len() {
+            self.tree.focus = i;
+            self.sel = None;
+            self.in_sidebar = false;
+        }
+    }
+    fn focus_pane(&mut self, id: u32) {
+        if let Some(i) = self.tree.leaves().iter().position(|p| **p == id) {
+            self.focus_index(i);
+        }
+    }
+    fn split(&mut self, dir: Dir) {
+        if self.project.is_none() {
+            return;
+        }
+        let id = self.new_pane(None);
+        if self.tree.split(dir, id) {
+            self.laid_out();
+        } else {
+            self.panes.remove(&id);
+            self.say("No room for more cells");
+        }
+    }
+    fn close_cell(&mut self) {
+        let leaves: Vec<u32> = self.tree.leaves().into_iter().copied().collect();
+        match self.tree.close(self.tree.focus) {
+            Some(id) => {
+                // Only the view goes; the agent keeps running in its tmux window.
+                self.panes.remove(&id);
+                self.laid_out();
+            }
+            None if leaves.len() < 2 => self.say("The last cell cannot be closed"),
+            None => {}
+        }
+    }
+    fn move_focus(&mut self, toward: Side) {
+        let cells = self.tree.areas(self.term);
+        if let Some(i) = Tree::<u32>::neighbor(&cells, self.tree.focus, toward) {
+            self.focus_index(i);
+        }
+    }
+    fn resize_cell(&mut self, toward: Side) {
+        if self.tree.resize(toward, layout::STEP) {
+            self.laid_out();
+        }
+    }
+    fn swap_cell(&mut self, forward: bool) {
+        let n = self.tree.len();
+        if n < 2 {
+            return;
+        }
+        let from = self.tree.focus;
+        let to = if forward {
+            (from + 1) % n
+        } else {
+            (from + n - 1) % n
+        };
+        if self.tree.swap(from, to) {
+            self.laid_out();
+        }
+    }
+    fn zoom_cell(&mut self) {
+        if self.tree.zoom() {
+            self.laid_out();
+        } else {
+            self.say("Only one cell to show");
+        }
+    }
+
+    /// Put an agent in a cell: the one that already shows it, else the focused one.
+    fn show_agent(&mut self, id: &Id) {
+        let shown = self.tree.leaves().iter().position(|p| {
+            self.panes
+                .get(*p)
+                .is_some_and(|x| x.agent.as_ref() == Some(id))
+        });
+        match shown {
+            Some(i) => self.focus_index(i),
+            None => {
+                let pane = self.panes.entry(self.focused()).or_default();
+                pane.agent = Some(id.clone());
+                pane.view.next = None;
+            }
+        }
     }
     fn open_agent(&mut self, id: &Id) {
         if let Some(a) = self
@@ -933,128 +1201,209 @@ impl App {
         {
             let project = a.project_id();
             self.collapsed.remove(&project);
-            self.project = Some(project.clone());
-            self.tab.insert(project, a.name);
-            self.view.scroll = 0;
-            self.view.next = None;
+            self.tab.insert(project.clone(), a.name.clone());
+            // With one cell the project follows the agent, as it always did; with several, the
+            // agent comes into the focused cell and the project stays.
+            if self.tree.len() == 1 {
+                self.set_project(Some(project));
+            }
+            self.show_agent(&a.id());
             self.sel = None;
         }
     }
 
+    /// The layouts of the projects as the file keeps them: only the ones with several cells.
+    fn layouts_json(&self) -> Vec<Value> {
+        let mut out = vec![];
+        let shown = self.project.iter().map(|p| (p, &self.tree));
+        for (p, tree) in self.layouts.iter().chain(shown) {
+            if tree.len() < 2 {
+                continue;
+            }
+            let mut v = tree.to_json(&|id| self.agent_json(*id));
+            v["machine"] = json!(p.machine);
+            v["project"] = json!(p.name);
+            out.push(v);
+        }
+        out
+    }
+    fn agent_json(&self, id: u32) -> Value {
+        match self.panes.get(&id).and_then(|p| p.agent.as_ref()) {
+            Some(a) => json!({"machine": a.machine, "agent": a.name}),
+            None => json!({}),
+        }
+    }
+    /// A layout from the file, with a cell for each leaf. An agent in two cells is kept in the first.
+    fn tree_from_json(&mut self, v: &Value) -> Option<Tree<u32>> {
+        let mut seen: HashSet<Id> = HashSet::new();
+        let mut made = vec![];
+        let tree = Tree::from_json(v, &mut |leaf| {
+            let agent = leaf["agent"]
+                .as_str()
+                .map(|n| Id::new(leaf["machine"].as_str().unwrap_or_default(), n))
+                .filter(|a| seen.insert(a.clone()));
+            let id = self.next_pane;
+            self.next_pane += 1;
+            made.push((id, agent));
+            Some(id)
+        });
+        for (id, agent) in made {
+            self.panes.insert(
+                id,
+                Pane {
+                    agent,
+                    ..Pane::default()
+                },
+            );
+        }
+        tree
+    }
+
     /// Show nothing for the agent (its pane is gone, holds another run, or its computer is down).
     /// Whether that changed the screen.
-    fn blank(&mut self) -> bool {
-        self.view.last = None;
-        self.view.pending = None;
-        !std::mem::take(&mut self.view.rows).is_empty()
+    fn blank(&mut self, id: u32) -> bool {
+        let view = self.view(id);
+        view.last = None;
+        view.pending = None;
+        !std::mem::take(&mut view.rows).is_empty()
     }
-    /// Read the current agent's screen and schedule the next read. Whether the screen changed.
-    fn capture(&mut self, core: &Core) -> bool {
-        let Some(changed) = self.read_screen(core) else {
+    /// All the cells that are due.
+    fn capture_due(&mut self, core: &Core) -> bool {
+        let mut dirty = false;
+        for id in self.visible() {
+            if self.view(id).next.is_none_or(|t| Instant::now() >= t) {
+                dirty |= self.capture(core, id);
+            }
+        }
+        dirty
+    }
+    /// How long until the first cell is due.
+    fn due_in(&self) -> Duration {
+        self.visible()
+            .iter()
+            .map(|id| {
+                self.panes
+                    .get(id)
+                    .and_then(|p| p.view.next)
+                    .map_or(Duration::ZERO, |t| {
+                        t.saturating_duration_since(Instant::now())
+                    })
+            })
+            .min()
+            .unwrap_or(Duration::ZERO)
+    }
+    /// Read a cell's screen and schedule its next read. Whether the screen changed.
+    fn capture(&mut self, core: &Core, id: u32) -> bool {
+        let Some(changed) = self.read_screen(core, id) else {
             // The answer from another computer is on its way.
-            self.view.next = Some(Instant::now() + SOON);
+            self.view(id).next = Some(Instant::now() + SOON);
             return false;
         };
-        self.view.quiet = if changed { 0 } else { self.view.quiet + 1 };
-        self.view.next = Some(Instant::now() + capture_every(self.view.quiet));
+        let view = self.view(id);
+        view.quiet = if changed { 0 } else { view.quiet + 1 };
+        view.next = Some(Instant::now() + capture_every(view.quiet));
         changed
     }
-    /// Read the current agent's screen, resizing its window to the view first. Whether the screen
+    /// Read a cell's agent's screen, resizing its window to the cell first. Whether the screen
     /// changed; None while the answer of another computer is still to come.
-    fn read_screen(&mut self, core: &Core) -> Option<bool> {
-        let Some(a) = self.current().filter(|a| a.running()).cloned() else {
-            self.view.owner = Default::default();
-            return Some(self.blank());
+    fn read_screen(&mut self, core: &Core, id: u32) -> Option<bool> {
+        let Some(a) = self.agent_in(id).filter(|a| a.running()).cloned() else {
+            self.view(id).owner = Default::default();
+            return Some(self.blank(id));
         };
         let (Some(pane), Some(run)) = (a.pane.clone(), a.run.clone()) else {
-            return Some(self.blank());
+            return Some(self.blank(id));
         };
         let owner = (a.machine.clone(), pane.clone());
-        if self.view.owner != owner {
-            self.view = View {
+        if self.view(id).owner != owner {
+            *self.view(id) = View {
                 owner,
                 ..View::default()
             };
         }
-        let (w, h) = (self.term.width, self.term.height);
+        let inner = self.panes.get(&id).map_or(Rect::default(), |p| p.inner);
+        let (w, h) = (inner.width, inner.height);
         if w < 2 || h < 2 {
             return Some(false);
         }
         if !a.machine.is_empty() {
-            return self.read_remote(&a, &run, (w, h));
+            return self.read_remote(id, &a, &run, (w, h));
         }
-        if self.view.asked != (w, h) {
+        if self.view(id).asked != (w, h) {
             // The pane comes from the last list; check it still holds this run before resizing it.
             // The read below checks it again, in its own call.
             if bridge::verified(core, &pane, &run).is_err() {
                 self.poke();
-                return Some(self.blank());
+                return Some(self.blank(id));
             }
-            self.view.asked = (w, h);
+            self.view(id).asked = (w, h);
             self.touched.insert(pane.clone());
             let _ = bridge::resize(core, &pane, w, h);
         }
-        Some(
-            match bridge::read_screen(core, &pane, &run, h, self.view.scroll) {
-                Ok(Some(s)) => self.show(s),
-                Ok(None) => {
-                    self.poke();
-                    self.blank()
-                }
-                Err(_) => false,
-            },
-        )
+        let scroll = self.view(id).scroll;
+        Some(match bridge::read_screen(core, &pane, &run, h, scroll) {
+            Ok(Some(s)) => self.show(id, s),
+            Ok(None) => {
+                self.poke();
+                self.blank(id)
+            }
+            Err(_) => false,
+        })
     }
     /// The screen of an agent on another computer: one request at a time, the answer taken up on a
     /// later pass. The bridge there does the resizing.
-    fn read_remote(&mut self, a: &Agent, run: &str, (w, h): (u16, u16)) -> Option<bool> {
+    fn read_remote(&mut self, id: u32, a: &Agent, run: &str, (w, h): (u16, u16)) -> Option<bool> {
         if self.refused(&a.machine).is_some() {
-            return Some(self.blank());
+            return Some(self.blank(id));
         }
-        if let Some(rx) = self.view.pending.take() {
+        if let Some(rx) = self.view(id).pending.take() {
             return match rx.try_recv() {
-                Ok(Ok(v)) if v["ok"] == json!(true) => Some(self.show(Screen::from_answer(&v))),
+                Ok(Ok(v)) if v["ok"] == json!(true) => Some(self.show(id, Screen::from_answer(&v))),
                 Ok(Ok(v))
                     if v["error"]
                         .as_str()
                         .is_some_and(|e| e.starts_with("changed:")) =>
                 {
                     self.poke_machine(&a.machine);
-                    Some(self.blank())
+                    Some(self.blank(id))
                 }
                 Ok(_) | Err(mpsc::TryRecvError::Disconnected) => Some(false),
                 Err(mpsc::TryRecvError::Empty) => {
-                    self.view.pending = Some(rx);
+                    self.view(id).pending = Some(rx);
                     None
                 }
             };
         }
         let op = json!({
             "op": "screen", "agent": a.name, "run": run,
-            "width": w, "height": h, "scroll": self.view.scroll,
+            "width": w, "height": h, "scroll": self.view(id).scroll,
         });
-        self.view.pending = self.request(&a.machine, op, None);
+        let pending = self.request(&a.machine, op, None);
+        self.view(id).pending = pending;
         None
     }
-    /// Take a screen as the view. Whether it differs from the one shown.
-    fn show(&mut self, s: Screen) -> bool {
-        if self.view.last.as_ref() == Some(&s) {
+    /// Take a screen as a cell's view. Whether it differs from the one shown.
+    fn show(&mut self, id: u32, s: Screen) -> bool {
+        let view = self.view(id);
+        if view.last.as_ref() == Some(&s) {
             return false;
         }
-        self.view.cursor = s.cursor;
-        self.view.size = s.size;
-        self.view.history = s.history;
-        (self.view.alt, self.view.mouse, self.view.sgr) = (s.alt, s.mouse, s.sgr);
-        self.view.scroll = self.view.scroll.min(s.history);
-        self.view.rows = term::parse_capture(&s.text);
-        self.view.last = Some(s);
+        view.cursor = s.cursor;
+        view.size = s.size;
+        view.history = s.history;
+        (view.alt, view.mouse, view.sgr) = (s.alt, s.mouse, s.sgr);
+        view.scroll = view.scroll.min(s.history);
+        view.rows = term::parse_capture(&s.text);
+        view.last = Some(s);
         true
     }
 
     /// Something was typed: the echo is on its way, so look at once and often.
-    fn read_soon(&mut self) {
-        self.view.next = Some(Instant::now());
-        self.view.quiet = 0;
+    fn read_soon(&mut self, a: &Agent) {
+        let id = self.pane_of(&a.id()).unwrap_or_else(|| self.focused());
+        let view = self.view(id);
+        view.next = Some(Instant::now());
+        view.quiet = 0;
     }
     fn changed(&mut self, a: &Agent) {
         self.say(format!(
@@ -1082,12 +1431,18 @@ impl App {
         }) {
             self.flush_typed(core);
         }
+        let shown = self.pane_of(&a.id());
         let (_, parts) = self.typed.get_or_insert_with(|| (a, vec![]));
         match parts.last_mut() {
             Some((true, text)) if lit => text.push_str(&key),
             _ => parts.push((lit, key)),
         }
-        self.view.scroll = 0;
+        if let Some(id) = shown {
+            self.view(id).scroll = 0;
+        }
+        let Some((_, parts)) = &self.typed else {
+            return;
+        };
         if parts.iter().map(|(_, k)| k.len()).sum::<usize>() > TYPED_MAX {
             self.flush_typed(core);
         }
@@ -1108,7 +1463,7 @@ impl App {
             Ok(false) => self.changed(&a),
             Err(e) => self.say(format!("Could not type into {}: {e:#}", a.name)),
         }
-        self.read_soon();
+        self.read_soon(&a);
     }
     /// Type the keys into an agent of another computer; the answer comes back as a task.
     fn remote_keys(&mut self, a: Agent, run: &str, parts: &[(bool, String)]) {
@@ -1118,9 +1473,9 @@ impl App {
             .collect();
         let op = json!({"op": "keys", "agent": a.name, "run": run, "keys": keys});
         if let Some(rx) = self.request(&a.machine, op, None) {
-            self.tasks.push((rx, Task::Keys(a)));
+            self.tasks.push((rx, Task::Keys(a.clone())));
         }
-        self.read_soon();
+        self.read_soon(&a);
     }
     /// The image-paste key. An agent here sees this clipboard itself, so it only gets the key. An
     /// agent on another computer gets the clipboard's image first, when there is one.
@@ -1178,13 +1533,17 @@ impl App {
         }
         if let Some(rx) = self.request(&a.machine, op, Some(ACT_WITHIN)) {
             let task = if key {
-                Task::Keys(a)
+                Task::Keys(a.clone())
             } else {
-                Task::Image { agent: a, rest, kb }
+                Task::Image {
+                    agent: a.clone(),
+                    rest,
+                    kb,
+                }
             };
             self.tasks.push((rx, task));
         }
-        self.read_soon();
+        self.read_soon(&a);
     }
     fn paste(&mut self, core: &Core, text: &str) {
         self.flush_typed(core);
@@ -1203,16 +1562,16 @@ impl App {
             }
             let op = json!({"op": "paste", "agent": a.name, "run": run, "text": text});
             if let Some(rx) = self.request(&a.machine, op, None) {
-                self.tasks.push((rx, Task::Paste(a)));
+                self.tasks.push((rx, Task::Paste(a.clone())));
             }
-            return self.read_soon();
+            return self.read_soon(&a);
         }
         match bridge::paste_text(core, pane, run, text) {
             Ok(true) => {}
             Ok(false) => self.changed(&a),
             Err(e) => self.say(format!("Could not paste: {e:#}")),
         }
-        self.read_soon();
+        self.read_soon(&a);
     }
 
     fn handle(&mut self, core: &Core, ev: Event) {
@@ -1228,7 +1587,11 @@ impl App {
                     }
                 }
             }
-            Event::Resize(..) => self.view.asked = (0, 0),
+            Event::Resize(..) => {
+                for p in self.panes.values_mut() {
+                    p.view.asked = (0, 0);
+                }
+            }
             _ => {}
         }
     }
@@ -1356,6 +1719,20 @@ impl App {
             Action::Detach => self.quit = true,
             Action::ImagePaste if !self.in_sidebar => self.image_paste(core),
             Action::ImagePaste => {}
+            Action::SplitRight => self.split(Dir::Right),
+            Action::SplitDown => self.split(Dir::Down),
+            Action::CloseCell => self.close_cell(),
+            Action::FocusLeft => self.move_focus(Side::Left),
+            Action::FocusRight => self.move_focus(Side::Right),
+            Action::FocusUp => self.move_focus(Side::Up),
+            Action::FocusDown => self.move_focus(Side::Down),
+            Action::ResizeLeft => self.resize_cell(Side::Left),
+            Action::ResizeRight => self.resize_cell(Side::Right),
+            Action::ResizeUp => self.resize_cell(Side::Up),
+            Action::ResizeDown => self.resize_cell(Side::Down),
+            Action::SwapPrev => self.swap_cell(false),
+            Action::SwapNext => self.swap_cell(true),
+            Action::Zoom => self.zoom_cell(),
         }
     }
 
@@ -1423,8 +1800,8 @@ impl App {
             self.collapsed.insert(p.clone());
         } else {
             self.collapsed.remove(p);
-            self.project = Some(p.clone());
-            self.view.next = None;
+            self.set_project(Some(p.clone()));
+            self.recapture();
         }
     }
     fn click_machine(&mut self, m: &str) {
@@ -1472,15 +1849,15 @@ impl App {
                                 Hit::Agent(a) | Hit::Tab(a) if double => {
                                     self.agent_menu(&a, m.column, m.row)
                                 }
-                                // A press in the terminal starts a selection there; the drag
-                                // below extends it and the release copies it.
-                                Hit::Terminal => {
-                                    self.sel = Some((
-                                        self.cell_at(m.column, m.row),
-                                        self.cell_at(m.column, m.row),
-                                    ));
-                                    self.in_sidebar = false;
+                                // A press in a cell focuses it and starts a selection there; the
+                                // drag below extends it and the release copies it.
+                                Hit::Pane(id) => {
+                                    self.focus_pane(id);
+                                    let at = self.cell_at(id, m.column, m.row);
+                                    self.sel = Some((id, at, at));
                                 }
+                                Hit::Title(id) => self.focus_pane(id),
+                                Hit::Divider(d) => self.dragging = Some((d, false)),
                                 h => self.click(core, h),
                             }
                         }
@@ -1515,39 +1892,65 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) if self.drag => {
                 self.sidebar_w = m.column.clamp(16, 60);
             }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging.is_some() => {
+                if let Some((d, moved)) = &mut self.dragging {
+                    *moved = true;
+                    let (path, ratio) = (d.path.clone(), d.ratio_at(m.column, m.row));
+                    self.tree.set_ratio(&path, ratio);
+                    self.laid_out();
+                }
+            }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some((a, _)) = self.sel {
-                    let b = self.cell_at(m.column, m.row);
-                    self.sel = Some((a, b));
+                if let Some((id, a, _)) = self.sel {
+                    let b = self.cell_at(id, m.column, m.row);
+                    self.sel = Some((id, a, b));
                 }
             }
             MouseEventKind::Up(_) => {
                 self.drag = false;
+                // A press on a divider that never moved is a click on the cell under it.
+                if let Some((_, false)) = self.dragging.take()
+                    && let Some(i) = self.tree.geometry(self.term).cell_at(m.column, m.row)
+                {
+                    self.focus_index(i);
+                }
                 self.copy_selection();
             }
             // A full-screen program (most agents) has no tmux history to scroll: the wheel is its
             // own, as a mouse event where it reads the mouse, else as arrow keys like a terminal.
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                if matches!(hit, Some(Hit::Terminal)) && self.view.alt && self.view.scroll == 0 =>
+            // It goes to the cell under the pointer, whichever cell has the focus.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if matches!(hit, Some(Hit::Pane(id)) if self.panes.get(&id).is_some_and(|p| p.view.alt && p.view.scroll == 0)) =>
             {
                 self.sel = None;
-                if let Some(a) = self.current().filter(|a| a.running()).cloned() {
-                    let (row, col) = self.cell_at(m.column, m.row);
+                if let Some(Hit::Pane(id)) = hit
+                    && let Some(a) = self.agent_in(id).filter(|a| a.running()).cloned()
+                {
+                    let (row, col) = self.cell_at(id, m.column, m.row);
                     let up = m.kind == MouseEventKind::ScrollUp;
-                    for (lit, key) in wheel_input(up, col, row, self.view.mouse, self.view.sgr) {
+                    let (mouse, sgr) = self
+                        .panes
+                        .get(&id)
+                        .map_or((false, false), |p| (p.view.mouse, p.view.sgr));
+                    for (lit, key) in wheel_input(up, col, row, mouse, sgr) {
                         self.queue(core, a.clone(), lit, key);
                     }
                 }
             }
-            MouseEventKind::ScrollUp if matches!(hit, Some(Hit::Terminal)) => {
-                self.sel = None;
-                self.view.scroll = (self.view.scroll + 3).min(self.view.history);
-                self.view.next = None;
+            MouseEventKind::ScrollUp => {
+                if let Some(Hit::Pane(id)) = hit {
+                    self.sel = None;
+                    let view = self.view(id);
+                    view.scroll = (view.scroll + 3).min(view.history);
+                    view.next = None;
+                }
             }
-            MouseEventKind::ScrollDown if matches!(hit, Some(Hit::Terminal)) => {
-                self.sel = None;
-                self.view.scroll = self.view.scroll.saturating_sub(3);
-                self.view.next = None;
+            MouseEventKind::ScrollDown => {
+                if let Some(Hit::Pane(id)) = hit {
+                    self.sel = None;
+                    let view = self.view(id);
+                    view.scroll = view.scroll.saturating_sub(3);
+                    view.next = None;
+                }
             }
             _ => {}
         }
@@ -1563,7 +1966,8 @@ impl App {
             Hit::NewAgent(p) => self.agent_form(&p),
             Hit::NewTab(p) => self.new_tab(core, &p),
             Hit::NewProject => self.project_form(),
-            Hit::Terminal => self.in_sidebar = false,
+            Hit::Pane(id) | Hit::Title(id) => self.focus_pane(id),
+            Hit::Divider(_) => {}
             Hit::Help => self.modal = Some(Modal::Help),
             Hit::Theme => {
                 let (w, h) = (
@@ -1627,6 +2031,21 @@ impl App {
             "New agent in this project".to_string(),
             Act::NewAgent(a.project_id()),
         ));
+        // The cell commands act on the focused cell, so only the agent in it offers them.
+        if self.current().is_some_and(|c| c.id() == *id) {
+            let mut cell = |text: &str, action: Action| {
+                items.push((
+                    format!("{text} ({})", self.keys.label(action)),
+                    Act::Cell(action),
+                ));
+            };
+            cell("Split right", Action::SplitRight);
+            cell("Split down", Action::SplitDown);
+            cell("Zoom, and back", Action::Zoom);
+            if self.tree.len() > 1 {
+                cell("Close this cell", Action::CloseCell);
+            }
+        }
         self.modal = Some(Modal::Menu {
             title: a.name.clone(),
             items,
@@ -1739,7 +2158,7 @@ impl App {
                 }
                 Err(e) => self.say(format!("{e:#}")),
             }
-            self.view.next = None;
+            self.recapture();
             self.poke();
             return;
         }
@@ -1788,6 +2207,10 @@ impl App {
                 self.new_tab(core, p);
                 return;
             }
+            Act::Cell(action) => {
+                self.action(core, *action);
+                return;
+            }
             Act::Reconnect(m) => {
                 let label = self.label(m);
                 if let Some(m) = self.machines.iter_mut().find(|x| &x.id == m) {
@@ -1827,7 +2250,7 @@ impl App {
             Ok(msg) => self.say(msg),
             Err(e) => self.say(format!("{e:#}")),
         }
-        self.view.next = None;
+        self.recapture();
         self.poke();
     }
 
@@ -1865,10 +2288,9 @@ impl App {
             run: None,
         };
         self.agents.push(a.clone());
-        self.fresh.insert(a.id(), (a, Instant::now()));
-        self.project = Some(project.clone());
-        self.tab.insert(project.clone(), name.into());
-        self.view.next = None;
+        self.fresh.insert(a.id(), (a.clone(), Instant::now()));
+        self.open_agent(&a.id());
+        self.recapture();
         self.poke_machine(&project.machine);
     }
     fn project_form(&mut self) {
@@ -2067,7 +2489,7 @@ impl App {
                 self.modal = None;
                 if new_project {
                     let id = Id::new("", &name);
-                    self.project = Some(id.clone());
+                    self.set_project(Some(id.clone()));
                     self.machines[0].projects.push((name.clone(), new_root));
                     self.say(format!("Added project {name}. Now add its first agent."));
                     self.poke();
@@ -2162,6 +2584,7 @@ impl App {
             ..right
         };
         self.term = term;
+        self.place();
         self.render_term(f, term);
         self.render_status(
             f,
@@ -2416,40 +2839,41 @@ impl App {
         self.hit(plus, Hit::NewTab(project));
     }
 
-    fn render_term(&mut self, f: &mut Frame, r: Rect) {
-        let p = self.pal;
-        self.hit(r, Hit::Terminal);
-        let center = |f: &mut Frame, lines: Vec<Line<'static>>| {
-            let h = lines.len() as u16;
-            let y = r.y + r.height.saturating_sub(h) / 3;
-            f.render_widget(
-                Paragraph::new(lines)
-                    .alignment(ratatui::layout::Alignment::Center)
-                    .style(p.base()),
-                Rect {
-                    y,
-                    height: h.min(r.height),
-                    ..r
-                },
-            );
-            y + h
-        };
-        let button = |app: &mut App, f: &mut Frame, y: u16, text: &str, hit: Hit| {
-            let w = text.chars().count() as u16;
-            let b = Rect {
-                x: r.x + r.width.saturating_sub(w) / 2,
+    /// Text in the middle of an area, a third of the way down. The row below it.
+    fn center(&self, f: &mut Frame, r: Rect, lines: Vec<Line<'static>>) -> u16 {
+        let h = lines.len() as u16;
+        let y = r.y + r.height.saturating_sub(h) / 3;
+        f.render_widget(
+            Paragraph::new(lines)
+                .alignment(ratatui::layout::Alignment::Center)
+                .style(self.pal.base()),
+            Rect {
                 y,
-                width: w.min(r.width),
-                height: 1,
-            };
-            f.render_widget(
-                Paragraph::new(text.to_string()).style(Style::default().fg(p.ink).bg(p.accent)),
-                b,
-            );
-            app.hit(b, hit);
+                height: h.min(r.height),
+                ..r
+            },
+        );
+        y + h
+    }
+    fn button(&mut self, f: &mut Frame, r: Rect, y: u16, text: &str, hit: Hit) {
+        let p = self.pal;
+        let w = text.chars().count() as u16;
+        let b = Rect {
+            x: r.x + r.width.saturating_sub(w) / 2,
+            y,
+            width: w.min(r.width),
+            height: 1,
         };
+        f.render_widget(
+            Paragraph::new(text.to_string()).style(Style::default().fg(p.ink).bg(p.accent)),
+            b,
+        );
+        self.hit(b, hit);
+    }
+
+    fn render_term(&mut self, f: &mut Frame, r: Rect) {
         if !self.machines[0].loaded {
-            center(f, vec![Line::from(quips::loading(self.keys.wit))]);
+            self.center(f, r, vec![Line::from(quips::loading(self.keys.wit))]);
             return;
         }
         let Some(project) = self.project.clone() else {
@@ -2464,9 +2888,9 @@ impl App {
                     }));
                 }
                 lines.push(Line::from(""));
-                let y = center(f, lines);
+                let y = self.center(f, r, lines);
                 if self.local_connected() {
-                    button(self, f, y, " + Project ", Hit::NewProject);
+                    self.button(f, r, y, " + Project ", Hit::NewProject);
                 }
                 return;
             }
@@ -2487,14 +2911,97 @@ impl App {
                 lines.push(Line::from("then add a project."));
             }
             lines.push(Line::from(""));
-            let y = center(f, lines);
-            button(self, f, y, " + Project ", Hit::NewProject);
+            let y = self.center(f, r, lines);
+            self.button(f, r, y, " + Project ", Hit::NewProject);
             return;
         };
-        if let Some(why) = self.refused(&project.machine) {
+        let titled = self.tree.titled();
+        let leaves: Vec<u32> = self.tree.leaves().into_iter().copied().collect();
+        let focus = self.focused();
+        for i in self.tree.shown() {
+            let Some(&id) = leaves.get(i) else {
+                continue;
+            };
+            let Some((outer, inner)) = self.panes.get(&id).map(|p| (p.outer, p.inner)) else {
+                continue;
+            };
+            if inner.width == 0 || inner.height == 0 {
+                continue;
+            }
+            self.hit(inner, Hit::Pane(id));
+            if titled {
+                let title = Rect { height: 1, ..outer };
+                self.hit(title, Hit::Title(id));
+                self.render_title(f, id, title, id == focus);
+            }
+            self.render_pane(f, id, inner, &project, !titled);
+        }
+        if titled {
+            let p = self.pal;
+            for d in self.tree.geometry(self.term).dividers {
+                if d.dir == Dir::Right {
+                    let line: Vec<Line> = (0..d.rect.height).map(|_| Line::from("│")).collect();
+                    f.render_widget(
+                        Paragraph::new(line).style(Style::default().fg(p.border).bg(p.bg)),
+                        d.rect,
+                    );
+                }
+                self.hit(d.rect, Hit::Divider(d));
+            }
+        }
+    }
+
+    /// A cell's title row: the computer (when machines are saved), the agent and its state.
+    fn render_title(&self, f: &mut Frame, id: u32, r: Rect, focused: bool) {
+        let p = self.pal;
+        let a = self.agent_in(id);
+        let (text, glyph) = match a {
+            Some(a) => {
+                let name = if self.multi() {
+                    format!(" {} · {} ", self.label(&a.machine), a.name)
+                } else {
+                    format!(" {} ", a.name)
+                };
+                (name, Some(self.glyph(&a.status)))
+            }
+            None => (" no agent ".to_string(), None),
+        };
+        let muted = a.is_some_and(|a| self.refused(&a.machine).is_some());
+        let base = if focused {
+            Style::default()
+                .fg(p.ink)
+                .bg(p.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if muted {
+            Style::default()
+                .fg(p.muted)
+                .bg(p.panel)
+                .add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(p.muted).bg(p.panel)
+        };
+        let mut spans = vec![Span::styled(
+            fit(&text, r.width.saturating_sub(2) as usize),
+            base,
+        )];
+        if let Some((g, gs)) = glyph {
+            spans.push(Span::styled(g, if focused { base } else { gs.bg(p.panel) }));
+        }
+        f.render_widget(Block::default().style(base), r);
+        f.render_widget(Paragraph::new(Line::from(spans)), r);
+    }
+
+    /// What one cell holds. `lone`: it is the only thing on screen, so it also says what the
+    /// project lacks (no agents yet, its computer down), as the app did before it had cells.
+    fn render_pane(&mut self, f: &mut Frame, id: u32, r: Rect, project: &Id, lone: bool) {
+        let p = self.pal;
+        let agent = self.agent_in(id).cloned();
+        let machine = agent.as_ref().map_or(&project.machine, |a| &a.machine);
+        if let Some(why) = self.refused(machine).filter(|_| agent.is_some() || lone) {
             // The last list stays in the sidebar; the screen says why there is none.
-            center(
+            self.center(
                 f,
+                r,
                 vec![
                     Line::from(why),
                     Line::from(""),
@@ -2503,19 +3010,25 @@ impl App {
             );
             return;
         }
-        let Some(a) = self.current().cloned() else {
-            let y = center(
+        let Some(a) = agent else {
+            if !lone {
+                self.center(f, r, vec![Line::from("Pick an agent in the sidebar")]);
+                return;
+            }
+            let project = project.clone();
+            let y = self.center(
                 f,
+                r,
                 vec![
                     Line::from(format!("No agents in {} yet.", project.name)),
                     Line::from(quips::empty_project(self.keys.wit)),
                     Line::from(""),
                 ],
             );
-            button(self, f, y, " + bash ", Hit::NewTab(project.clone()));
-            button(
-                self,
+            self.button(f, r, y, " + bash ", Hit::NewTab(project.clone()));
+            self.button(
                 f,
+                r,
                 y + 2,
                 " + Agent (Claude Code, Codex, …) ",
                 Hit::NewAgent(project),
@@ -2523,28 +3036,32 @@ impl App {
             return;
         };
         if a.status == "starting" {
-            center(f, vec![Line::from(format!("Starting {}…", a.name))]);
+            self.center(f, r, vec![Line::from(format!("Starting {}…", a.name))]);
             return;
         }
         if !a.running() {
-            let y = center(
+            let y = self.center(
                 f,
+                r,
                 vec![
                     Line::from(format!("{} is {}.", a.name, a.status)),
                     Line::from(""),
                 ],
             );
-            button(self, f, y, " Start ", Hit::Start(a.id(), false));
-            button(
-                self,
+            self.button(f, r, y, " Start ", Hit::Start(a.id(), false));
+            self.button(
                 f,
+                r,
                 y + 2,
                 " Start a new conversation… ",
                 Hit::Start(a.id(), true),
             );
             return;
         }
-        if self.view.owner != (a.machine.clone(), a.pane.clone().unwrap_or_default()) {
+        let Some(view) = self.panes.get(&id).map(|p| &p.view) else {
+            return;
+        };
+        if view.owner != (a.machine.clone(), a.pane.clone().unwrap_or_default()) {
             return;
         }
         // The theme colours the terminal too: default background and text, and the 16 ANSI
@@ -2564,9 +3081,8 @@ impl App {
         }
         // A pane taller than this area (another viewer sized it) shows its bottom rows: the input
         // line and any dialog live there, and nothing must be typed into a row out of sight.
-        let skip = self.rows_skip();
-        for (i, row) in self
-            .view
+        let skip = self.rows_skip(id);
+        for (i, row) in view
             .rows
             .iter()
             .skip(skip as usize)
@@ -2590,14 +3106,11 @@ impl App {
         }
         // The selection sits on top of the text, reversed, the way a terminal shows one. A wide
         // character is marked once, on the cell it starts at.
-        if let Some((a, b)) = self.sel {
+        if let Some((sel, a, b)) = self.sel
+            && sel == id
+        {
             let (a, b) = if a <= b { (a, b) } else { (b, a) };
-            let drawn = self
-                .view
-                .rows
-                .iter()
-                .skip(skip as usize)
-                .take(r.height as usize);
+            let drawn = view.rows.iter().skip(skip as usize).take(r.height as usize);
             for (i, row) in drawn.enumerate() {
                 let vrow = skip as usize + i;
                 if vrow < a.0 as usize || vrow > b.0 as usize {
@@ -2620,10 +3133,10 @@ impl App {
                 }
             }
         }
-        if self.view.scroll > 0 {
+        if view.scroll > 0 {
             let note = format!(
                 " ↑ {} lines back · scroll down or type to return ",
-                self.view.scroll
+                view.scroll
             );
             let w = (note.chars().count() as u16).min(r.width);
             f.render_widget(
@@ -2635,9 +3148,12 @@ impl App {
                     height: 1,
                 },
             );
-        } else if let (Some((cx, cy)), false, None) =
-            (self.view.cursor, self.in_sidebar, &self.modal)
-            && let Some(cy) = cy.checked_sub(skip)
+        } else if let (Some((cx, cy)), true, false, None) = (
+            view.cursor,
+            id == self.focused(),
+            self.in_sidebar,
+            &self.modal,
+        ) && let Some(cy) = cy.checked_sub(skip)
             && cx < r.width
             && cy < r.height
         {
@@ -2664,6 +3180,9 @@ impl App {
             left.push(Span::raw(on));
             left.push(Span::styled(g, gs));
             left.push(Span::raw(format!(" {} {}", a.name, a.status)));
+        }
+        if self.tree.zoomed {
+            left.push(Span::styled("   zoomed", Style::default().fg(p.accent)));
         }
         // A fresh notice or the prefix hint goes first: it lasts seconds and may matter more.
         if self.prefix {
@@ -2779,35 +3298,43 @@ impl App {
                     Line::from("the screen: a best guess that can lag a moment."),
                     Line::from(""),
                 ];
-                for (_, _, action, text) in ACTIONS {
-                    if self.keys.label(action).is_empty() {
-                        continue;
+                let mut entries: Vec<(String, &str)> = ACTIONS
+                    .iter()
+                    .map(|(_, _, action, text)| (self.keys.label(*action), *text))
+                    .filter(|(label, _)| !label.is_empty())
+                    .collect();
+                entries.push((format!("{} 1…9", self.keys.prefix.label()), "Tab 1 to 9"));
+                entries.push((
+                    format!("{} {}", self.keys.prefix.label(), self.keys.prefix.label()),
+                    "Send the prefix key itself to the agent",
+                ));
+                // One column when it fits, else two, so every shortcut stays on a short screen.
+                let two = lines.len() + entries.len() + 6 > area.height as usize;
+                let width = if two { area.width.min(120) } else { 90 };
+                let column = (width.saturating_sub(4) / 2) as usize;
+                let entry = |(key, text): &(String, &str), room: usize| {
+                    vec![
+                        Span::styled(format!("{key:>18}  "), Style::default().fg(p.accent)),
+                        Span::raw(fit(text, room.saturating_sub(20))),
+                    ]
+                };
+                if two {
+                    lines.clear();
+                    let half = entries.len().div_ceil(2);
+                    for i in 0..half {
+                        let mut spans = entry(&entries[i], column);
+                        if let Some(right) = entries.get(i + half) {
+                            let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                            spans.push(Span::raw(" ".repeat(column.saturating_sub(used))));
+                            spans.extend(entry(right, column));
+                        }
+                        lines.push(Line::from(spans));
                     }
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("{:>22}  ", self.keys.label(action)),
-                            Style::default().fg(p.accent),
-                        ),
-                        Span::raw(text),
-                    ]));
+                } else {
+                    for e in &entries {
+                        lines.push(Line::from(entry(e, usize::MAX)));
+                    }
                 }
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:>22}  ", format!("{} 1…9", self.keys.prefix.label())),
-                        Style::default().fg(p.accent),
-                    ),
-                    Span::raw("Tab 1 to 9"),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!(
-                            "{:>22}  ",
-                            format!("{} {}", self.keys.prefix.label(), self.keys.prefix.label())
-                        ),
-                        Style::default().fg(p.accent),
-                    ),
-                    Span::raw("Send the prefix key itself to the agent"),
-                ]));
                 lines.push(Line::from(""));
                 let src = if self.keys.source.is_empty() {
                     "~/.config/pctl/config.toml (not created yet)".to_string()
@@ -2823,7 +3350,7 @@ impl App {
                     Style::default().fg(p.muted),
                 )));
                 let h = lines.len() as u16 + 2;
-                let r = centered(area, 90, h);
+                let r = centered(area, width, h);
                 boxed(f, r, "Shortcuts");
                 f.render_widget(Paragraph::new(lines), inner(r));
             }
@@ -3230,6 +3757,175 @@ mod tests {
         for bad in ["PS1='$ '; clear", "a b", "-x", ".hidden", "a/b", "한글"] {
             assert!(!super::plain_name(bad), "{bad}");
         }
+    }
+    fn app_with(names: &[&str]) -> App {
+        let mut app = App::new(ThemeName::ALL[0], Keymap::defaults());
+        app.agents = names.iter().map(|n| agent(n, "idle")).collect();
+        app.machines[0].loaded = true;
+        app.set_project(Some(Id::new("", "p")));
+        app.term = Rect::new(0, 1, 80, 24);
+        app
+    }
+    fn in_cells(app: &App) -> Vec<Option<String>> {
+        app.tree
+            .leaves()
+            .iter()
+            .map(|id| app.panes[*id].agent.as_ref().map(|a| a.name.clone()))
+            .collect()
+    }
+    fn name(n: &str) -> Option<String> {
+        Some(n.to_string())
+    }
+    #[test]
+    fn a_new_cell_is_empty_and_an_agent_is_never_shown_twice() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.tab.insert(Id::new("", "p"), "a".into());
+        app.settle();
+        assert_eq!(
+            in_cells(&app),
+            [name("a")],
+            "one cell shows the project's tab"
+        );
+        app.split(Dir::Right);
+        assert_eq!(in_cells(&app), [name("a"), None]);
+        assert_eq!(app.tree.focus, 1, "the new cell has the focus");
+        app.open_agent(&a_id("b"));
+        assert_eq!(in_cells(&app), [name("a"), name("b")]);
+        // Asking for one that is shown focuses its cell instead of showing it again.
+        app.open_agent(&a_id("a"));
+        assert_eq!(
+            (in_cells(&app), app.tree.focus),
+            ([name("a"), name("b")].to_vec(), 0)
+        );
+        // Another agent takes the place of the one in the focused cell.
+        app.open_agent(&a_id("c"));
+        assert_eq!(in_cells(&app), [name("c"), name("b")]);
+        // An agent that is not listed is not opened.
+        app.open_agent(&a_id("nobody"));
+        assert_eq!(in_cells(&app), [name("c"), name("b")]);
+    }
+    #[test]
+    fn closing_a_cell_keeps_the_agent_and_the_last_cell() {
+        let mut app = app_with(&["a", "b"]);
+        app.open_agent(&a_id("a"));
+        app.split(Dir::Down);
+        app.open_agent(&a_id("b"));
+        app.close_cell();
+        assert_eq!(in_cells(&app), [name("a")]);
+        assert_eq!(app.agents.len(), 2, "nothing was stopped or removed");
+        app.close_cell();
+        assert_eq!(in_cells(&app), [name("a")]);
+        assert!(app.notice.contains("last cell"), "{}", app.notice);
+    }
+    #[test]
+    fn a_single_cell_follows_the_project_and_its_tab() {
+        let mut app = app_with(&["a", "b"]);
+        app.agents[1].project = "q".into();
+        app.tab.insert(Id::new("", "p"), "a".into());
+        app.tab.insert(Id::new("", "q"), "b".into());
+        app.settle();
+        assert_eq!(app.current().map(|a| a.name.as_str()), Some("a"));
+        // With one cell, opening an agent of another project moves the project, as before cells.
+        app.open_agent(&a_id("b"));
+        assert_eq!(app.project, Some(Id::new("", "q")));
+        assert_eq!(app.current().map(|a| a.name.as_str()), Some("b"));
+        // Each project keeps its own cells.
+        app.set_project(Some(Id::new("", "p")));
+        app.split(Dir::Right);
+        app.set_project(Some(Id::new("", "q")));
+        assert_eq!(app.tree.len(), 1);
+        app.set_project(Some(Id::new("", "p")));
+        assert_eq!(app.tree.len(), 2, "p's two cells came back");
+        // With several, an agent of another project goes into the focused cell and the project stays.
+        app.open_agent(&a_id("b"));
+        assert_eq!(app.project, Some(Id::new("", "p")));
+        assert_eq!(in_cells(&app), [name("a"), name("b")]);
+        // A single cell whose agent has left the list shows the project's tab again.
+        let mut app = app_with(&["a", "b"]);
+        app.tab.insert(Id::new("", "p"), "a".into());
+        app.settle();
+        app.agents.retain(|x| x.name != "a");
+        app.tab.insert(Id::new("", "p"), "b".into());
+        app.settle();
+        assert_eq!(in_cells(&app), [name("b")]);
+    }
+    #[test]
+    fn the_layout_of_a_project_round_trips_through_the_view_file() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.open_agent(&a_id("a"));
+        app.split(Dir::Right);
+        app.open_agent(&a_id("b"));
+        app.split(Dir::Down);
+        app.open_agent(&Id::new("", "c"));
+        app.resize_cell(Side::Up);
+        app.focus_index(1);
+        let saved = app.layouts_json();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            (saved[0]["project"].as_str(), saved[0]["machine"].as_str()),
+            (Some("p"), Some(""))
+        );
+        // Through text, as the file holds it, into a fresh app.
+        let text = serde_json::to_string(&saved).expect("json");
+        let again: Vec<Value> = serde_json::from_str(&text).expect("parse");
+        let mut fresh = app_with(&[]);
+        let tree = fresh.tree_from_json(&again[0]).expect("a tree");
+        fresh.layouts.insert(Id::new("", "q"), tree);
+        fresh.set_project(Some(Id::new("", "q")));
+        assert_eq!(in_cells(&fresh), [name("a"), name("b"), name("c")]);
+        assert_eq!(fresh.tree.focus, 1);
+        assert_eq!(fresh.tree.geometry(app.term), app.tree.geometry(app.term));
+        // A cell that held an agent of another computer keeps its computer.
+        let remote = json!({"focus": 0, "tree": {"split": "right", "ratio": 500,
+            "a": {"machine": "rm", "agent": "x"}, "b": {"machine": "", "agent": "x"}}});
+        let mut app = app_with(&[]);
+        let tree = app.tree_from_json(&remote).expect("a tree");
+        let ids: Vec<Option<Id>> = tree
+            .leaves()
+            .iter()
+            .map(|id| app.panes[*id].agent.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            [Some(Id::new("rm", "x")), Some(Id::new("", "x"))],
+            "same name, two computers, two agents"
+        );
+        // The same agent twice is kept in the first cell only.
+        let twice = json!({"focus": 0, "tree": {"split": "down", "ratio": 500,
+            "a": {"machine": "", "agent": "x"}, "b": {"machine": "", "agent": "x"}}});
+        let tree = app.tree_from_json(&twice).expect("a tree");
+        let ids: Vec<Option<Id>> = tree
+            .leaves()
+            .iter()
+            .map(|id| app.panes[*id].agent.clone())
+            .collect();
+        assert_eq!(ids, [Some(Id::new("", "x")), None]);
+        // An empty cell and a damaged tree.
+        assert!(
+            app.tree_from_json(&json!({"tree": {"split": "up"}}))
+                .is_none()
+        );
+        let empty = json!({"tree": {"split": "right", "a": {}, "b": {}}});
+        let tree = app.tree_from_json(&empty).expect("a tree");
+        assert!(
+            tree.leaves()
+                .iter()
+                .all(|id| app.panes[*id].agent.is_none())
+        );
+    }
+    #[test]
+    fn the_agent_typed_to_is_the_one_in_the_focused_cell() {
+        let mut app = app_with(&["a"]);
+        app.agents.push(agent_on("rm", "r", "idle"));
+        app.open_agent(&a_id("a"));
+        app.split(Dir::Right);
+        app.open_agent(&Id::new("rm", "r"));
+        assert_eq!(app.current().map(|a| a.id()), Some(Id::new("rm", "r")));
+        app.focus_index(0);
+        assert_eq!(app.current().map(|a| a.id()), Some(a_id("a")));
+        // A cell with no agent has nobody to type to.
+        app.split(Dir::Down);
+        assert!(app.current().is_none());
     }
     #[test]
     fn a_list_answer_becomes_an_update() {

@@ -8,12 +8,15 @@ every 10 ms. Measured, from the viewer's screen (what a person would see):
   output staleness    age of the newest streamed line on screen, and screen updates per second
   app CPU             the app and the tmux processes it starts, idle and streaming (1.0 = one core)
   tmux calls          per second, by tmux command (the --tmux binary is a logging wrapper for this pass)
+With --cells 4 the app shows four cells (2x2): a-main (key echo, focused), a-stream (streams), two idle agents.
 Works on macOS (libproc) and Linux (/proc). Poll cost of the harness itself is reported as `poll_ms`:
 no latency below it can be seen."""
 import argparse, ctypes, json, os, pathlib, platform, re, shutil, statistics, subprocess, tempfile, time
 p = argparse.ArgumentParser(); p.add_argument('--bin', required=True); p.add_argument('--tmux', required=True); p.add_argument('--report', required=True)
 p.add_argument('--agents', type=int, default=24); p.add_argument('--keys', type=int, default=60); p.add_argument('--burst', type=int, default=40)
-p.add_argument('--seconds', type=int, default=20); p.add_argument('--label', default=''); a = p.parse_args()
+p.add_argument('--seconds', type=int, default=20); p.add_argument('--label', default='')
+p.add_argument('--cells', type=int, default=1, help='1 or 4: with 4 the app shows four cells; the key echo is measured in the focused one while another streams')
+a = p.parse_args()
 B = str(pathlib.Path(a.bin).resolve()); T = str(pathlib.Path(a.tmux).resolve())
 root = pathlib.Path(tempfile.mkdtemp(prefix='pctl-perf-', dir=os.path.realpath('/tmp'))); state = root / 's'; V = root / 'v.sock'
 bindir = root / 'bin'; bindir.mkdir(); calls = root / 'calls.log'
@@ -38,7 +41,14 @@ def cli(*args, tmux=T):
     q = subprocess.run([B, '--state', str(state), '--tmux', tmux, *map(str, args)], text=True, capture_output=True, timeout=60, env=ENV)
     assert q.returncode == 0, (args, q.stderr); return q.stdout
 def vt(*args): return subprocess.run([T, '-S', str(V), *map(str, args)], text=True, capture_output=True, timeout=10).stdout
-def lines(): return [l.split('│', 1)[-1].rstrip() for l in vt('capture-pane', '-p', '-t', 'view').split('\n')]  # the agent's part of each row
+VIEW_COLS, SIDE = 140, 27  # the viewer's width, and the columns of the sidebar and its edge
+# With four cells the focused cell (a-main) is the top left and the streaming one the top right.
+REGIONS = {'echo': (SIDE, SIDE + (VIEW_COLS - SIDE - 1) // 2), 'stream': (SIDE + (VIEW_COLS - SIDE - 1) // 2 + 1, VIEW_COLS)}
+def lines(region=None):
+    rows = vt('capture-pane', '-p', '-t', 'view').split('\n')
+    if a.cells > 1 and region:
+        x0, x1 = REGIONS[region]; return [l[x0:x1].rstrip() for l in rows]
+    return [l.split('│', 1)[-1].rstrip() for l in rows]  # the agent's part of each row
 def until(fn, seconds=15):
     end = time.monotonic() + seconds
     while time.monotonic() < end:
@@ -68,7 +78,9 @@ try:
     for i in range(a.agents):
         proj = 'alpha' if i < a.agents // 2 else 'beta'; name = 'a-main' if i == 0 else f'{proj[0]}-w{i:02d}'
         d = root / 'proj' / proj / name; d.mkdir(parents=True)
-        cli('session', 'add', '--name', name, '--cwd', d, '--project', proj, '--', *(['python3', '-u', bindir / 'echoer.py'] if i == 0 else ['sleep', '3600']))
+        if a.cells > 1 and i == 1: name = 'a-stream'
+        echoer = i == 0 or (a.cells > 1 and i == 1)
+        cli('session', 'add', '--name', name, '--cwd', d, '--project', proj, '--', *(['python3', '-u', bindir / 'echoer.py'] if echoer else ['sleep', '3600']))
     st = lambda *x: subprocess.run([T, '-S', str(state / 'tmux.sock'), *map(str, x)], text=True, capture_output=True, timeout=10).stdout.strip()
     server_pid = st('display-message', '-p', '#{pid}')
 
@@ -77,18 +89,32 @@ try:
         cmd = f"env -u TMUX {B} --state {state} --tmux {tmux}; echo EXITED $?; sleep 600"
         subprocess.run([T, '-S', str(V), '-f', '/dev/null', 'new-session', '-d', '-x', '140', '-y', '40', '-s', 'view', cmd], env=ENV, check=True, timeout=10)
         assert until(lambda: any(l.startswith(('ready', 'k', 's')) for l in lines())), '\n'.join(lines())
+        if a.cells > 1: make_cells()
         shell = vt('display-message', '-p', '-t', 'view', '#{pane_pid}').strip()
         ps = subprocess.run(['ps', '-A', '-o', 'pid=,ppid=,command='], text=True, capture_output=True).stdout.splitlines()
         app = [l.split()[0] for l in ps if l.split()[1] == shell and B in l][0]
         return app, vt('display-message', '-p', '#{pid}').strip()
 
+    def sidebar_click(name):
+        rows = vt('capture-pane', '-p', '-t', 'view').split('\n')
+        y = next(i for i, l in enumerate(rows) if name in l[:26]); x = rows[y].index(name)
+        vt('send-keys', '-t', 'view', '-l', f'\x1b[<0;{x + 1};{y + 1}M\x1b[<0;{x + 1};{y + 1}m'); time.sleep(0.5)
+    def make_cells():
+        """2x2: a-main top left (focused at the end), a-stream top right, two idle agents below."""
+        vt('send-keys', '-t', 'view', 'C-b', '%'); time.sleep(0.4); sidebar_click('a-stream')
+        vt('send-keys', '-t', 'view', 'C-b', '"'); time.sleep(0.4); sidebar_click('a-w02')
+        vt('send-keys', '-t', 'view', 'C-b', 'Left'); time.sleep(0.4)
+        vt('send-keys', '-t', 'view', 'C-b', '"'); time.sleep(0.4); sidebar_click('a-w03')
+        vt('send-keys', '-t', 'view', 'C-b', 'Up'); time.sleep(0.4)
+        seen = lambda r: any(l.startswith(('ready', 'k', 's')) for l in lines(r))  # the second pass starts with the agents already used
+        assert until(lambda: seen('echo') and seen('stream')), '\n'.join(lines())
     keys = [0]  # keys the agent has echoed so far, across passes
     def keyseq(n, char='x'):
         """Send one key; seconds until its echo line is on screen."""
         vt('send-keys', '-t', 'view', '-l', char); t0 = time.monotonic()
         want = f'k{n} '
         while time.monotonic() - t0 < 5:
-            if any(l.startswith(want) for l in lines()): return (time.monotonic() - t0) * 1000
+            if any(l.startswith(want) for l in lines('echo')): return (time.monotonic() - t0) * 1000
         raise AssertionError(f'no echo for key {n}\n' + '\n'.join(lines()))
 
     def run_pass(tmux):
@@ -112,15 +138,20 @@ try:
         out['key_echo_ms'] = dist(ms)
         # Burst: all at once, as fast typing or key repeat arrives.
         word = ''.join('abcdefghij'[i % 10] for i in range(a.burst)); vt('send-keys', '-t', 'view', '-l', word); t0 = time.monotonic(); keys[0] += a.burst
-        assert until(lambda: any(l.startswith(f'k{keys[0]} ') for l in lines()), 30)
+        assert until(lambda: any(l.startswith(f'k{keys[0]} ') for l in lines('echo')), 30)
         out['burst_ms'] = {'keys': a.burst, 'until_last_echo': round((time.monotonic() - t0) * 1000)}
         # Streaming: one line every 10 ms.
-        vt('send-keys', '-t', 'view', '-l', '~'); assert until(lambda: any(re.match(r's\d+ \d+', l) for l in lines()))
+        if a.cells > 1:  # the stream starts in the other cell, then the focus comes back
+            vt('send-keys', '-t', 'view', 'C-b', 'Right'); time.sleep(0.4)
+            vt('send-keys', '-t', 'view', '-l', '~'); time.sleep(0.4)
+            vt('send-keys', '-t', 'view', 'C-b', 'Left'); time.sleep(0.4)
+        else: vt('send-keys', '-t', 'view', '-l', '~')
+        assert until(lambda: any(re.match(r's\d+ \d+', l) for l in lines('stream')))
         stale, seen = [], []
         def sample():
             end = time.monotonic() + a.seconds; last = None
             while time.monotonic() < end:
-                ss = [l.split() for l in lines() if re.match(r's\d+ \d+$', l)]
+                ss = [l.split() for l in lines('stream') if re.match(r's\d+ \d+$', l)]
                 if ss:
                     s, ts = ss[-1]; now = time.monotonic_ns(); stale.append((now - int(ts)) / 1e6)
                     if s != last: seen.append(time.monotonic()); last = s
@@ -130,11 +161,13 @@ try:
         ms = []
         for i in range(a.keys // 2): keys[0] += 1; ms.append(keyseq(keys[0], 'abcdefghij'[i % 10])); time.sleep(0.15)
         out['key_echo_while_streaming_ms'] = dist(ms)
+        if a.cells > 1:
+            vt('send-keys', '-t', 'view', 'C-b', 'Right'); time.sleep(0.4)
         vt('send-keys', '-t', 'view', '-l', '^'); time.sleep(1)
         return out
 
     res = {'label': a.label, 'binary': B, 'pctl': subprocess.run([B, '--version'], text=True, capture_output=True).stdout.strip(), 'tmux': subprocess.run([T, '-V'], text=True, capture_output=True).stdout.strip(),
-           'platform': platform.platform(), 'agents': a.agents, 'viewer': '140x40'}
+           'platform': platform.platform(), 'agents': a.agents, 'cells': a.cells, 'viewer': '140x40'}
     res['timing'] = run_pass(T)
     # Same again through the logging wrapper (it adds a shell start to every call, so only its counts count).
     res['calls'] = run_pass(str(bindir / 'tmuxlog'))
