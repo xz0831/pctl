@@ -31,6 +31,7 @@ fn run() -> Result<(), String> {
         } else {
             first
         };
+        let mut project = None;
         let mut look = None;
         let mut dark = false;
         while let Some(arg) = args.next() {
@@ -43,12 +44,17 @@ fn run() -> Result<(), String> {
                     })
                 }
                 "--dark" => dark = true,
+                "--project" => project = Some(args.next().ok_or("missing project")?),
                 _ => return Err("unexpected view argument".into()),
             }
         }
         return mdv::view::run(
             std::path::Path::new(&path),
-            mdv::view::ViewOptions { look, dark },
+            mdv::view::ViewOptions {
+                project,
+                look,
+                dark,
+            },
             mdv::view::Hooks::default(),
         );
     }

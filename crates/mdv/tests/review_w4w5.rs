@@ -7,6 +7,7 @@ fn event() -> Event {
         req_id: new_id(),
         path: "/review.md".into(),
         feed_id: None,
+        project: None,
         block_id: 0,
         range: [0, 4],
         fingerprint: "ab".into(),

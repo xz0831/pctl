@@ -570,3 +570,89 @@ fn original_quote_survives_edit_in_all_looks() {
     }
     assert!(!f.root.join("unused-dry.json").exists());
 }
+
+#[test]
+fn explicit_project_routes_a_document_outside_projects() {
+    let mut f = Fixture::new("outside.md", "# Outside document\n");
+    let outside = f.root.join("outside.md");
+    fs::rename(&f.doc, &outside).unwrap();
+    f.doc = outside;
+    for project in [false, true] {
+        let mut args = vec!["view", f.doc.to_str().unwrap()];
+        if project {
+            args.extend(["--project", "fixture"]);
+        }
+        let mut p = Pty::new(&f, &args, "project-dry.json");
+        p.wait_for("T -> Tree");
+        p.send(TAB);
+        p.compose(
+            true,
+            if project {
+                "explicit question"
+            } else {
+                "path question"
+            },
+        );
+        p.wait_for(if project {
+            "Not confirmed"
+        } else {
+            "No recipient"
+        });
+        if project {
+            let dry: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(f.root.join("project-dry.json")).unwrap())
+                    .unwrap();
+            assert_eq!(dry[1], "fixture-main");
+            let ask = f
+                .events()
+                .into_iter()
+                .find(|e| e["text"] == "explicit question")
+                .unwrap();
+            assert_eq!(ask["project"], "fixture");
+        } else {
+            assert!(!f.root.join("project-dry.json").exists());
+        }
+        p.quit();
+    }
+}
+
+#[test]
+fn saved_question_keeps_its_project_on_retry() {
+    let f = Fixture::new(
+        "retry.md", "# Retry
+",
+    );
+    fs::write(f.root.join("sessions"), "[]").unwrap();
+    let mut p = Pty::new(
+        &f,
+        &["view", f.doc.to_str().unwrap(), "--project", "fixture"],
+        "retry.json",
+    );
+    p.wait_for("T -> Tree");
+    p.send(TAB);
+    p.compose(true, "saved question");
+    p.wait_for("No recipient");
+    p.quit();
+    drop(p);
+    let session: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(f.root.join("session")).unwrap()).unwrap();
+    fs::write(
+        f.root.join("sessions"),
+        serde_json::json!([session]).to_string(),
+    )
+    .unwrap();
+    let mut p = Pty::new(
+        &f,
+        &["view", f.doc.to_str().unwrap(), "--project", "other"],
+        "retry.json",
+    );
+    p.wait_for("T -> Tree");
+    p.send(TAB);
+    p.send(b"s");
+    p.wait_for("Saved · Not confirmed");
+    let dry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(f.root.join("retry.json")).unwrap()).unwrap();
+    assert_eq!(dry[1], "fixture-main");
+    p.quit();
+}
+

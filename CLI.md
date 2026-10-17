@@ -441,7 +441,7 @@ There is no `--force`. Nothing is deleted outright.
 
 ## Documents (`pctl view`)
 
-`pctl view <file|folder> [--look portal|garage] [--dark]` opens the document reader (the `mdv` crate in `crates/mdv`) in the terminal it runs in. It needs an interactive terminal and works in any one: nothing in it is specific to a terminal program. The reader is built in; the `mdv` command is not needed.
+`pctl view <file|folder> [--project <name>] [--look portal|garage] [--dark]` opens the document reader (the `mdv` crate in `crates/mdv`) in the terminal it runs in. It needs an interactive terminal and works in any one: nothing in it is specific to a terminal program. The reader is built in; the `mdv` command is not needed. `--project` selects the project whose main receives questions; otherwise the reader uses the path under `$HOME/Projects`.
 
 - Copy (`y`) puts the text on the clipboard of the computer it runs on (the same `PCTL_CLIP_WRITE_TEXT` seam and command search as the app) and writes OSC 52 to the terminal. The status line says `Copied` only when a command ran here or the terminal is known to honour OSC 52; over ssh no command runs and it says `paste to verify`; a VTE terminal (MATE Terminal, GNOME Terminal) ignores OSC 52 and the line says so.
 - A question about a passage goes to the main agent of the document's project, through `tell` in the same process (the reader first checks that there is exactly one running `*-main` session in the project, and that it is still the run it picked). Delivery states are `tell`'s: reached, queued, typed but unconfirmed, and blocked (nothing is typed, the question is kept and can be retried). An agent answers with `pctl show --answer <request-id> <text>`.

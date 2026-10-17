@@ -17,6 +17,8 @@ pub struct Event {
     pub req_id: String,
     pub path: String,
     pub feed_id: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
     pub block_id: usize,
     pub range: [usize; 2],
     pub fingerprint: String,
@@ -443,8 +445,11 @@ impl Recipient {
         })
     }
 }
-fn resolve(path: &str) -> Result<Option<Recipient>, String> {
-    let project = project(path);
+fn resolve(path: &str, explicit: Option<&str>) -> Result<Option<Recipient>, String> {
+    let project = explicit
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| project(path));
     let Some(sessions) = pctl(&["session", "list"]) else {
         return Ok(None);
     };
@@ -465,7 +470,10 @@ fn resolve(path: &str) -> Result<Option<Recipient>, String> {
     Ok(target.filter(|r| !r.agent_id.is_empty() && !r.run_id.is_empty()))
 }
 pub fn resolve_recipient(event: &Event) -> Option<String> {
-    resolve(&event.path).ok().flatten().map(|r| r.name)
+    resolve(&event.path, event.project.as_deref())
+        .ok()
+        .flatten()
+        .map(|r| r.name)
 }
 fn local_bin(name: &str) -> PathBuf {
     let local = PathBuf::from(env::var_os("HOME").unwrap_or_default())
@@ -482,8 +490,8 @@ pub(crate) fn pctl_bin() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| local_bin("pctl"))
 }
-pub fn focus_agent(path: &str) -> Result<String, String> {
-    let target = resolve(path)?.ok_or("No recipient")?;
+pub fn focus_agent(path: &str, project: Option<&str>) -> Result<String, String> {
+    let target = resolve(path, project)?.ok_or("No recipient")?;
     let session = pctl(&["session", "get", &target.name]).ok_or("Recipient unavailable")?;
     if session["name"] != target.name
         || session["agent_id"] != target.agent_id
@@ -614,7 +622,7 @@ pub fn submit_with_hook(
         return Ok("Saved");
     }
     let delivered = (|| -> Result<String, String> {
-        let target = match resolve(&event.path) {
+        let target = match resolve(&event.path, event.project.as_deref()) {
             Ok(target) => target,
             Err(reason) => return Ok(reason),
         };
@@ -713,12 +721,20 @@ pub fn state(text: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_event_without_project_still_loads() {
+        let mut old = serde_json::to_value(sample()).unwrap();
+        old.as_object_mut().unwrap().remove("project");
+        let event: Event = serde_json::from_value(old).unwrap();
+        assert_eq!(event.project, None);
+    }
     fn sample() -> Event {
         Event {
             kind: "ask".into(),
             req_id: new_id(),
             path: "/test.md".into(),
             feed_id: None,
+            project: None,
             block_id: 0,
             range: [0, 4],
             fingerprint: "ab".into(),
@@ -1016,7 +1032,7 @@ echo '도달'
         session["run_id"] = "new".into();
         fs::write(root.join("session"), serde_json::to_vec(&session).unwrap()).unwrap();
         assert_eq!(
-            focus_agent(&event.path).unwrap(),
+            focus_agent(&event.path, None).unwrap(),
             "PCTL 화면이 열려 있지 않음"
         );
         assert!(
@@ -1026,7 +1042,7 @@ echo '도달'
         );
         fs::write(root.join("focus-error"), "").unwrap();
         assert!(
-            focus_agent(&event.path)
+            focus_agent(&event.path, None)
                 .unwrap_err()
                 .contains("focus supports one interactive client")
         );

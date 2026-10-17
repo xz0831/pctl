@@ -34,6 +34,7 @@ pub use mdv::threads::{AskHook, AskOutcome, AskRequest};
 
 #[derive(Default)]
 pub struct ViewOptions {
+    pub project: Option<String>,
     pub look: Option<mdv::Look>,
     pub dark: bool,
 }
@@ -342,6 +343,7 @@ struct App {
     src: String,
     layout: Layout,
     path: PathBuf,
+    project: Option<String>,
     tree: PathBuf,
     entries: Vec<PathBuf>,
     inbox: Inbox,
@@ -401,6 +403,7 @@ impl App {
             src: String::new(),
             layout,
             path: absolute.clone(),
+            project: None,
             tree,
             entries: Vec::new(),
             inbox: Inbox::default(),
@@ -624,6 +627,7 @@ impl App {
         let mut event = mdv::threads::Event {
             kind,
             req_id: mdv::threads::new_id(),
+            project: Some(self.project()),
             feed_id: mdv::threads::feed(&path).and_then(|v| v["id"].as_str().map(String::from)),
             path,
             block_id: block.id,
@@ -674,9 +678,17 @@ impl App {
         self.message = "Saving".into();
         Ok(())
     }
+    fn project(&self) -> String {
+        self.project
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| mdv::threads::project(&self.path.to_string_lossy()))
+    }
     fn focus_agent(&mut self) {
         self.message =
-            mdv::threads::focus_agent(&self.path.to_string_lossy()).unwrap_or_else(|error| error);
+            mdv::threads::focus_agent(&self.path.to_string_lossy(), self.project.as_deref())
+                .unwrap_or_else(|error| error);
         self.menu = None;
     }
     fn retry_question(&mut self) -> io::Result<()> {
@@ -1724,29 +1736,16 @@ impl App {
                 )?;
             }
         }
-        let project = self
-            .path
-            .ancestors()
-            .find_map(|p| {
-                let name = p.file_name()?.to_string_lossy();
-                if name.len() > 3
-                    && name.as_bytes()[0].is_ascii_digit()
-                    && name.as_bytes()[1].is_ascii_digit()
-                    && name.as_bytes()[2] == b'_'
-                {
-                    Some(name.into_owned())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| {
-                self.path
-                    .parent()
-                    .and_then(Path::file_name)
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
-            });
+        let project = match self.project() {
+            project if !project.is_empty() => project,
+            _ => self
+                .path
+                .parent()
+                .and_then(Path::file_name)
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        };
         let offer = self
             .inbox
             .entries
@@ -1840,6 +1839,7 @@ fn run_terminal(path: &Path, options: ViewOptions, hooks: Hooks) -> io::Result<(
         ));
     }
     let mut app = App::new(path, hooks)?;
+    app.project = options.project;
     if options.look.is_some() || options.dark {
         app.style = Style::for_look(options.look.unwrap_or(mdv::Look::Portal), options.dark);
         app.rewrap();
@@ -2042,6 +2042,7 @@ mod tests {
             src: src.into(),
             layout,
             path: PathBuf::new(),
+            project: None,
             tree: PathBuf::new(),
             entries: Vec::new(),
             inbox: Inbox::default(),
@@ -2201,6 +2202,7 @@ mod tests {
             req_id: "fixture".into(),
             path: String::new(),
             feed_id: None,
+            project: None,
             block_id: 0,
             range: [0, 9],
             fingerprint: format!("{:016x}", app.doc.blocks[0].fingerprint),

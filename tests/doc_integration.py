@@ -97,6 +97,23 @@ try:
         assert until(lambda: any(w in view_screen() for w in ('Reached', 'Queued', 'Not confirmed'))), view_screen()
         view_stop()
     case('a question reaches the project main through tell (fake session)', ask_goes_to_project_main)
+    def explicit_project_outside_projects():
+        outside = root / 'outside.md'; outside.write_text('# Outside document\n')
+        dry = root / 'outside-dry.json'
+        reader(outside, '--project', 'demo', env={'MDV_ASK_DRYRUN': str(dry)})
+        assert until(lambda: 'Outside document' in view_screen()), view_screen()
+        view_keys('Tab', 'Enter')
+        assert until(lambda: 'Ask the agent' in view_screen()), view_screen()
+        view_keys('Down', 'Down', 'Down', 'Down', 'Enter')
+        assert until(lambda: 'Enter send' in view_screen()), view_screen()
+        view_text('outside question'); view_keys('Enter')
+        assert until(dry.is_file), view_screen()
+        assert json.loads(dry.read_text())[1] == 'demo-main', dry.read_text()
+        events = [json.loads(line) for line in (root / 'threads.jsonl').read_text().splitlines()]
+        assert any(e['kind'] == 'ask' and e['text'] == 'outside question' and e['project'] == 'demo' for e in events), events
+        view_stop()
+    case('pctl view --project routes a document outside Projects (dry run)', explicit_project_outside_projects)
+
     def ask_to_blocked_main_is_saved_not_sent():
         cli('session', 'prompt', 'demo-main', 'BLOCK')
         assert until(lambda: cli('session', 'get', 'demo-main')['status'] == 'blocked')
