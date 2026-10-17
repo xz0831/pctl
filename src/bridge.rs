@@ -247,9 +247,19 @@ pub fn read_screen(
     h: u16,
     scroll: usize,
 ) -> Result<Option<Screen>> {
+    // A pane taller than the view shows its bottom rows live; scrolled back it keeps that anchor,
+    // so the window is `scroll` lines above the live one, not above the pane's top.
+    let anchor = if scroll > 0 {
+        core.tm(&["display-message", "-p", "-t", pane, "#{pane_height}"])
+            .ok()
+            .and_then(|t| t.trim().parse::<i64>().ok())
+            .map_or(0, |ph| (ph - i64::from(h)).max(0))
+    } else {
+        0
+    };
     let (start, end) = (
-        format!("-{scroll}"),
-        format!("{}", h as i64 - 1 - scroll as i64),
+        format!("{}", anchor - scroll as i64),
+        format!("{}", anchor + h as i64 - 1 - scroll as i64),
     );
     let mut args = vec!["capture-pane", "-p", "-e", "-t", pane];
     if scroll > 0 {

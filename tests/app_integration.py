@@ -228,6 +228,15 @@ try:
             assert until(lambda: size('window_width') == 100 and size('pane_height') > 30, 20), 'the client took the window'
             text('echo BOTTOM-MARK'); keys('Enter')
             assert until(lambda: 'BOTTOM-MARK' in screen()), 'a taller pane shows its bottom rows (input line in sight)'
+            # Scrolled back, the window stays anchored to the bottom like the live view: 12 lines
+            # above the live bottom, so the last cell row is 12 rows above the prompt row (the shell prompt), not the pane's top.
+            cell = lambda: [l.split('│', 1)[-1].rstrip() for l in lines()[1:25]]
+            text('seq 1 100'); keys('Enter')
+            assert until(lambda: cell()[-1].endswith('$') and cell()[-2] == '100'), cell()
+            for _ in range(2): click(60, 12, button=64)  # a press and a release each: 4 notches of 3 lines
+            assert until(lambda: '12 lines back' in screen()), screen()
+            assert until(lambda: cell()[-1] == '89' and cell()[0].split()[0] == '66'), cell()
+            keys('Escape'); assert until(lambda: 'lines back' not in screen() and cell()[-2] == '100'), screen()
             click(*side('a-main')); click(*side('a-shell'))  # opening it again asks for the app's size
             assert until(lambda: st('show-options', '-wv', '-t', pane, 'window-size') == 'manual' and size('window_width') < 100), 'with a client attached the size holds'
             w = size('window_width'); time.sleep(1.5); assert size('window_width') == w, 'and stays'
@@ -236,7 +245,7 @@ try:
         finally:
             subprocess.run([T, '-S', str(C), 'kill-server'], capture_output=True)
         app(); assert until(lambda: 'alpha / ● a-shell' in status()), status()
-    case('with a client attached the app keeps its size while open, shows the bottom rows, and leaving hands the window back', attached)
+    case('with a client attached the app keeps its size while open, shows the bottom rows (also scrolled back), and leaving hands the window back', attached)
     def agents_refused():
         for env in ({'PCTL_AGENT_ID': 'x'}, {'PCTL_RUN_ID': 'x'}, {'TMUX': f'{state}/tmux.sock,1,0'}):
             app(env=env, ready=False)
