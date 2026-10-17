@@ -24,9 +24,22 @@ case "$(cat {marker} 2>/dev/null || true)" in
 c = subprocess.Popen(["/bin/sh", "-c", sys.argv[1]], stdin=subprocess.PIPE, env=dict(os.environ, PCTL_STATE=sys.argv[2]))
 for l in sys.stdin.buffer:
     open(sys.argv[3], "ab").write(l); c.stdin.write(l); c.stdin.flush()' "$line" {remote} {reqlog} ;;
+  nowatch) for a in "$@"; do line="$a"; done
+       exec python3 {bindir}/nowatch.py "$line" {remote} {reqlog} ;;
 esac
 for a in "$@"; do line="$a"; done
 PCTL_STATE={remote} exec /bin/sh -c "$line"
+''')
+# An older pctl on the other side: it does not know `watch` and answers it like any unknown op.
+(bindir / 'nowatch.py').write_text('''import json, os, subprocess, sys
+c = subprocess.Popen(["/bin/sh", "-c", sys.argv[1]], stdin=subprocess.PIPE, env=dict(os.environ, PCTL_STATE=sys.argv[2]))
+for l in sys.stdin.buffer:
+    open(sys.argv[3], "ab").write(l)
+    req = json.loads(l)
+    if req.get("op") == "watch":
+        sys.stdout.write(json.dumps({"id": req["id"], "ok": False, "error": "unknown op watch"}) + "\\n"); sys.stdout.flush()
+    else:
+        c.stdin.write(l); c.stdin.flush()
 ''')
 ssh.chmod(0o755)
 # A full-screen agent that reads the mouse like Claude Code and shows how many wheel ticks came.
@@ -239,6 +252,89 @@ try:
         marker.write_text(''); kill_bridge()
         assert until(lambda: 'down:' not in screen() and 'r-main' in screen(), 25), 'it comes back on its own'
     case('a machine that answers nothing never freezes the app; it recovers by itself', slow)
+    def pushed():
+        marker.write_text('tee'); kill_bridge(); reqlog.write_text('')
+        assert until(lambda: 'down:' not in screen() and 'r-main' in screen(), 25), screen()
+        click(*side('r-main', 'rproj')); assert until(lambda: 'ready R in r-main' in screen()), screen()
+        assert until(lambda: '"op":"watch"' in reqlog.read_text()), reqlog.read_text()
+        text('by push'); keys('Enter')
+        assert until(lambda: 'got R: by push' in screen()), screen()
+        time.sleep(1.5)
+        log = reqlog.read_text()
+        assert log.count('"op":"screen"') <= 1, 'a remote cell is not polled once the bridge pushes (one read may go out before the first watch answer): ' + log[:900]
+        assert log.count('"op":"watch"') <= 4, log.count('"op":"watch"')
+        rcli('session', 'prompt', 'r-main', 'typed over there'); assert until(lambda: 'got R: typed over there' in screen(), 5), 'a screen change nobody here caused arrives by push'
+    case('a cell of the other machine updates by push: typing echoes and outside changes show, with no screen polling', pushed)
+    def old_bridge():
+        marker.write_text('nowatch'); kill_bridge(); reqlog.write_text('')
+        assert until(lambda: 'down:' not in screen() and 'r-main' in screen(), 25), screen()
+        click(*side('r-main', 'rproj')); assert until(lambda: 'ready R in r-main' in screen()), screen()
+        assert until(lambda: '"op":"screen"' in reqlog.read_text()), 'an older bridge is polled as before'
+        text('old bridge'); keys('Enter')
+        assert until(lambda: 'got R: old bridge' in screen()), screen()
+        marker.write_text(''); kill_bridge()
+        assert until(lambda: 'down:' not in screen() and 'r-main' in screen(), 25), screen()
+    case('a bridge that does not know watch is polled as before; typing and screens work', old_bridge)
+    def bridge_push():
+        env = dict(ENV, PCTL_STATE=str(remote), PCTL_TMUX=T)
+        b = subprocess.Popen([B, 'bridge'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, env=env)
+        import threading, queue
+        got = queue.Queue(); t = threading.Thread(target=lambda: [got.put(json.loads(l)) for l in b.stdout], daemon=True); t.start()
+        n = [0]
+        def send(op): n[0] += 1; b.stdin.write(json.dumps(dict(id=n[0], **op)) + '\n'); b.stdin.flush(); return n[0]
+        def take(pred, within=5):
+            end = time.monotonic() + within; seen = []
+            while time.monotonic() < end:
+                try: v = got.get(timeout=0.1)
+                except queue.Empty: continue
+                if pred(v): return v
+                seen.append(v)
+            return None
+        try:
+            assert take(lambda v: v.get('ev') == 'hello')
+            i = send({'op': 'list'}); ses = take(lambda v: v.get('id') == i)['sessions']
+            r = next(x for x in ses if x['name'] == 'r-main')
+            cell = lambda rev, key='7': {'key': key, 'rev': rev, 'agent': r['name'], 'run': r['run_id'], 'width': 70, 'height': 20, 'scroll': 0}
+            i = send({'op': 'watch', 'cells': [cell(1)]}); a = take(lambda v: v.get('id') == i)
+            assert a['ok'] and a['watching'] == 1, a
+            ev = take(lambda v: v.get('ev') == 'screen')
+            assert ev and ev['key'] == '7' and ev['rev'] == 1 and 'ready R in r-main' in ev['rows'] and ev['size'] == [70, 20], ev
+            assert take(lambda v: v.get('ev') == 'screen', 0.8) is None, 'an unchanged screen is not sent again'
+            rt('send-keys', '-t', r['pane'], '-l', 'seen by the watch'); assert take(lambda v: v.get('ev') == 'screen' and 'seen by the watch' in v['rows']), 'a change comes by itself'
+            # Typing through the bridge makes the cell hot: the echo is quick.
+            t0 = time.monotonic(); i = send({'op': 'keys', 'agent': r['name'], 'run': r['run_id'], 'keys': [{'literal': True, 'key': 'Z'}]})
+            assert take(lambda v: v.get('ev') == 'screen' and 'seen by the watchZ' in v['rows'], 2) and time.monotonic() - t0 < 1.0
+            # Many answers and events at once: every line is whole JSON (the reader parses each).
+            for _ in range(40): send({'op': 'list'}); send({'op': 'keys', 'agent': r['name'], 'run': r['run_id'], 'keys': [{'literal': True, 'key': 'y'}]})
+            assert take(lambda v: v.get('id') == n[0], 20), 'all answered'
+            # A new set replaces the old one; an empty one stops the events.
+            i = send({'op': 'watch', 'cells': []}); assert take(lambda v: v.get('id') == i)['watching'] == 0
+            while take(lambda v: True, 0.5): pass
+            rt('send-keys', '-t', r['pane'], '-l', 'nobody watches'); assert take(lambda v: v.get('ev'), 1.0) is None
+            # A pane that no longer holds the run is reported once, and nothing is read from it.
+            i = send({'op': 'watch', 'cells': [cell(2)]}); take(lambda v: v.get('id') == i)
+            while take(lambda v: v.get('ev') == 'screen', 0.5): pass
+            rt('set-option', '-p', '-t', r['pane'], '@pctl_run', 'someone-else')
+            ch = take(lambda v: v.get('ev') == 'changed'); assert ch and ch['key'] == '7' and ch['rev'] == 2, ch
+            assert take(lambda v: v.get('ev') in ('changed', 'screen'), 1.0) is None, 'reported once'
+            rt('set-option', '-p', '-t', r['pane'], '@pctl_run', r['run_id'])
+            # An agent that is not there at all is a change too.
+            i = send({'op': 'watch', 'cells': [dict(cell(3, key='8'), agent='no-such-agent')]}); take(lambda v: v.get('id') == i)
+            ch = take(lambda v: v.get('ev') == 'changed'); assert ch and ch['key'] == '8', ch
+            # More than 64 cells are refused whole.
+            i = send({'op': 'watch', 'cells': [cell(1, key=str(k)) for k in range(65)]}); assert take(lambda v: v.get('id') == i)['ok'] is False
+        finally:
+            b.stdin.close(); b.wait(timeout=10)
+    case('bridge: watch replaces the set, pushes a screen only when it changed, reports a changed run once, and lines never mix', bridge_push)
+    def machine_log():
+        log = state / 'app-machines.log'
+        assert log.exists() and oct(log.stat().st_mode & 0o777) == '0o600', log
+        rows = [l.split('\t') for l in log.read_text().splitlines()]
+        assert all(len(r) == 4 and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', r[0]) and r[1] == 'rm' for r in rows), rows
+        changes = [r[2] for r in rows]
+        assert 'connecting -> up' in changes and any(c.endswith('-> down') for c in changes) and 'down -> connecting' in changes and 'reconnect' in changes, changes
+        assert any(r[2].endswith('-> down') and r[3] for r in rows), 'a down line says why'
+    case('every state change of the other machine is one line in app-machines.log (time, label, change, reason), mode 0600', machine_log)
     def no_server():
         app(st=none)
         assert until(lambda: 'no pctl server here' in screen() and 'rproj' in screen() and ' rm' in screen()), screen()

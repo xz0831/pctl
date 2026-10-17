@@ -142,6 +142,8 @@ impl Drop for TerminalGuard {
 
 /// While an answer from another computer is on its way, look for it this often.
 const SOON: Duration = Duration::from_millis(10);
+/// How often the loop looks for pushed screens while a computer pushes.
+const PUSH_POLL: Duration = Duration::from_millis(4);
 
 #[derive(Clone, Debug)]
 struct Agent {
@@ -590,7 +592,7 @@ pub fn run(core: &Core) -> Result<()> {
             saved
                 .iter()
                 .filter(|m| m.enabled)
-                .map(|m| Mach::remote(&m.label, &m.target)),
+                .map(|m| Mach::remote(&m.label, &m.target, core.state.join("app-machines.log"))),
         ),
         Err(e) => app.say(format!("Machines: {e:#}")),
     }
@@ -669,6 +671,7 @@ pub fn run(core: &Core) -> Result<()> {
             }
             dirty |= app.tick();
             dirty |= app.end_viewers(core);
+            app.sync_watches();
             dirty |= app.capture_due(core);
             for machine in &app.machines {
                 if machine.unusable().is_some() {
@@ -697,6 +700,12 @@ pub fn run(core: &Core) -> Result<()> {
             }
             let wait = app.due_in();
             let wait = if app.waiting() { wait.min(SOON) } else { wait };
+            // A pushed screen is picked up within a few ms of coming in.
+            let wait = if app.machines.iter().any(Mach::pushing) {
+                wait.min(PUSH_POLL)
+            } else {
+                wait
+            };
             if event::poll(wait)? {
                 // Everything already waiting goes in one go, so fast typing is one tmux call.
                 loop {
@@ -884,6 +893,10 @@ impl App {
         for u in updates {
             self.apply(u);
         }
+        let pushed: Vec<(u32, Value)> = self.machines.iter_mut().flat_map(Mach::pushed).collect();
+        for (id, ev) in pushed {
+            dirty |= self.apply_push(id, &ev);
+        }
         let mut done = vec![];
         let mut i = 0;
         while i < self.tasks.len() {
@@ -915,6 +928,61 @@ impl App {
             }
         }
         dirty
+    }
+    /// A screen or a change the bridge of another computer pushed for a cell. Whether the screen
+    /// changed.
+    fn apply_push(&mut self, id: u32, ev: &Value) -> bool {
+        if ev["ev"] == "changed" {
+            let machine = self.agent_in(id).map(|a| a.machine.clone());
+            let changed = self.blank(id);
+            if let Some(m) = machine {
+                self.poke_machine(&m);
+            }
+            return changed;
+        }
+        self.show(id, Screen::from_answer(ev))
+    }
+    /// Tell each pushing-capable computer which of its cells are on screen, at what size and
+    /// scroll. A cell that now shows another agent starts from nothing.
+    fn sync_watches(&mut self) {
+        let mut want: HashMap<String, Vec<(u32, machines::Watched)>> = HashMap::new();
+        for id in self.visible() {
+            let Some(a) = self
+                .agent_in(id)
+                .filter(|a| a.running() && !a.machine.is_empty())
+            else {
+                continue;
+            };
+            let (Some(pane), Some(run)) = (a.pane.clone(), a.run.clone()) else {
+                continue;
+            };
+            let inner = self.panes.get(&id).map_or(Rect::default(), |p| p.inner);
+            if inner.width < 2 || inner.height < 2 {
+                continue;
+            }
+            let (machine, name) = (a.machine.clone(), a.name.clone());
+            let owner = (machine.clone(), pane);
+            if self.view(id).owner != owner {
+                *self.view(id) = View {
+                    owner,
+                    ..View::default()
+                };
+            }
+            let scroll = self.view(id).scroll;
+            want.entry(machine)
+                .or_default()
+                .push((id, (name, run, inner.width, inner.height, scroll)));
+        }
+        for m in self.machines.iter_mut().filter(|m| !m.is_local()) {
+            m.watch(want.get(&m.id).map_or(&[], Vec::as_slice));
+        }
+    }
+    /// Whether the bridge pushes this cell's screen, so it is not read here.
+    fn pushed(&self, id: u32) -> bool {
+        self.agent_in(id)
+            .filter(|a| a.running() && a.pane.is_some() && a.run.is_some())
+            .and_then(|a| self.mach(&a.machine))
+            .is_some_and(Mach::pushing)
     }
     /// Something is in flight, so the loop looks again soon.
     fn waiting(&self) -> bool {
@@ -1517,7 +1585,7 @@ impl App {
     fn capture_due(&mut self, core: &Core) -> bool {
         let mut dirty = false;
         for id in self.visible() {
-            if self.view(id).next.is_none_or(|t| Instant::now() >= t) {
+            if !self.pushed(id) && self.view(id).next.is_none_or(|t| Instant::now() >= t) {
                 dirty |= self.capture(core, id);
             }
         }
@@ -1527,6 +1595,7 @@ impl App {
     fn due_in(&self) -> Duration {
         self.visible()
             .iter()
+            .filter(|id| !self.pushed(**id))
             .map(|id| {
                 self.panes
                     .get(id)

@@ -6,9 +6,61 @@ use crate::bridge::{Remote, RemoteState};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
     sync::mpsc,
     time::{Duration, Instant},
 };
+
+/// The log of a computer's connection changes stays about this long; the newest lines are kept.
+const LOG_CAP: u64 = 1 << 20;
+
+/// Add a line to a log file (0600), and when the file is over `cap` bytes keep its newest half.
+fn append_capped(path: &Path, line: &str, cap: u64) {
+    let _ = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+        writeln!(f, "{line}")?;
+        if f.metadata()?.len() > cap {
+            let text = std::fs::read_to_string(path)?;
+            let mut keep = &text[text.len() - (cap / 2) as usize..];
+            // Start at a line: a cut can fall inside a character, or in the middle of a line.
+            keep = keep.split_once('\n').map_or("", |(_, rest)| rest);
+            let tmp = path.with_extension("tmp");
+            let mut out = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            out.write_all(keep.as_bytes())?;
+            std::fs::rename(&tmp, path)?;
+        }
+        Ok(())
+    })();
+}
+
+/// What the app tells a bridge to push for one cell: agent, run, width, height, scroll.
+pub type Watched = (String, String, u16, u16, usize);
+
+/// How a computer's screens reach the app. `capable` is None until the bridge has answered a
+/// `watch`; Some(false) (an older bridge) keeps today's polling for that computer.
+#[derive(Default)]
+struct Push {
+    capable: Option<bool>,
+    /// The connection the state below belongs to (`Remote::generation`).
+    generation: u64,
+    /// The cells the bridge was last told to watch, with the revision of each one's settings.
+    sent: HashMap<u32, (u64, Watched)>,
+    next_rev: u64,
+    inflight: Option<mpsc::Receiver<Result<Value>>>,
+    retry_at: Option<Instant>,
+}
 
 /// How often a machine that is up is asked for its list.
 const LIST_EVERY: Duration = Duration::from_millis(1500);
@@ -54,6 +106,10 @@ pub struct Mach {
     next_list: Instant,
     next_retry: Instant,
     delay: Duration,
+    push: Push,
+    /// Where connection changes are written, and the last state written.
+    log: Option<PathBuf>,
+    logged: String,
 }
 
 impl Mach {
@@ -65,13 +121,14 @@ impl Mach {
 
     /// A machine from the machines file. Returns as soon as ssh exists; the hello is read in the
     /// background. A start that fails is a machine that is down, retried like any other.
-    pub fn remote(label: &str, target: &str) -> Self {
+    pub fn remote(label: &str, target: &str, log: PathBuf) -> Self {
         let (remote, down) = match Remote::connect(target) {
             Ok(r) => (Some(r), None),
             Err(e) => (None, Some(format!("{e:#}"))),
         };
         let mut m = Self::new(label.into(), label.into(), target.into(), remote);
         m.down = down;
+        m.log = Some(log);
         m
     }
 
@@ -91,7 +148,31 @@ impl Mach {
             next_list: now,
             next_retry: now + RETRY_FIRST,
             delay: RETRY_FIRST,
+            push: Push::default(),
+            log: None,
+            logged: "connecting".into(),
         }
+    }
+
+    /// One line in `app-machines.log`: UTC time, the computer, what changed, and why.
+    fn note(&self, what: &str, why: &str) {
+        let Some(path) = &self.log else { return };
+        let when = std::process::Command::new("date")
+            .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let clean = |s: &str| s.replace(['\n', '\t'], " ");
+        append_capped(
+            path,
+            &format!(
+                "{when}\t{}\t{}\t{}",
+                clean(&self.label),
+                clean(what),
+                clean(why)
+            ),
+            LOG_CAP,
+        );
     }
 
     pub fn is_local(&self) -> bool {
@@ -134,6 +215,7 @@ impl Mach {
 
     /// Start a new connection now and forget the wait.
     pub fn reconnect(&mut self) {
+        self.note("reconnect", "asked for by the person");
         self.delay = RETRY_FIRST;
         self.next_retry = Instant::now() + RETRY_FIRST;
         self.list = None;
@@ -149,7 +231,10 @@ impl Mach {
 
     /// A new `Remote` for a machine whose start failed, keeping what was last listed.
     fn start_again(&mut self) {
-        let mut fresh = Self::remote(&self.id, &self.target);
+        self.note("reconnect", "starting a new ssh connection");
+        let mut fresh = Self::remote(&self.id, &self.target, self.log.clone().unwrap_or_default());
+        fresh.log = self.log.take();
+        fresh.logged = std::mem::take(&mut self.logged);
         fresh.projects = std::mem::take(&mut self.projects);
         fresh.connected = self.connected;
         fresh.loaded = self.loaded;
@@ -171,6 +256,13 @@ impl Mach {
                 if now >= self.next_retry {
                     self.delay = (self.delay * 2).min(RETRY_LONGEST);
                     self.next_retry = now + self.delay;
+                    self.note(
+                        "reconnect",
+                        &format!(
+                            "retry after the failure; next in {} s",
+                            self.delay.as_secs()
+                        ),
+                    );
                     if let Some(r) = &self.remote {
                         let _ = r.reconnect();
                     }
@@ -205,11 +297,146 @@ impl Mach {
             self.list = self.request(json!({"op": "list"}), None).ok();
             self.next_list = now + LIST_EVERY;
         }
+        let (state, why) = match self.unusable() {
+            None => ("up", String::new()),
+            Some(w) if w == "connecting" => ("connecting", String::new()),
+            Some(w) => ("down", w),
+        };
+        if state != self.logged {
+            let change = format!("{} -> {state}", self.logged);
+            self.note(&change, &why);
+            self.logged = state.into();
+        }
         (self.down != before || update.is_some(), update)
+    }
+
+    /// Whether this computer's screens arrive by push (its bridge answered `watch`).
+    pub fn pushing(&self) -> bool {
+        self.push.capable == Some(true)
+    }
+
+    /// Tell the bridge which cells are on screen: nothing when the set is the one it has, the
+    /// whole set when anything in it changed. An older bridge answers `watch` with an error, and
+    /// from then on this computer is polled as before.
+    pub fn watch(&mut self, want: &[(u32, Watched)]) {
+        let Some(remote) = &self.remote else { return };
+        let now = Instant::now();
+        if remote.generation() != self.push.generation || self.unusable().is_some() {
+            // A new connection has watched nothing yet, and may be another pctl.
+            self.push = Push {
+                generation: remote.generation(),
+                ..Push::default()
+            };
+        }
+        if let Some(rx) = &self.push.inflight {
+            match rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => return,
+                Ok(Ok(v)) if v["ok"] == json!(true) => self.push.capable = Some(true),
+                Ok(Ok(v))
+                    if v["error"]
+                        .as_str()
+                        .is_some_and(|e| e.contains("unknown op")) =>
+                {
+                    self.push.capable = Some(false)
+                }
+                _ => {
+                    self.push.sent.clear();
+                    self.push.retry_at = Some(now + Duration::from_secs(1));
+                }
+            }
+            self.push.inflight = None;
+        }
+        if self.push.capable == Some(false)
+            || self.unusable().is_some()
+            || self.push.retry_at.is_some_and(|t| now < t)
+        {
+            return;
+        }
+        let mut next = HashMap::new();
+        for (key, cell) in want {
+            let rev = match self.push.sent.get(key) {
+                Some((rev, old)) if old == cell => *rev,
+                _ => {
+                    self.push.next_rev += 1;
+                    self.push.next_rev
+                }
+            };
+            next.insert(*key, (rev, cell.clone()));
+        }
+        let same = next.len() == self.push.sent.len()
+            && next
+                .iter()
+                .all(|(k, (r, _))| self.push.sent.get(k).is_some_and(|(o, _)| o == r));
+        if same {
+            return;
+        }
+        let cells: Vec<Value> = next
+            .iter()
+            .map(|(key, (rev, (agent, run, width, height, scroll)))| {
+                json!({"key": key.to_string(), "rev": rev, "agent": agent, "run": run,
+                    "width": width, "height": height, "scroll": scroll})
+            })
+            .collect();
+        if let Ok(rx) = self.request(json!({"op": "watch", "cells": cells}), None) {
+            self.push.inflight = Some(rx);
+            self.push.sent = next;
+        }
+    }
+
+    /// The screens and changes the bridge pushed, as `(cell, event)`. Events for settings the app
+    /// has since changed are dropped.
+    pub fn pushed(&mut self) -> Vec<(u32, Value)> {
+        let Some(remote) = &self.remote else {
+            return vec![];
+        };
+        remote
+            .events()
+            .into_iter()
+            .filter_map(|ev| {
+                let key: u32 = ev["key"].as_str()?.parse().ok()?;
+                let (rev, _) = self.push.sent.get(&key)?;
+                (ev["rev"].as_u64() == Some(*rev)).then_some((key, ev))
+            })
+            .collect()
     }
 
     /// Whether something is in flight, so the loop should look again soon.
     pub fn waiting(&self) -> bool {
         self.list.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_connection_log_is_private_and_keeps_its_newest_lines() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = dir.path().join("app-machines.log");
+        for i in 0..200 {
+            append_capped(&log, &format!("line {i:04} {}", "x".repeat(40)), 2000);
+        }
+        let text = std::fs::read_to_string(&log).expect("log");
+        assert!(text.len() <= 2000 + 60, "capped: {}", text.len());
+        assert!(text.ends_with(&format!("line 0199 {}\n", "x".repeat(40))));
+        assert!(text.lines().all(|l| l.starts_with("line ")), "no cut line");
+        let mode = std::fs::metadata(&log).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_machine_that_cannot_connect_logs_its_change_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = dir.path().join("app-machines.log");
+        let mut m = Mach::new("rm".into(), "rm".into(), "t".into(), None);
+        m.log = Some(log.clone());
+        m.tick();
+        m.tick();
+        let text = std::fs::read_to_string(&log).expect("log");
+        let rows: Vec<Vec<&str>> = text.lines().map(|l| l.split('\t').collect()).collect();
+        assert_eq!(rows.len(), 1, "{text}");
+        assert_eq!(rows[0][1..], ["rm", "connecting -> down", "not connected"]);
     }
 }
