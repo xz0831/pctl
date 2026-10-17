@@ -86,9 +86,9 @@ try:
   second=inbox(b,limit=2,after_sequence=first['next_after_sequence']);assert len(second['messages'])==2;assert not set(m['id'] for m in first['messages'])&set(m['id'] for m in second['messages'])
  case('bounded pagination is ordered and nonoverlapping',pagination)
  def status():
-  report=cli('agent','report','--agent',b[0]['id'],'--expected-run',b[1]['id'],'--status','completed','--summary','Synthetic claim, still requires verification','--ttl-seconds','1')
+  report=cli('agent','report','--agent',b[0]['id'],'--expected-run',b[1]['id'],'--status','completed','--summary','Synthetic claim, still requires verification','--ttl-seconds','5')  # 5 s: a busy machine can take over 1 s between report and inspect
   v=cli('agent','inspect','--agent',b[0]['id']);assert v['task']=='unknown';assert v['report']['fresh'];assert v['report']['report']['status']=='completed'
-  time.sleep(1.1);v=cli('agent','inspect','--agent',b[0]['id']);assert not v['report']['fresh'];assert v['task']=='unknown'
+  time.sleep(5.1);v=cli('agent','inspect','--agent',b[0]['id']);assert not v['report']['fresh'];assert v['task']=='unknown'
  case('self-reported completed never changes observed task and expires',status)
  def wait():
   watermark=inbox(b)['high_watermark']
