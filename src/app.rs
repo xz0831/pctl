@@ -705,10 +705,10 @@ pub fn run(core: &Core) -> Result<()> {
                         break;
                     }
                 }
-                app.flush_typed(core);
                 app.place();
                 dirty = true;
             }
+            app.flush_typed_when_free(core);
         }
         Ok(())
     })();
@@ -1694,6 +1694,20 @@ impl App {
             self.flush_typed(core);
         }
     }
+    /// The flush after each batch of events. Keys for another computer wait while that agent's last
+    /// keys are on their way, so a burst (a trackpad's wheel) is one request, not a queue of them.
+    fn flush_typed_when_free(&mut self, core: &Core) {
+        let busy = self.typed.as_ref().is_some_and(|(a, _)| {
+            !a.machine.is_empty()
+                && self
+                    .tasks
+                    .iter()
+                    .any(|(_, t)| matches!(t, Task::Keys(b) | Task::Paste(b) if b.id() == a.id()))
+        });
+        if !busy {
+            self.flush_typed(core);
+        }
+    }
     /// Send the typed keys: one call checks the run and types them all.
     fn flush_typed(&mut self, core: &Core) {
         let Some((a, parts)) = self.typed.take() else {
@@ -2071,7 +2085,14 @@ impl App {
     }
 
     fn mouse(&mut self, core: &Core, m: MouseEvent) {
-        self.flush_typed(core);
+        // A wheel tick joins the keys before it (it goes to the same agent or flushes them in
+        // `queue`); anything else sends them first.
+        if !matches!(
+            m.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            self.flush_typed(core);
+        }
         let hit = self
             .hits
             .iter()

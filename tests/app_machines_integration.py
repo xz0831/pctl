@@ -9,7 +9,7 @@ p = argparse.ArgumentParser(); p.add_argument('--bin', required=True); p.add_arg
 B = str(pathlib.Path(a.bin).resolve()); T = str(pathlib.Path(a.tmux).resolve())
 root = pathlib.Path(tempfile.mkdtemp(prefix='pctl-mach-', dir=os.path.realpath('/tmp')))
 state, remote, none, cfg = root / 'local', root / 'remote', root / 'none', root / 'cfg'
-V = root / 'v.sock'; bindir = root / 'bin'; bindir.mkdir(); results = []; marker = root / 'ssh-mode'; pids = root / 'pids'
+V = root / 'v.sock'; bindir = root / 'bin'; bindir.mkdir(); results = []; marker = root / 'ssh-mode'; pids = root / 'pids'; reqlog = root / 'requests'
 HOST = subprocess.run(['hostname', '-s'], text=True, capture_output=True).stdout.strip()
 hello = json.dumps({"ev": "hello", "protocol": 1, "host": "other-mac", "version": "9.9.9"})
 ssh = bindir / 'ssh'
@@ -19,11 +19,29 @@ echo $$ >> {pids}
 case "$(cat {marker} 2>/dev/null || true)" in
   silent) exit 0 ;;
   slow) printf '%s\\n' '{hello}'; exec sleep 60 ;;
+  tee) for a in "$@"; do line="$a"; done
+       exec python3 -c 'import os,subprocess,sys
+c = subprocess.Popen(["/bin/sh", "-c", sys.argv[1]], stdin=subprocess.PIPE, env=dict(os.environ, PCTL_STATE=sys.argv[2]))
+for l in sys.stdin.buffer:
+    open(sys.argv[3], "ab").write(l); c.stdin.write(l); c.stdin.flush()' "$line" {remote} {reqlog} ;;
 esac
 for a in "$@"; do line="$a"; done
 PCTL_STATE={remote} exec /bin/sh -c "$line"
 ''')
 ssh.chmod(0o755)
+# A full-screen agent that reads the mouse like Claude Code and shows how many wheel ticks came.
+(bindir / 'wheel').write_text('''#!/usr/bin/env python3
+import os, re, sys, tty
+tty.setraw(0); out = sys.stdout
+out.write('\\x1b[?1049h\\x1b[?1000h\\x1b[?1006h\\x1b[2J\\x1b[HPOS=0\\r\\n'); out.flush()
+pos, buf = 0, b''
+while True:
+    buf += os.read(0, 65536)
+    ticks = re.findall(rb'\\x1b\\[<64;\\d+;\\d+M', buf); pos += len(ticks)
+    buf = buf[buf.rfind(b'M') + 1:] if ticks else buf
+    out.write(f'\\x1b[2J\\x1b[HPOS={pos}\\r\\n'); out.flush()
+''')
+(bindir / 'wheel').chmod(0o755)
 for tag in ('L', 'R'):  # a fake agent: says which computer it runs on
     (bindir / f'plain{tag}').write_text(f'#!/bin/bash\necho "ready {tag} in $(basename "$PWD")"\necho "> "\nwhile IFS= read -r line; do echo "got {tag}: $line"; echo "> "; done\n')
     (bindir / f'plain{tag}').chmod(0o755)
@@ -167,6 +185,21 @@ try:
         keys('Escape')
         assert until(lambda: 'lines back' not in screen()), screen()
     case('the wheel scrolls back over an agent of the other machine; a key returns to live', scroll_remote)
+    def wheel_burst():
+        marker.write_text('tee'); kill_bridge()
+        w = add(remote, 'r-wheel', 'rproj', 'wheel')
+        assert until(lambda: 'r-wheel' in screen() and reqlog.exists(), 20), screen()
+        click(*side('r-wheel', 'rproj')); assert until(lambda: 'POS=0' in screen()), screen()
+        x, y = find('POS=')
+        before = reqlog.read_text().count('"keys"')
+        vt('send-keys', '-t', 'view', '-l', f'\x1b[<64;{x};{y + 2}M' * 100)
+        assert until(lambda: 'POS=100' in screen()), screen()
+        sent = reqlog.read_text().count('"keys"') - before
+        assert 1 <= sent <= 5, f'100 wheel ticks took {sent} keys requests'
+        marker.write_text(''); kill_bridge()
+        rcli('agent', 'terminate', '--agent', w['agent_id'], '--expected-run', w['run_id']); rcli('session', 'remove', 'r-wheel')
+        assert until(lambda: 'r-wheel' not in screen() and 'rm · rproj' in status(), 20), screen()
+    case('a burst of wheel ticks over an agent of the other machine goes as a few requests, not one each', wheel_burst)
     def comes_back():
         click(*side('r-shell', 'rproj')); assert until(lambda: 'rm · rproj / ● r-shell' in status()), status()
         click(*find('⏏ Leave')); assert until(lambda: 'EXITED 0' in screen()), screen()
