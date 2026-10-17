@@ -349,6 +349,7 @@ try:
             out.unlink(missing_ok=True)
             app(env=env)
             vt('resize-window', '-t', 'view', '-x', '150')  # the status line cuts a notice at the window edge
+            assert until(lambda: any('a-main' in l[:26] for l in lines())), screen()
             click(*side('a-main'))
             assert until(lambda: 'alpha / ● a-main' in status() and '>' in screen()), screen()
             text('echo HELLO-WORLD'); keys('Enter')

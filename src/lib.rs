@@ -19,11 +19,8 @@ pub mod machine;
 pub mod notify;
 pub mod orchestration;
 pub mod session;
-pub mod sidebar;
 pub mod tell;
-pub mod terminal_input;
 pub mod theme;
-pub mod ui;
 pub mod web;
 pub mod worktree;
 
@@ -35,11 +32,6 @@ pub fn now() -> u64 {
 }
 fn id() -> String {
     Uuid::new_v4().to_string()
-}
-pub fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() { '�' } else { c })
-        .collect()
 }
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -355,13 +347,23 @@ impl Core {
         self.tm(&["show-options", "-gqv", "@pctl_instance"])
     }
     fn panes(&self) -> Result<Vec<Pane>> {
-        let output = self.tm(&["list-panes", "-a", "-F", PANE_FORMAT])?;
-        parse_panes(&output)
+        match self.tm(&["list-panes", "-a", "-F", PANE_FORMAT]) {
+            Ok(output) => parse_panes(&output),
+            Err(e)
+                if e.to_string().ends_with(": no current target")
+                    && self
+                        .tm(&["list-sessions", "-F", "#{session_id}"])?
+                        .is_empty() =>
+            {
+                Ok(vec![])
+            }
+            Err(e) => Err(e),
+        }
     }
     /// Observation only: one tmux client reads the marker and panes in order.
     /// Mutation guards deliberately retain their independent fresh queries.
     fn snapshot_panes(&self, expected_instance: &str) -> Result<Vec<Pane>> {
-        let output = self.tm(&[
+        let output = match self.tm(&[
             "show-options",
             "-gq",
             "@pctl_instance",
@@ -370,7 +372,19 @@ impl Core {
             "-a",
             "-F",
             PANE_FORMAT,
-        ])?;
+        ]) {
+            Ok(output) => output,
+            Err(e)
+                if e.to_string().ends_with(": no current target")
+                    && self.server()? == expected_instance
+                    && self
+                        .tm(&["list-sessions", "-F", "#{session_id}"])?
+                        .is_empty() =>
+            {
+                return Ok(vec![]);
+            }
+            Err(e) => return Err(e),
+        };
         parse_snapshot_panes(&output, expected_instance)
     }
     pub fn register_project(&self, name: &str, root: &Path) -> Result<Project> {
@@ -507,30 +521,14 @@ impl Core {
             .input_mode = mode.into();
         self.save(&r)
     }
-    fn manager_command(&self, project: &str) -> Result<String> {
-        let exe = std::env::current_exe()?.to_string_lossy().into_owned();
-        Ok([
-            exe,
-            "--state".into(),
-            self.state.to_string_lossy().into(),
-            "--tmux".into(),
-            self.tmux.to_string_lossy().into(),
-            "ui".into(),
-            "--project".into(),
-            project.into(),
-        ]
-        .iter()
-        .map(|s| shell_quote(s))
-        .collect::<Vec<_>>()
-        .join(" "))
-    }
-    fn ensure_session(&self, r: &Registry, project: &str) -> Result<String> {
+    fn project_session(&self, r: &Registry, project: &str) -> Result<Option<String>> {
         let name = format!("p-{}", project.replace('-', ""));
         if let Ok(marker) = self.server() {
             ensure!(
                 marker == r.server_instance,
                 "server identity changed; controls locked"
             );
+            self.retire_old_panel()?;
         } else {
             ensure!(
                 r.runs.is_empty(),
@@ -538,8 +536,6 @@ impl Core {
             );
             server_start_allowed()?;
         }
-        // display-message -t is a pane target: a missing session can return an empty
-        // format successfully. Enumerate sessions and match the generated name exactly.
         if let Ok(sessions) = self.tm(&[
             "list-sessions",
             "-F",
@@ -554,31 +550,13 @@ impl Core {
                             && fields[2] == project,
                         "invalid registered session identity"
                     );
-                    return Ok(fields[1].to_string());
+                    return Ok(Some(fields[1].into()));
                 }
             }
         }
-        let cmd = self.manager_command(project)?;
-        let session = self.tm(&[
-            "new-session",
-            "-d",
-            "-s",
-            &name,
-            "-n",
-            "manager",
-            "-x",
-            "120",
-            "-y",
-            "36",
-            "-P",
-            "-F",
-            "#{session_id}",
-            &cmd,
-        ])?;
-        ensure!(
-            valid_native_id(&session, '$'),
-            "new session identity unavailable; inspect before retrying"
-        );
+        Ok(None)
+    }
+    fn configure_session(&self, r: &Registry, session: &str, project: &str) -> Result<()> {
         let marker = self.server()?;
         if marker.is_empty() {
             self.tm(&["set-option", "-g", "@pctl_instance", &r.server_instance])?;
@@ -588,37 +566,31 @@ impl Core {
                 "server identity changed; controls locked"
             );
         }
-        self.tm(&["set-option", "-g", "mouse", "on"])?;
-        self.tm(&["set-option", "-g", "history-limit", "20000"])?;
-        // external: a copy made in tmux (a mouse drag in `pctl attach`) goes out to the person's
-        // terminal as OSC 52, while programs inside the panes cannot write to the clipboard.
-        self.tm(&["set-option", "-g", "set-clipboard", "external"])?;
-        self.tm(&["set-option", "-g", "remain-on-exit", "on"])?;
-        self.apply_theme_chrome()?;
-        self.tm(&["set-option", "-t", &session, "@pctl_project", project])?;
+        self.tm(&["set-option", "-s", "exit-empty", "off"])?;
+        for (key, value) in [
+            ("mouse", "on"),
+            ("history-limit", "20000"),
+            ("set-clipboard", "external"),
+            ("remain-on-exit", "on"),
+        ] {
+            self.tm(&["set-option", "-g", key, value])?;
+        }
+        if marker.is_empty() {
+            self.apply_theme_chrome()?;
+            self.tm(&["bind-key", "-n", "MouseDown3Pane", "send-keys", "-M"])?;
+            self.tm(&["bind-key", "-n", "MouseUp3Pane", "send-keys", "-M"])?;
+        }
+        self.tm(&["set-option", "-t", session, "@pctl_project", project])?;
         if let Some(p) = r.projects.iter().find(|p| p.id == project) {
             self.tm(&[
                 "set-option",
                 "-t",
-                &session,
+                session,
                 "@pctl_name",
                 &human::literal(&p.name),
             ])?;
         }
-        self.tm(&[
-            "set-option",
-            "-w",
-            "-t",
-            &format!("{session}:manager"),
-            "synchronize-panes",
-            "off",
-        ])?;
-        // Forward manager/agent application mouse requests; keep terminal clipboard policy untouched.
-        self.tm(&["bind-key", "-n", "MouseDown3Pane", "send-keys", "-M"])?;
-        self.tm(&["bind-key", "-n", "MouseUp3Pane", "send-keys", "-M"])?;
-        // Prefix+m returns to this session's dedicated manager window.
-        self.tm(&["bind-key", "m", "select-window", "-t", ":manager"])?;
-        Ok(session)
+        Ok(())
     }
     fn start_locked(&self, r: &mut Registry, agent: &str) -> Result<Run> {
         let a = r
@@ -636,7 +608,10 @@ impl Core {
             !r.runs.iter().any(|v| v.agent_id == agent),
             "existing run; use restart with expected-run (including exited runs)"
         );
-        let session = self.ensure_session(r, &a.project_id)?;
+        let existing = self.project_session(r, &a.project_id)?;
+        let session = existing
+            .clone()
+            .unwrap_or_else(|| format!("p-{}", a.project_id.replace('-', "")));
         let run_id = id();
         fs::create_dir_all(self.state.join("launchers"))?;
         fs::create_dir_all(self.state.join("events"))?;
@@ -666,40 +641,79 @@ impl Core {
             &intent,
             &serde_json::json!({"agent_id":agent,"run_id":run_id,"session":session,"created_at":now(),"state":"pending_native_pane"}),
         )?;
-        let raw = self.tm(&[
-            "new-window",
-            "-d",
-            "-t",
-            &session,
-            "-n",
-            &format!("a-{}", &a.id[..8]),
-            "-P",
-            "-F",
-            "#{pane_id}\t#{window_id}\t#{pane_pid}",
-            &launch,
-        ])?;
+        let format = "#{session_id}\t#{pane_id}\t#{window_id}\t#{pane_pid}";
+        let window = format!("a-{}", &a.id[..8]);
+        let raw = if existing.is_some() {
+            self.tm(&[
+                "new-window",
+                "-d",
+                "-t",
+                &session,
+                "-n",
+                &window,
+                "-P",
+                "-F",
+                format,
+                &launch,
+            ])?
+        } else {
+            // Configure history before the first pane exists, and keep the empty server after its last run.
+            self.tm(&[
+                "start-server",
+                ";",
+                "set-option",
+                "-s",
+                "exit-empty",
+                "off",
+                ";",
+                "set-option",
+                "-g",
+                "history-limit",
+                "20000",
+                ";",
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-n",
+                &window,
+                "-x",
+                "120",
+                "-y",
+                "36",
+                "-P",
+                "-F",
+                format,
+                &launch,
+            ])?
+        };
         let parts: Vec<_> = raw.split('\t').collect();
         ensure!(
-            parts.len() == 3,
+            parts.len() == 4,
             "unexpected launch result; inspect isolated server before retrying"
         );
         ensure!(
-            valid_native_id(parts[0], '%')
-                && valid_native_id(parts[1], '@')
-                && !parts[2].is_empty()
-                && parts[2].chars().all(|c| c.is_ascii_digit()),
+            valid_native_id(parts[0], '$')
+                && valid_native_id(parts[1], '%')
+                && valid_native_id(parts[2], '@')
+                && !parts[3].is_empty()
+                && parts[3].chars().all(|c| c.is_ascii_digit()),
             "invalid pane/window/process identity; launch remains gated"
         );
+        let session = parts[0].to_string();
+        if existing.is_none() {
+            self.configure_session(r, &session, &a.project_id)?;
+        }
         let run = Run {
             id: run_id,
             agent_id: a.id,
             project_id: a.project_id,
             server_instance: r.server_instance.clone(),
             session,
-            pane: parts[0].into(),
-            window: parts[1].into(),
-            pid: parts[2].into(),
-            process_start: process_start(parts[2]).context(
+            pane: parts[1].into(),
+            window: parts[2].into(),
+            pid: parts[3].into(),
+            process_start: process_start(parts[3]).context(
                 "cannot identify new pane process; launch remains gated; inspect before retrying",
             )?,
             started_at: now(),
@@ -915,11 +929,6 @@ impl Core {
             clients.len() <= 1,
             "focus supports one interactive client in this pilot"
         );
-        let p = if self.follow_sidebar_locked(r, &p, agent, expected)? {
-            self.guard(r, agent, expected, false)?
-        } else {
-            p
-        };
         self.tm(&["select-window", "-t", &p.window])?;
         self.tm(&["select-pane", "-t", &p.pane])?;
         if let Some(client) = clients.first() {
@@ -986,11 +995,10 @@ impl Core {
             !p.synchronized,
             "synchronize-panes must be off before layout changes"
         );
-        let sidebar_pane = self.sidebar_record()?.map(|s| s.pane);
         let count = self
             .panes()?
             .iter()
-            .filter(|v| v.window == p.window && Some(&v.pane) != sidebar_pane.as_ref())
+            .filter(|v| v.window == p.window && !self.legacy_sidebar(r, v))
             .count();
         if count > 1 {
             self.tm(&[
@@ -1011,6 +1019,7 @@ impl Core {
     }
     fn terminate_locked(&self, r: &mut Registry, agent: &str, expected: &str) -> Result<()> {
         let p = self.guard(r, agent, expected, false)?;
+        self.retire_old_panel()?;
         self.tm(&["kill-pane", "-t", &p.pane])?;
         ensure!(
             !self.panes()?.iter().any(|v| v.pane == p.pane),
@@ -1031,6 +1040,7 @@ impl Core {
     }
     fn restart_locked(&self, r: &mut Registry, agent: &str, expected: &str) -> Result<Run> {
         let p = self.guard(r, agent, expected, false)?;
+        self.retire_old_panel()?;
         self.tm(&["kill-pane", "-t", &p.pane])?;
         ensure!(
             !self.panes()?.iter().any(|v| v.pane == p.pane),
@@ -1273,49 +1283,6 @@ impl Core {
         self.tm(&["detach-client", "-t", target])?;
         Ok(())
     }
-    pub fn attach(&self, project: &str) -> Result<()> {
-        {
-            let _lock = self.lock()?;
-            let r = self.registry()?;
-            ensure!(
-                r.projects.iter().any(|p| p.id == project),
-                "project not found"
-            );
-            let session = self.ensure_session(&r, project)?;
-            let manager = format!("{session}:manager");
-            let panes = self.tm(&[
-                "list-panes",
-                "-t",
-                &manager,
-                "-F",
-                "#{pane_id}\t#{pane_dead}\t#{@pctl_agent}",
-            ])?;
-            let rows: Vec<_> = panes.lines().collect();
-            if rows.len() == 1 {
-                let fields: Vec<_> = rows[0].split('\t').collect();
-                if fields.len() == 3
-                    && fields[1] == "1"
-                    && fields[2].is_empty()
-                    && valid_native_id(fields[0], '%')
-                {
-                    self.tm(&[
-                        "respawn-pane",
-                        "-t",
-                        fields[0],
-                        &self.manager_command(project)?,
-                    ])?;
-                }
-            }
-            self.tm(&["select-window", "-t", &manager])?;
-        }
-        let session = format!("p-{}", project.replace('-', ""));
-        let status = self
-            .tmux_cmd()
-            .args(["attach-session", "-t", &session])
-            .status()?;
-        ensure!(status.success(), "tmux attach failed");
-        Ok(())
-    }
     pub fn doctor(&self) -> serde_json::Value {
         let version = self
             .command_output(Command::new(&self.tmux).arg("-V"), None)
@@ -1420,8 +1387,6 @@ pub fn error_code(message: &str) -> &'static str {
         "context_mismatch"
     } else if message.contains("ambiguous_reply") {
         "ambiguous_reply"
-    } else if message.contains("stale_sidebar") {
-        "stale_sidebar"
     } else if message.contains("idempotency_conflict") {
         "idempotency_conflict"
     } else if message.contains("mailbox_full") {
@@ -1700,10 +1665,6 @@ mod tests {
         assert_ne!(a.id, b.id);
         c.rename_project(&a.id, "다른 이름").unwrap();
         assert_eq!(c.registry().unwrap().projects[0].id, a.id);
-    }
-    #[test]
-    fn sanitizes_control_characters() {
-        assert_eq!(sanitize("x\x1b[31m\ny"), "x�[31m�y");
     }
     #[test]
     fn atomic_registry_roundtrip() {

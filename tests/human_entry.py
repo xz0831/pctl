@@ -3,7 +3,7 @@
 without a terminal (on one it opens the app: tests/app_integration.py); `pctl attach` without
 --project opens nothing without a server and otherwise attaches to the most recently used project at
 its last window; `attach --project` takes a name; tabs and the status
-line carry agent names and states (`session marks`), including a name ending in ';'; ^b s and ^b q
+line carry static agent names without a background job, including a name ending in ';'; ^b s and ^b q
 are bound; inside another tmux it refuses instead of nesting."""
 import argparse, fcntl, json, os, pathlib, pty, struct, subprocess, tempfile, termios, threading, time
 p = argparse.ArgumentParser(); p.add_argument('--bin', required=True); p.add_argument('--tmux', required=True); p.add_argument('--report', required=True); a = p.parse_args()
@@ -70,6 +70,9 @@ try:
         q = subprocess.run([B, '--state', str(other), '--tmux', T], text=True, capture_output=True, timeout=30, env=ENV, stdin=subprocess.DEVNULL)
         assert q.returncode == 2 and 'a command is required' in q.stderr, (q.returncode, q.stderr)
         assert subprocess.run([T, '-S', str(other / 'tmux.sock'), 'ls'], capture_output=True).returncode != 0
+        for old in [('ui',), ('sidebar', 'inspect'), ('session', 'marks')]:
+            q = subprocess.run([B, '--state', str(other), *old], env=ENV, capture_output=True)
+            assert q.returncode == 2 and not other.exists(), (old, q.stderr)
     case('without a terminal, pctl alone is the usage error and starts nothing', no_terminal)
     def no_server():
         t = Tty('attach', st=other)
@@ -77,31 +80,27 @@ try:
         assert subprocess.run([T, '-S', str(other / 'tmux.sock'), 'ls'], capture_output=True).returncode != 0, 'no server started'
     case('attach without a server explains and starts none', no_server)
     s = {n: add(n, p, f) for n, p, f in [('w-a1', 'alpha', None), ('w-a2', 'alpha', 'b-block'), ('w-semi;', 'alpha', 'semi'), ('w-b1', 'beta', None)]}
+    for v in s.values(): v['window'] = tm('display-message', '-p', '-t', v['pane'], '#{window_id}')
     assert until(lambda: cli('session', 'get', 'w-a2')['status'] == 'blocked')
     def names():
         for n, v in s.items():
             assert tm('show-options', '-wqv', '-t', v['pane'], '@pctl_tab') == n, (n, tm('show-options', '-w', '-t', v['pane']))
         projects = {tm('show-options', '-qv', '-t', v['pane'], '@pctl_name') for v in s.values()}
         assert projects == {'alpha', 'beta'}, projects
-        assert 'session' in tm('show-options', '-gv', 'status-right') and 'marks' in tm('show-options', '-gv', 'status-right')
+        assert 'marks' not in tm('show-options', '-gv', 'status-right')
+        assert ':manager' not in tm('list-keys', '-T', 'prefix')
+        assert tm('show-options', '-sv', 'exit-empty') == 'off'
         assert tm('show-options', '-gv', 'status-interval') == '5'
         keys = tm('list-keys', '-T', 'prefix')
         assert any(' s ' in k and 'choose-tree' in k for k in keys.splitlines()), keys
         assert any(' q ' in k and 'detach-client' in k for k in keys.splitlines()), keys
-    case('agent tabs and project sessions carry names (a trailing ";" too); status job and ^b s, ^b q are set', names)
-    def marks():
-        out = cli('session', 'marks')
-        assert out.strip() == '! 1 blocked', out
-        st = {n: tm('show-options', '-wqv', '-t', v['pane'], '@pctl_status') for n, v in s.items()}
-        assert st == {'w-a1': 'idle', 'w-a2': 'blocked', 'w-semi;': 'idle', 'w-b1': 'idle'}, st
-        assert tm('show-options', '-wqv', '-t', s['w-semi;']['pane'], '@pctl_tab') == 'w-semi;'
-    case('session marks writes each tab state and prints the totals', marks)
+    case('agent tabs and project sessions carry names (a trailing ";" too); static chrome and ^b s, ^b q are set', names)
     def by_name():
         assert 'project not found' in cli('attach', '--project', 'nope', ok=False)
         t = Tty('attach', '--project', 'beta'); c = attached(t)
-        assert c[1] == 'beta' and c[2] == 'manager', c
+        assert c[1] == 'beta' and c[3] == s['w-b1']['window'], c
         detach(t, c)
-    case('attach --project takes a project name and opens its manager', by_name)
+    case('attach --project takes a project name and opens its verified agent window', by_name)
     def alone():
         time.sleep(1.1)  # session_last_attached has one-second resolution
         t = Tty('attach', '--project', 'alpha'); c = attached(t)
@@ -121,10 +120,97 @@ try:
         detach(t, c)
     case('attach without --project goes to the most recently used project at its last window', alone)
     def nested():
-        t = Tty('attach', env={'TMUX': str(root / 'elsewhere.sock') + ',1,0'})
-        assert t.wait() == 2 and b'already inside another tmux' in t.out, t.out
-        assert not clients()
+        for args in [('attach',), ('attach', '--project', 'beta')]:
+            t = Tty(*args, env={'TMUX': str(root / 'elsewhere.sock') + ',1,0'})
+            assert t.wait() == 2 and b'already inside another tmux' in t.out, t.out
+            assert not clients()
     case('inside another tmux it refuses instead of nesting', nested)
+    def legacy_upgrade():
+        # Legacy panes and metadata are test fixtures, never production state.
+        session = s['w-a1']['pane']
+        sid = tm('display-message', '-p', '-t', session, '#{session_id}')
+        old = tm('new-window', '-d', '-t', sid, '-n', 'manager', '-P', '-F', '#{pane_id}', 'exec sleep 300')
+        oldpid = tm('display-message', '-p', '-t', old, '#{pane_pid}')
+        tm('bind-key', 'm', 'select-window', '-t', ':manager')
+        job = '#(' + ' '.join("'" + x.replace("'", "'\\''") + "'" for x in ['/old/pctl', '--state', str(state), '--tmux', T, 'session', 'marks']) + ')'
+        tm('set-option', '-g', 'status-right', 'custom #(date) ' + job)
+        tm('select-window', '-t', old)
+        before = {n: cli('session', 'get', n)['run_id'] for n in s}
+        t = Tty('attach', '--project', 'alpha'); c = attached(t)
+        assert c[3] in {v['window'] for n,v in s.items() if n != 'w-b1'} and c[3] != tm('display-message', '-p', '-t', old, '#{window_id}'), c
+        detach(t, c)
+        assert tm('display-message', '-p', '-t', old, '#{pane_pid}') == oldpid, 'legacy pane survived'
+        assert {n: cli('session', 'get', n)['run_id'] for n in s} == before
+        assert ':manager' not in tm('list-keys', '-T', 'prefix')
+        assert tm('show-options', '-gv', 'status-right') == 'custom #(date)'
+        tm('bind-key', 'm', 'display-message', 'custom-menu')
+        tm('set-option', '-g', 'status-right', '#(echo custom)')
+        t = Tty('attach', '--project', 'alpha'); detach(t, attached(t))
+        assert 'custom-menu' in tm('list-keys', '-T', 'prefix', 'm')
+        assert tm('show-options', '-gv', 'status-right') == '#(echo custom)'
+        add('w-z1', 'zeta')
+        assert 'custom-menu' in tm('list-keys', '-T', 'prefix', 'm')
+        assert tm('show-options', '-gv', 'status-right') == '#(echo custom)', 'a new project does not reset custom chrome'
+    case('upgrade leaves legacy panes and runs alive, avoids manager, retires only owned routes and preserves custom ones', legacy_upgrade)
+    def foreign_server():
+        marker = json.loads((state / 'registry.json').read_text())['server_instance']
+        tm('bind-key', 'm', 'select-window', '-t', ':manager')
+        before = tm('list-keys', '-T', 'prefix', 'm')
+        status = tm('show-options', '-gv', 'status-right')
+        tm('set-option', '-g', '@pctl_instance', 'foreign')
+        try:
+            t = Tty('attach', '--project', 'alpha')
+            assert t.wait() != 0 and b'controls locked' in t.out, t.out
+            assert tm('list-keys', '-T', 'prefix', 'm') == before
+            assert tm('show-options', '-gv', 'status-right') == status
+        finally:
+            tm('set-option', '-g', '@pctl_instance', marker)
+        t = Tty('attach', '--project', 'alpha'); detach(t, attached(t))
+        assert ':manager' not in tm('list-keys', '-T', 'prefix')
+    case('upgrade refuses a foreign server without changing its binding or status', foreign_server)
+    def legacy_sidebar():
+        v = s['w-a1']
+        profile = cli('agent', 'add', '--project', cli('project', 'list')[0]['id'], '--name', 'old-nav-fixture', '--cwd', root, '--', '/bin/sleep', '300')
+        run = cli('agent', 'start', '--agent', profile['id'])
+        reg = json.loads((state / 'registry.json').read_text())
+        reg['runs'] = [r for r in reg['runs'] if r['id'] != run['id']]
+        (state / 'registry.json').write_text(json.dumps(reg))  # disposable legacy fixture only
+        rec = {'id': 'legacy-nav', 'server_instance': reg['server_instance'], 'pane': run['pane'], 'pid': run['pid'], 'process_start': run['process_start']}
+        (state / 'sidebar.json').write_text(json.dumps(rec))
+        for key,value in [('@pctl_agent',''),('@pctl_sidebar',rec['id']),('@pctl_sidebar_instance',reg['server_instance'])]: tm('set-option','-p','-t',run['pane'],key,value)
+        tm('join-pane','-d','-h','-s',run['pane'],'-t',v['pane'])
+        before = tm('display-message','-p','-t',v['pane'],'#{window_id}')
+        cli('layout','split','--agent',v['agent_id'],'--expected-run',v['run_id'])
+        assert tm('display-message','-p','-t',v['pane'],'#{window_id}') == before, 'verified legacy navigation is not a second agent'
+        assert tm('display-message','-p','-t',run['pane'],'#{pane_pid}') == run['pid']
+        tm('set-option','-p','-t',run['pane'],'@pctl_sidebar','someone-else')
+        cli('layout','split','--agent',v['agent_id'],'--expected-run',v['run_id'])
+        assert tm('display-message','-p','-t',v['pane'],'#{window_id}') != before, 'unverified ordinary pane is not excluded'
+        assert tm('display-message','-p','-t',run['pane'],'#{pane_pid}') == run['pid']
+    case('native split excludes only a positively identified legacy sidebar and never kills its process', legacy_sidebar)
+    def empty_project():
+        p = cli('project', 'add', '--name', 'empty', '--root', root)
+        t = Tty('attach', '--project', p['id'])
+        assert t.wait() != 0 and b'no agent window' in t.out, t.out
+        assert p['id'] not in tm('list-sessions', '-F', '#{@pctl_project}').splitlines()
+    case('attach to an empty project refuses without creating a placeholder', empty_project)
+    def last_agent():
+        lone = root / 'lone'
+        try:
+            v = cli('session', 'add', '--name', 'only', '--cwd', root, '--', bindir / 'plain', st=lone)
+            assert tm('list-panes', '-a', '-F', '#{pane_id}', st=lone) == v['pane']
+            assert tm('display-message', '-p', '-t', v['pane'], '#{history_limit}', st=lone) == '20000'
+            cli('agent', 'terminate', '--agent', v['agent_id'], '--expected-run', v['run_id'], st=lone)
+            assert cli('agent', 'list', st=lone)['connected']
+            assert cli('session', 'get', 'only', st=lone)['process'] == 'stopped'
+            assert cli('session', 'start', 'only', st=lone)['process'] == 'running'
+            q = Tty('attach', '--project', cli('project', 'list', st=lone)[0]['id'], st=lone)
+            assert until(lambda: tm('list-clients', st=lone))
+            client = tm('list-clients', '-F', '#{client_name}', st=lone).splitlines()[0]
+            tm('detach-client', '-t', client, st=lone); assert q.wait() == 0
+        finally:
+            subprocess.run([T, '-S', str(lone / 'tmux.sock'), 'kill-server'], capture_output=True)
+    case('first agent is the only first window; terminating the last agent keeps the server usable for start', last_agent)
     pathlib.Path(a.report).write_text(json.dumps({'results': results, 'passed': len(results)}, indent=1))
 finally:
     subprocess.run([T, '-S', str(state / 'tmux.sock'), 'kill-server'], capture_output=True)

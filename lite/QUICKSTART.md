@@ -46,14 +46,14 @@ Run `pctl` with no command in a terminal to open the full-screen app.
 | Type a line | `pctl session prompt alpha "text"` |
 | Wait until it stops working | `pctl session wait alpha` |
 | Restart | `pctl session restart alpha` |
-| Watch and type yourself | `pctl attach --project <id>` |
+| Advanced raw tmux access | `pctl attach --project <id>` |
 | Stop | `pctl agent terminate --agent <agent_id> --expected-run <run_id>` |
 
 Notes:
 - **Start:** the folder name becomes the project unless you pass `--project <name>`. Session names are unique.
 - **Type a line:** refused while the agent waits for a human decision.
 - **Restart:** claude and codex resume the same conversation. If pctl does not know the conversation ID, add `--new` to start a fresh one. Other commands simply start again. Restart is refused while the agent waits for a human decision.
-- **Watch:** the `<id>` comes from `pctl project list`. Run it from a plain terminal, not inside tmux. Detach with the tmux prefix, then `d`.
+- **Advanced raw tmux:** the `<id>` comes from `pctl project list`. It lands on a registered agent window; an empty project refuses. Use `pctl` alone for the app. Run it from a plain terminal, not inside tmux. Detach with the tmux prefix, then `d`.
 - **Stop:** the IDs come from `pctl session get alpha`. Start a stopped session again with `pctl session start alpha`.
 
 ## Agent to agent (run inside an agent's pane)
@@ -88,7 +88,7 @@ pctl knows who is sending from the pane it runs in. Agents in the same project a
   2. Delete the `pctl` binary and that folder.
 
 ## Not covered here
-- The binary also has sidebar, theme, team and demo commands. They are not part of this quick start.
+- The binary also has theme, team and demo commands. `pctl demo` creates synthetic workers that the app can show. They are not part of this quick start.
 - `pctl --host` uses ssh only when you pass it.
 - `pctl web` (an optional page on loopback or a Tailscale address) is not part of this quick start. pctl makes no outgoing network calls.
 - Agents use their own existing install and login. pctl never stores credentials.

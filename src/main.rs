@@ -93,10 +93,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MessageCmd,
     },
-    Sidebar {
-        #[command(subcommand)]
-        cmd: SidebarCmd,
-    },
     /// Tell another agent something: a session here, `<machine>:<name>` on another computer, an
     /// A2A agent from `[tell.a2a.<name>]` in config.toml, or `codex:<prefix>`. A sender line
     /// `[from <me> <host> <cwd>]` goes in front. Exit: 0 sent, 1 refused, 2 usage, 3 no token,
@@ -125,11 +121,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ClientCmd,
     },
-    Ui {
-        #[arg(long)]
-        project: Option<String>,
-    },
-    /// Attach a plain tmux client: to a project's manager window (name or ID), or without
+    /// Attach a raw tmux client: to a project's agent window (name or ID), or without
     /// --project to the most recently used project. `pctl` alone opens the app instead.
     Attach {
         #[arg(long)]
@@ -519,9 +511,6 @@ enum SessionCmd {
     },
     /// Name of the caller's own session (from PCTL_AGENT_ID).
     Whoami,
-    /// Status-line job: write agent names and states onto tmux tabs; print the totals.
-    #[command(hide = true)]
-    Marks,
     /// Start a stopped session in its saved conversation. Unknown conversation needs --new.
     Start {
         name: String,
@@ -612,35 +601,6 @@ fn msg_body(text: Option<String>, file: Option<PathBuf>) -> Result<String> {
     } else {
         text.context("message text or body file required")
     }
-}
-#[derive(Subcommand)]
-enum SidebarCmd {
-    /// Focus only a verified live full-manager process. Never starts an agent.
-    Manager {
-        #[arg(long)]
-        project: String,
-    },
-    /// Open one optional native navigation pane. Existing agents are not restarted.
-    Open {
-        #[arg(long)]
-        agent: String,
-        #[arg(long)]
-        expected_run: String,
-        #[arg(long, default_value_t = 28)]
-        width: u16,
-    },
-    Inspect,
-    /// Close only the exact registered sidebar generation.
-    Close {
-        #[arg(long)]
-        id: String,
-    },
-    /// Internal native sidebar process, launched only through sidebar open.
-    #[command(hide = true)]
-    Ui {
-        #[arg(long)]
-        id: String,
-    },
 }
 #[derive(Subcommand)]
 enum SkillCmd {
@@ -1015,7 +975,6 @@ fn run() -> Result<()> {
             }
             SessionCmd::Restore { new } => print(&core.session_restore(new)?)?,
             SessionCmd::Whoami => print(&core.session_whoami()?)?,
-            SessionCmd::Marks => println!("{}", core.session_marks()?),
             SessionCmd::Start { name, new } => print(&core.session_start(&name, new)?)?,
             SessionCmd::Remove { name } => print(&core.session_remove(&name)?)?,
             SessionCmd::Hook => {
@@ -1190,23 +1149,6 @@ fn run() -> Result<()> {
                 &json!({"message":core.ack_message(&agent, &expected_run, &message)?,"semantics":"receipt only; not permission, task acceptance, or completion"}),
             )?,
         },
-        Cmd::Sidebar { cmd } => match cmd {
-            SidebarCmd::Manager { project } => {
-                core.sidebar_manager(&project)?;
-                print(&json!({"ok":true,"result":"verified native manager focused"}))?;
-            }
-            SidebarCmd::Open {
-                agent,
-                expected_run,
-                width,
-            } => print(&core.open_sidebar(&agent, &expected_run, width)?)?,
-            SidebarCmd::Inspect => print(&core.inspect_sidebar()?)?,
-            SidebarCmd::Close { id } => {
-                core.close_sidebar(&id)?;
-                print(&json!({"ok":true,"result":"only sidebar pane removed; agents retained"}))?;
-            }
-            SidebarCmd::Ui { id } => pctl::sidebar::run(&core, &id)?,
-        },
         Cmd::Tell {
             to,
             text,
@@ -1267,7 +1209,6 @@ fn run() -> Result<()> {
             WorktreeCmd::Remove { name } => print(&core.worktree_remove(&name)?)?,
         },
         Cmd::Web { listen, token_file } => pctl::web::serve(&core, &listen, &token_file)?,
-        Cmd::Ui { project } => pctl::ui::run(&core, project)?,
         Cmd::Demo => {
             anyhow::ensure!(
                 core.registry()?.projects.is_empty(),

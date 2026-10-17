@@ -1,8 +1,5 @@
-//! The human entry: `pctl` alone opens the running workspace, projects are found by
-//! name, and tabs carry agent names and states. They are tmux user options: `@pctl_name` (project,
-//! on the session), `@pctl_tab` and `@pctl_status` (agent, on its window; a distinct name because
-//! formats look up window options before session ones). Window and session names stay as they
-//! are, so no identity check changes. Nothing here starts a server.
+//! Advanced raw tmux entry. Project and agent names are static tmux user options;
+//! every attach targets a verified registered agent pane and never creates a UI or server.
 use crate::Core;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::{fs, path::Path};
@@ -25,114 +22,205 @@ impl Core {
         }
     }
 
-    /// Write each running agent's name and state onto its tmux window, name each project
-    /// session, and return a one-line summary for the status line. Run by the status line
-    /// while someone is attached; never starts a server.
-    pub fn session_marks(&self) -> Result<String> {
-        let all = self.session_list()?;
-        let r = self.registry()?;
-        // One tmux call: commands joined by ";" arguments.
-        let mut cmds: Vec<String> = Vec::new();
-        let mut set = |args: &[&str]| {
-            if !cmds.is_empty() {
-                cmds.push(";".into());
-            }
-            cmds.push("set-option".into());
-            cmds.extend(args.iter().map(|a| literal(a)));
-        };
-        let (mut blocked, mut working) = (0, 0);
-        for s in &all {
-            let status = s["status"].as_str().unwrap_or("unknown");
-            let (Some(pane), Some(name)) = (s["pane"].as_str(), s["name"].as_str()) else {
-                continue;
-            };
-            if matches!(status, "stopped" | "lost") {
-                continue;
-            }
-            blocked += usize::from(status == "blocked");
-            working += usize::from(status == "working");
-            set(&["-w", "-t", pane, "@pctl_status", status]);
-            set(&["-w", "-t", pane, "@pctl_tab", name]);
-        }
-        let sessions = self.tm(&["list-sessions", "-F", "#{session_id}\t#{@pctl_project}"])?;
-        for line in sessions.lines() {
-            let Some((sid, pid)) = line.split_once('\t') else {
-                continue;
-            };
-            if let Some(p) = r.projects.iter().find(|p| p.id == pid) {
-                set(&["-t", sid, "@pctl_name", &p.name]);
-            }
-        }
-        if !cmds.is_empty() {
-            self.tm(&cmds.iter().map(String::as_str).collect::<Vec<_>>())?;
-        }
-        Ok(match (blocked, working) {
-            (0, 0) => "all idle".into(),
-            (b, 0) => format!("! {b} blocked"),
-            (0, w) => format!("* {w} working"),
-            (b, w) => format!("! {b} blocked  * {w} working"),
-        })
+    /// Raw tmux entry: only a registered, verified agent pane, never a legacy control window.
+    pub fn attach(&self, project: &str) -> Result<()> {
+        self.attach_agent(Some(project))
     }
-
-    /// `pctl` alone on a terminal: attach to the running server at the most recently used
-    /// project, in the window used last. Refuses when no server runs (it never starts one) and
-    /// inside another tmux; inside this server it switches the client instead of nesting.
     pub fn open_default(&self) -> Result<()> {
-        let r = self.registry()?;
-        let marker = self.server().map_err(|_| {
-            anyhow!(
-                "no PCTL server is running. Start it with PCTL_STANDALONE=1 pctl attach --project <name> (or where [server] start_env in config.toml allows it)"
-            )
-        })?;
-        ensure!(
-            marker == r.server_instance,
-            "this tmux server does not belong to this PCTL state; controls locked"
-        );
-        let rows = self.tm(&[
-            "list-sessions",
-            "-F",
-            "#{session_last_attached}\t#{session_activity}\t#{session_id}\t#{@pctl_project}",
-        ])?;
-        let session = rows
-            .lines()
-            .filter_map(|l| {
-                let f: Vec<_> = l.split('\t').collect();
-                let known = f.len() == 4 && r.projects.iter().any(|p| p.id == f[3]);
-                known.then(|| {
-                    let n = |s: &str| s.parse::<u64>().unwrap_or(0);
-                    ((n(f[0]), n(f[1])), f[2].to_string())
-                })
-            })
-            .max()
-            .map(|(_, id)| id)
-            .context("the PCTL server has no project yet; start an agent with pctl session add")?;
-        self.apply_theme_chrome()?;
-        let _ = self.session_marks();
-        if let Ok(outer) = std::env::var("TMUX") {
+        self.attach_agent(None)
+    }
+    fn attach_agent(&self, project: Option<&str>) -> Result<()> {
+        let outer = std::env::var("TMUX").ok();
+        if let Some(outer) = &outer {
             let socket = outer.split(',').next().unwrap_or_default();
-            let same = |a: &Path, b: &Path| match (fs::canonicalize(a), fs::canonicalize(b)) {
-                (Ok(a), Ok(b)) => a == b,
-                _ => false,
-            };
             ensure!(
-                same(Path::new(socket), &self.state.join("tmux.sock")),
+                fs::canonicalize(socket)
+                    .ok()
+                    .zip(fs::canonicalize(self.state.join("tmux.sock")).ok())
+                    .is_some_and(|(a, b)| a == b),
                 "already inside another tmux; detach from it first (tmux would nest)"
             );
-            let status = self
-                .tmux_cmd()
-                .env("TMUX", &outer)
-                .args(["switch-client", "-t", &session])
-                .status()?;
-            ensure!(status.success(), "tmux switch-client failed");
-            return Ok(());
         }
-        let status = self
-            .tmux_cmd()
-            .args(["attach-session", "-t", &session])
-            .status()?;
-        ensure!(status.success(), "tmux attach failed");
+        let pane = {
+            let _lock = self.lock()?;
+            let r = self.registry()?;
+            ensure!(
+                self.server().map_err(|_| anyhow!(
+                    "no PCTL server is running; open pctl and start an agent"
+                ))? == r.server_instance,
+                "this tmux server does not belong to this PCTL state; controls locked"
+            );
+            self.retire_old_panel()?;
+            let panes = self.panes()?;
+            let eligible: Vec<_> = r
+                .runs
+                .iter()
+                .filter_map(|run| {
+                    let a = r.agents.iter().find(|a| a.id == run.agent_id)?;
+                    let p = panes.iter().find(|p| {
+                        p.pane == run.pane
+                            && p.run == run.id
+                            && p.agent == a.id
+                            && p.project == a.project_id
+                    })?;
+                    self.guard(&r, &a.id, &run.id, false)
+                        .ok()
+                        .map(|_| (a.project_id.as_str(), p))
+                })
+                .collect();
+            let rows = self.tm(&[
+                "list-sessions",
+                "-F",
+                "#{session_last_attached}\t#{session_activity}\t#{session_id}\t#{@pctl_project}",
+            ])?;
+            let target = match project {
+                Some(id) => id.to_string(),
+                None => rows
+                    .lines()
+                    .filter_map(|l| {
+                        let f: Vec<_> = l.split('\t').collect();
+                        (f.len() == 4 && eligible.iter().any(|(id, _)| *id == f[3])).then(|| {
+                            let n = |s: &str| s.parse::<u64>().unwrap_or(0);
+                            ((n(f[0]), n(f[1])), f[3].to_string())
+                        })
+                    })
+                    .max()
+                    .map(|(_, id)| id)
+                    .context("no agent window to attach; open pctl and start an agent")?,
+            };
+            let candidates: Vec<_> = eligible
+                .into_iter()
+                .filter(|(id, _)| *id == target)
+                .map(|(_, p)| p)
+                .collect();
+            let first = candidates
+                .first()
+                .context("no agent window to attach; open pctl and start an agent")?;
+            let active = self.tm(&[
+                "display-message",
+                "-p",
+                "-t",
+                &first.session,
+                "#{window_id}\t#{pane_id}",
+            ])?;
+            let (window, pane) = active.split_once('\t').unwrap_or_default();
+            let picked = candidates
+                .iter()
+                .find(|p| p.window == window && p.pane == pane)
+                .or_else(|| candidates.iter().find(|p| p.window == window))
+                .unwrap_or(first);
+            (**picked).clone()
+        };
+        let mut cmd = self.tmux_cmd();
+        if let Some(outer) = outer {
+            cmd.env("TMUX", outer)
+                .args(["switch-client", "-t", &pane.pane]);
+        } else {
+            self.tm(&["select-window", "-t", &pane.window])?;
+            self.tm(&["select-pane", "-t", &pane.pane])?;
+            cmd.args(["attach-session", "-t", &pane.session]);
+        }
+        ensure!(cmd.status()?.success(), "tmux attach/switch failed");
         Ok(())
     }
+    /// Retire only exact old PCTL routes on this verified server; leave every existing pane alone.
+    pub(crate) fn retire_old_panel(&self) -> Result<()> {
+        let Ok(marker) = self.server() else {
+            return Ok(());
+        };
+        ensure!(
+            marker == self.registry()?.server_instance,
+            "server identity changed; controls locked"
+        );
+        self.tm(&["set-option", "-s", "exit-empty", "off"])?;
+        if let Ok(key) = self.tm(&["list-keys", "-T", "prefix", "m"])
+            && key.split_whitespace().eq([
+                "bind-key",
+                "-T",
+                "prefix",
+                "m",
+                "select-window",
+                "-t",
+                ":manager",
+            ])
+        {
+            self.tm(&["unbind-key", "-T", "prefix", "m"])?;
+        }
+        let status = self.tm(&["show-options", "-gqv", "status-right"])?;
+        let cleaned = without_marks_job(&status, &self.state, &self.tmux);
+        if cleaned != status {
+            self.tm(&["set-option", "-g", "status-right", &literal(&cleaned)])?;
+        }
+        Ok(())
+    }
+    pub(crate) fn legacy_sidebar(&self, r: &crate::Registry, pane: &crate::Pane) -> bool {
+        let Some(v) = fs::read(self.state.join("sidebar.json"))
+            .ok()
+            .and_then(|s| serde_json::from_slice::<serde_json::Value>(&s).ok())
+        else {
+            return false;
+        };
+        let Some(id) = v["id"].as_str().filter(|id| !id.is_empty()) else {
+            return false;
+        };
+        if v["server_instance"] != r.server_instance
+            || v["pane"] != pane.pane
+            || !pane.agent.is_empty()
+            || (!pane.dead
+                && (v["pid"] != pane.pid
+                    || crate::process_start(&pane.pid).ok().as_deref()
+                        != v["process_start"].as_str()))
+        {
+            return false;
+        }
+        self.tm(&[
+            "display-message",
+            "-p",
+            "-t",
+            &pane.pane,
+            "#{@pctl_sidebar}\t#{@pctl_sidebar_instance}\t#{@pctl_agent}END",
+        ])
+        .is_ok_and(|tags| tags == format!("{id}\t{}\tEND", r.server_instance))
+    }
+}
+
+fn without_marks_job(value: &str, state: &Path, tmux: &Path) -> String {
+    let tail = format!(
+        " {} {} {} {} {} {})",
+        crate::shell_quote("--state"),
+        crate::shell_quote(&state.to_string_lossy()),
+        crate::shell_quote("--tmux"),
+        crate::shell_quote(&tmux.to_string_lossy()),
+        crate::shell_quote("session"),
+        crate::shell_quote("marks")
+    );
+    let mut out = value.to_string();
+    let mut scan = 0;
+    while let Some(offset) = out[scan..].find(&tail) {
+        let end = scan + offset;
+        scan = end + tail.len();
+        let start = out[..end].rmatch_indices("#(").find_map(|(start, _)| {
+            let head = &out[start + 2..end];
+            let exe = head
+                .strip_prefix('\'')?
+                .strip_suffix('\'')?
+                .replace("'\\''", "'");
+            (Path::new(&exe)
+                .file_name()
+                .is_some_and(|name| name == "pctl")
+                && crate::shell_quote(&exe) == head)
+                .then_some(start)
+        });
+        let Some(start) = start else {
+            continue;
+        };
+        out.replace_range(start..end + tail.len(), "");
+        scan = start;
+    }
+    if out != value {
+        out = out.replace("^b s tree  m manager  q detach", "^b s tree  q detach");
+    }
+    out
 }
 
 /// tmux reads an argument that ends in ";" as a command separator; "\;" keeps it literal.
@@ -145,6 +233,46 @@ pub(crate) fn literal(v: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    #[test]
+    fn retires_only_generated_jobs_for_this_state_and_tmux() {
+        let state = Path::new("/tmp/one 'state");
+        let tmux = Path::new("/bin/tmux");
+        let job = |state: &Path, extra: &str| {
+            format!(
+                "#({} {} {} {} {} {} {}{extra})",
+                crate::shell_quote("/old's directory/pctl"),
+                crate::shell_quote("--state"),
+                crate::shell_quote(&state.to_string_lossy()),
+                crate::shell_quote("--tmux"),
+                crate::shell_quote(&tmux.to_string_lossy()),
+                crate::shell_quote("session"),
+                crate::shell_quote("marks")
+            )
+        };
+        let value = format!(
+            "user #(date) {} │ ^b s tree  m manager  q detach",
+            job(state, "")
+        );
+        assert_eq!(
+            without_marks_job(&value, state, tmux),
+            "user #(date)  │ ^b s tree  q detach"
+        );
+        let nested_path = job(state, "").replace("/old", "/nested#(old");
+        assert_eq!(without_marks_job(&nested_path, state, tmux), "");
+        let custom = job(state, "")
+            .replace("/old", "/custom")
+            .replace("/pctl'", "/echo'");
+        let mixed = format!("{custom} {}", job(state, ""));
+        assert_eq!(without_marks_job(&mixed, state, tmux), format!("{custom} "));
+        for other in [
+            job(Path::new("/other"), ""),
+            job(state, " --other"),
+            "#(echo 'session' 'marks')".into(),
+        ] {
+            assert_eq!(without_marks_job(&other, state, tmux), other);
+        }
+    }
     #[test]
     fn a_trailing_semicolon_stays_literal() {
         assert_eq!(super::literal("a;"), "a\\;");
