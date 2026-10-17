@@ -516,6 +516,8 @@ impl Core {
             "run_id": run.map(|x| &x.id), "pane": run.map(|x| &x.pane),
             "branch": a.worktree.as_ref().map(|w| &w.branch),
             "process": process, "status": status,
+            "tell_queue": crate::tellq::len(&self.state, &a.name),
+            "tell_dropped": crate::tellq::dropped(&self.state, &a.name),
         })
     }
     /// Live panes, or None when no server owns this state (after a reboot).
@@ -571,9 +573,14 @@ impl Core {
             .map(|p| p.pane.as_str())
             .collect();
         let known = self.activities(&reading);
+        // Kept tell messages go in once a session reads idle; its status here is the one before.
         Ok(r.agents
             .iter()
-            .map(|a| self.view(&r, a, panes.as_deref(), &known))
+            .map(|a| {
+                let mut v = self.view(&r, a, panes.as_deref(), &known);
+                crate::tellq::after_read(self, &mut v);
+                v
+            })
             .collect())
     }
     pub fn session_get(&self, name: &str) -> Result<Value> {

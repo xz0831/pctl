@@ -390,6 +390,15 @@ try:
         assert until(lambda: 'keep the right button' in screen()), screen()
         keys('Escape')
     case('the help screen says some terminals keep the right button', help_line)
+    def kept_messages():
+        add('q-blk', 'qq', 'b-block')
+        assert until(lambda: cli('session', 'get', 'q-blk')['status'] == 'blocked')
+        v = json.loads(subprocess.run([B, '--state', str(state), '--tmux', T, 'tell', 'q-blk', 'kept for later'], text=True, capture_output=True, env=dict(ENV, PCTL_STANDALONE='1')).stdout)
+        assert v['result'] == 'queued_blocked' and v['queue'] == 1, v
+        app()
+        assert until(lambda: '! q-blk ✉1' in screen()), screen()  # the sidebar row shows how many are kept
+        click(*side('q-blk')); assert until(lambda: 'qq / ! q-blk blocked · 1 kept for it' in status()), status()
+    case('an agent with kept tell messages shows how many in the sidebar and the status line', kept_messages)
     def sidebar_scroll():
         for proj, n in (('pa', 14), ('pb', 13), ('pc', 13)):
             for i in range(1, n + 1):

@@ -150,6 +150,8 @@ struct Agent {
     status: String,
     pane: Option<String>,
     run: Option<String>,
+    /// Tell messages kept for it while it waited for a decision.
+    queued: usize,
 }
 impl Agent {
     fn running(&self) -> bool {
@@ -985,6 +987,7 @@ impl App {
                     status: s["status"].as_str().unwrap_or("unknown").into(),
                     pane: s["pane"].as_str().map(String::from),
                     run: s["run_id"].as_str().map(String::from),
+                    queued: s["tell_queue"].as_u64().unwrap_or(0) as usize,
                 }));
             }
             Err(e) => {
@@ -2430,6 +2433,7 @@ impl App {
             status: "starting".into(),
             pane: None,
             run: None,
+            queued: 0,
         };
         self.agents.push(a.clone());
         self.fresh.insert(a.id(), (a.clone(), Instant::now()));
@@ -2943,12 +2947,22 @@ impl App {
                     } else {
                         base
                     };
-                    let spans = vec![
+                    let kept = a.as_ref().map_or(0, |a| a.queued);
+                    let tag = if kept > 0 {
+                        format!(" ✉{kept}")
+                    } else {
+                        String::new()
+                    };
+                    let room = r.width.saturating_sub(6 + step) as usize;
+                    let mut spans = vec![
                         Span::raw(pad(3)),
                         Span::styled(g, gs),
                         Span::raw(" "),
-                        Span::raw(fit(&id.name, r.width.saturating_sub(6 + step) as usize)),
+                        Span::raw(fit(&id.name, room.saturating_sub(tag.chars().count()))),
                     ];
+                    if kept > 0 {
+                        spans.push(Span::styled(tag, Style::default().fg(p.accent)));
+                    }
                     line(f, y, spans, st);
                     self.hit(rect, Hit::Agent(id.clone()));
                 }
@@ -3371,6 +3385,12 @@ impl App {
             left.push(Span::raw(on));
             left.push(Span::styled(g, gs));
             left.push(Span::raw(format!(" {} {}", a.name, a.status)));
+            if a.queued > 0 {
+                left.push(Span::styled(
+                    format!(" · {} kept for it", a.queued),
+                    Style::default().fg(p.accent),
+                ));
+            }
         }
         if self.tree.zoomed {
             left.push(Span::styled("   zoomed", Style::default().fg(p.accent)));
@@ -3829,6 +3849,7 @@ mod tests {
             status: status.into(),
             pane: Some("%1".into()),
             run: Some("r".into()),
+            queued: 0,
         }
     }
     fn agent(name: &str, status: &str) -> Agent {
