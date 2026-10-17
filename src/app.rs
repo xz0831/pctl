@@ -2988,10 +2988,14 @@ impl App {
             ];
             if !self.local_connected() {
                 lines.push(Line::from("No PCTL server is running yet."));
-                lines.push(Line::from(
-                    "Start pctl with PCTL_STANDALONE=1 (or where [server] start_env allows it),",
-                ));
-                lines.push(Line::from("then add a project."));
+                if crate::server_start_allowed().is_ok() {
+                    lines.push(Line::from("Add a project with + Project; that starts one."));
+                } else {
+                    lines.push(Line::from(
+                        "Start pctl with PCTL_STANDALONE=1 (or where [server] start_env allows it),",
+                    ));
+                    lines.push(Line::from("then add a project."));
+                }
             }
             lines.push(Line::from(""));
             let y = self.center(f, r, lines);
