@@ -582,6 +582,22 @@ impl Core {
         }
         Ok((r, panes))
     }
+    pub(crate) fn session_observations(&self, r: &Registry) -> Vec<Value> {
+        let panes = self.live_panes(r);
+        let reading: Vec<&str> = r
+            .agents
+            .iter()
+            .filter_map(|a| Self::pane_of(r, a, panes.as_deref()))
+            .filter(|p| !p.dead)
+            .map(|p| p.pane.as_str())
+            .collect();
+        let known = self.activities(&reading);
+        let mut paths = HashMap::new();
+        r.agents
+            .iter()
+            .map(|a| self.view(r, a, panes.as_deref(), &known, &mut paths))
+            .collect()
+    }
     pub fn session_list(&self) -> Result<Vec<Value>> {
         let (r, panes) = self.discover()?;
         let reading: Vec<&str> = r
@@ -766,6 +782,9 @@ impl Core {
             .find(|a| a.id == id)
             .context("agent not found")?;
         a.protected = !off;
+        if let Some(run) = r.runs.iter().find(|run| run.agent_id == id) {
+            self.refresh_event_locked(&r, &id, &run.id, "protection")?;
+        }
         self.save(&r)?;
         Ok(json!({"name":name,"protected":!off}))
     }
@@ -833,6 +852,7 @@ impl Core {
             );
             let mut args = vec!["send-keys", "-t", &pane.pane];
             args.extend(send.iter().copied());
+            self.refresh_event_locked(&r, &a.id, &run.id, "input")?;
             match self.tm(&args) {
                 Ok(_) => self
                     .audit(

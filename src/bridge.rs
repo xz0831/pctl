@@ -338,6 +338,9 @@ fn while_run(core: &Core, pane: &str, run: &str, then: &str, otherwise: &str) ->
 /// Type the keys (text to send with `-l`, or key names) into the pane, in one tmux call that also
 /// checks the run. Ok(false): the run changed and nothing was typed.
 pub fn type_keys(core: &Core, pane: &str, run: &str, keys: &[(bool, String)]) -> Result<bool> {
+    if !core.refresh_pane_input(pane, run)? {
+        return Ok(false);
+    }
     let send: Vec<String> = keys
         .iter()
         .map(|(lit, key)| {
@@ -381,6 +384,9 @@ fn send_keys(core: &Core, agent: &str, run: &str, req: &Value) -> Result<Value> 
 /// Paste `text` into the pane as one bracketed paste, checking the run in the call that pastes.
 /// Ok(false): the run changed and nothing was pasted.
 pub fn paste_text(core: &Core, pane: &str, run: &str, text: &str) -> Result<bool> {
+    if !core.refresh_pane_input(pane, run)? {
+        return Ok(false);
+    }
     // One tmux command carries about 16 KB; a longer paste goes in 8 KB pieces into one buffer,
     // then out as one bracketed paste. One buffer per process: two viewers must not mix their text.
     let buffer = format!("pctl-app-{}", std::process::id());
@@ -446,7 +452,13 @@ impl Clip {
 
     /// The pane is the agent's and still holds the run, so the clipboard is not touched for another.
     fn check(core: &Core, agent: &str, run: &str) -> Result<()> {
-        verified(core, &pane_of(core, agent, run)?, run)
+        let pane = pane_of(core, agent, run)?;
+        verified(core, &pane, run)?;
+        ensure!(
+            core.refresh_pane_input(&pane, run)?,
+            "changed: image target run changed"
+        );
+        Ok(())
     }
 
     fn put(&mut self, core: &Core, agent: &str, run: &str, req: &Value) -> Result<Value> {

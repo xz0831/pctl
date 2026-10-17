@@ -467,7 +467,12 @@ enum WorktreeCmd {
 enum SessionCmd {
     /// Swap an idle, stale Claude session to its installed build, preserving its conversation.
     Refresh {
-        name: String,
+        #[arg(required_unless_present = "idle", conflicts_with = "idle")]
+        name: Option<String>,
+        #[arg(long, requires = "dry_run")]
+        idle: bool,
+        #[arg(long, requires = "idle")]
+        dry_run: bool,
     },
     /// Hold this session out of refresh until --off.
     Protect {
@@ -569,7 +574,11 @@ enum SessionCmd {
         name: String,
     },
     /// SessionStart hook: read the hook JSON on stdin and record the conversation ID.
-    Hook,
+    Hook {
+        /// Record Claude readiness/activity events; never changes real hook settings.
+        #[arg(long)]
+        refresh_observe: bool,
+    },
 }
 #[derive(Subcommand)]
 enum MsgCmd {
@@ -988,7 +997,19 @@ fn run() -> Result<()> {
             } => print(&core.peers(&agent, &expected_run)?)?,
         },
         Cmd::Session { cmd } => match cmd {
-            SessionCmd::Refresh { name } => print(&core.session_refresh(&name)?)?,
+            SessionCmd::Refresh {
+                name,
+                idle,
+                dry_run: _,
+            } => {
+                if idle {
+                    print(&core.session_refresh_idle_dry_run()?)?;
+                } else {
+                    print(
+                        &core.session_refresh(name.as_deref().context("session name required")?)?,
+                    )?;
+                }
+            }
             SessionCmd::Protect { name, off } => print(&core.session_protect(&name, off)?)?,
             SessionCmd::List => print(&core.session_list()?)?,
             SessionCmd::Explain { name } => print(&core.session_explain(&name)?)?,
@@ -1040,15 +1061,19 @@ fn run() -> Result<()> {
             SessionCmd::Whoami => print(&core.session_whoami()?)?,
             SessionCmd::Start { name, new } => print(&core.session_start(&name, new)?)?,
             SessionCmd::Remove { name } => print(&core.session_remove(&name)?)?,
-            SessionCmd::Hook => {
-                // Silent and always successful: Claude adds SessionStart hook output to the
-                // conversation, and a hook failure must never disturb the harness.
+            SessionCmd::Hook { refresh_observe } => {
+                // Legacy/out-of-context hooks stay silent. The opt-in handler never
+                // treats missing evidence as ready; metadata I/O errors remain visible.
                 let mut input = String::new();
                 let _ = std::io::Read::read_to_string(
                     &mut std::io::Read::take(std::io::stdin(), 1 << 20),
                     &mut input,
                 );
-                let _ = core.session_hook(&input);
+                if refresh_observe {
+                    core.session_refresh_hook(&input)?;
+                } else {
+                    let _ = core.session_hook(&input);
+                }
             }
         },
         Cmd::Msg { cmd } => {

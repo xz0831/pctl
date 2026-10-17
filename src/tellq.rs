@@ -44,6 +44,35 @@ fn count(dir: &Path, ext: &str) -> usize {
 pub fn len(state: &Path, name: &str) -> usize {
     count(&queue_dir(state, name), "json") + count(&queue_dir(state, name), "sending")
 }
+/// Strict metadata-only queue read for refresh observation; filesystem errors are unknown.
+pub(crate) fn observation(state: &Path, name: &str) -> anyhow::Result<Value> {
+    let mut files = Vec::new();
+    match fs::read_dir(queue_dir(state, name)) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let n = entry.file_name();
+                if n == ".lock" {
+                    continue;
+                }
+                files.push(
+                    n.into_string()
+                        .map_err(|_| anyhow::anyhow!("unreadable tell queue filename"))?,
+                );
+            }
+        }
+    }
+    files.sort();
+    let has_dropped = match fs::read_dir(dropped_dir(state, name)) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+        Ok(mut entries) => entries.next().transpose()?.is_some(),
+    };
+    let unresolved = has_dropped || files.iter().any(|f| !f.ends_with(".json"));
+    Ok(json!({"pending":files.len(),"unresolved":unresolved,"files":files}))
+}
 /// Messages that could not be delivered (see the module text).
 pub fn dropped(state: &Path, name: &str) -> usize {
     count(&dropped_dir(state, name), "json")
@@ -111,6 +140,15 @@ pub fn deliver(core: &Core, name: &str, allow_working: bool) {
         return;
     };
     if lock.try_lock_exclusive().is_err() {
+        return;
+    }
+    let Ok(current) = core.session_get(name) else {
+        return;
+    };
+    let Some(run) = current["run_id"].as_str() else {
+        return;
+    };
+    if core.refresh_queue_event(name, run).is_err() {
         return;
     }
     let mut files: Vec<PathBuf> = fs::read_dir(&dir)
