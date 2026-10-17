@@ -3359,10 +3359,14 @@ impl App {
                     format!("Change shortcuts in {src}, under [keys]."),
                     Style::default().fg(p.muted),
                 )));
-                lines.push(Line::from(Span::styled(
-                    quips::tip(self.keys.wit),
-                    Style::default().fg(p.muted),
-                )));
+                // A short screen has no room for the intro lines; keep the right-button hint there.
+                let last = if two {
+                    "Some terminals (MATE Terminal) keep the right button: double-click or press ctrl+b m."
+                        .to_string()
+                } else {
+                    quips::tip(self.keys.wit).to_string()
+                };
+                lines.push(Line::from(Span::styled(last, Style::default().fg(p.muted))));
                 let h = lines.len() as u16 + 2;
                 let r = centered(area, width, h);
                 boxed(f, r, "Shortcuts");

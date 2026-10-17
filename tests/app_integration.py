@@ -155,6 +155,8 @@ try:
         click(*find('Start agent'))
         assert until(lambda: any(s['name'] == 'a-shell' and s['status'] in ('idle', 'unknown') for s in cli('session', 'list')), 15)
         assert until(lambda: 'a-shell' in lines()[0] and 'New agent' not in screen()), screen()
+        # Wait for the shell's prompt: a login profile may still be starting and drop keys typed early.
+        assert until(lambda: any(l.rstrip().endswith('$') for l in lines()[1:-1]), 15), screen()
         text('echo $((6*7))'); keys('Enter')
         assert until(lambda: '42' in screen()), screen()
     case('+ agent opens the new-agent form with bash chosen; the agent started from it takes typing', form)
