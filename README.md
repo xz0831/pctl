@@ -61,6 +61,8 @@ Everything works with the mouse:
 | See the shortcuts | `? Help` |
 | Leave | `⏏ Leave` (the agents keep running) |
 
+Some terminals (MATE Terminal) keep the right button, ignore the copy and notification escape sequences, or take some keys; pctl has a way around the first two. See [docs/terminals.md](docs/terminals.md).
+
 ![The new-agent form: bash, Claude Code, Codex, OpenCode or any command, optionally in its own git worktree](docs/images/app-form.svg)
 
 Shortcuts: press `ctrl+b`, then:

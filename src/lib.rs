@@ -16,6 +16,7 @@ pub mod clipboard;
 pub mod collaboration;
 pub mod human;
 pub mod machine;
+pub mod notify;
 pub mod orchestration;
 pub mod session;
 pub mod sidebar;

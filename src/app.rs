@@ -395,9 +395,14 @@ fn sanitize(name: &str) -> String {
         .collect()
 }
 
-/// The notification for one agent: `done` when it went idle, `needs you` when it is blocked.
+/// The notice text for one agent: `done` when it went idle, `needs you` when it is blocked.
+fn notice_body(name: &str, text: &str) -> String {
+    format!("{}: {text}", sanitize(name))
+}
+
+/// The OSC 777 notification for one agent, with a bell when it is blocked.
 fn notice_sequence(name: &str, text: &str, bell: bool) -> String {
-    let mut s = format!("\x1b]777;notify;pctl;{}: {text}\x07", sanitize(name));
+    let mut s = format!("\x1b]777;notify;pctl;{}\x07", notice_body(name, text));
     if bell {
         s.push('\x07');
     }
@@ -813,9 +818,11 @@ impl App {
             .map_or((Rect::default(), 0), |p| (p.inner, p.view.rows.len()));
         view_cell(inner, self.rows_skip(id), rows, column, row)
     }
-    /// Copy what the drag covers to the person's clipboard: an OSC 52 write on our own stdout,
-    /// which every modern terminal turns into a clipboard (and tmux with `set-clipboard on` into
-    /// a paste buffer). A plain click, or a drag over nothing, copies nothing.
+    /// Copy what the drag covers to the person's clipboard: an OSC 52 write on our own stdout
+    /// (most terminals turn it into a clipboard, tmux with `set-clipboard on` into a paste buffer)
+    /// and, on this computer's own desktop, a clipboard command too, for terminals that ignore
+    /// OSC 52. Over ssh that clipboard is not the person's. A plain click, or a drag over nothing,
+    /// copies nothing.
     fn copy_selection(&mut self) {
         let Some((id, a, b)) = self.sel else {
             return;
@@ -838,7 +845,9 @@ impl App {
             return;
         }
         write_out(&format!("\x1b]52;c;{}\x07", term::base64(text.as_bytes())));
-        self.say(format!("Copied {count} characters"));
+        let local = std::env::var_os("SSH_CONNECTION").is_none();
+        let command_ok = local && clipboard::write_text(&text).is_ok();
+        self.say(clipboard::CopyWay::from_env(command_ok).status(count));
     }
 
     fn apply(&mut self, u: Update) {
@@ -956,6 +965,8 @@ impl App {
                         format!("{}/{}", self.label(&id.machine), id.name)
                     };
                     write_out(&notice_sequence(&name, text, bell));
+                    // Terminals that ignore OSC 777 (MATE Terminal) get a desktop notice instead.
+                    crate::notify::desktop(&notice_body(&name, text));
                 }
             }
         }
@@ -3293,6 +3304,9 @@ impl App {
                         "restart, stop, start and remove; drag the sidebar edge; wheel scrolls the terminal.",
                     ),
                     Line::from(
+                        "Some terminals (MATE Terminal) keep the right button: double-click or press ctrl+b m.",
+                    ),
+                    Line::from(
                         "States (● idle or working, ! waiting for you, × exited, ○ stopped) are read from",
                     ),
                     Line::from("the screen: a best guess that can lag a moment."),
@@ -3345,10 +3359,14 @@ impl App {
                     format!("Change shortcuts in {src}, under [keys]."),
                     Style::default().fg(p.muted),
                 )));
-                lines.push(Line::from(Span::styled(
-                    quips::tip(self.keys.wit),
-                    Style::default().fg(p.muted),
-                )));
+                // A short screen has no room for the intro lines; keep the right-button hint there.
+                let last = if two {
+                    "Some terminals (MATE Terminal) keep the right button: double-click or press ctrl+b m."
+                        .to_string()
+                } else {
+                    quips::tip(self.keys.wit).to_string()
+                };
+                lines.push(Line::from(Span::styled(last, Style::default().fg(p.muted))));
                 let h = lines.len() as u16 + 2;
                 let r = centered(area, width, h);
                 boxed(f, r, "Shortcuts");
