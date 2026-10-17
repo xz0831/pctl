@@ -284,6 +284,14 @@ os.execv(os.environ['REAL_TMUX'], [os.environ['REAL_TMUX'], *args])
             except ProcessLookupError: pass
     case('old process survives pane removal: no replacement is launched', surviving_process)
 
+    def slow_exit():
+        # Claude Code needs ~1.7 s after SIGHUP before it exits.
+        slow = write(root / 'slow' / 'claude', "#!/usr/bin/env python3\nimport signal,sys,time\nsignal.signal(signal.SIGHUP, lambda *_: (time.sleep(1.7), sys.exit(0)))\nprint('> ', flush=True)\nwhile True: time.sleep(1)\n")
+        before = add('slow', str(slow))
+        after = cli('session', 'restart', 'slow')
+        assert after['run_id'] != before['run_id'] and get('slow')['process'] == 'running', after
+    case('old process that takes 1.7 s to exit is waited for and replaced', slow_exit)
+
     pathlib.Path(a.report).write_text(json.dumps(dict(root=str(root), passed=len(results), results=results), indent=2))
 finally:
     subprocess.run([T, '-S', str(state / 'tmux.sock'), 'kill-server'], capture_output=True)

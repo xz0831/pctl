@@ -730,12 +730,18 @@ fn main() {
     if let Some(code) = remote(&argv) {
         std::process::exit(code)
     }
+    // Claude Code reads hook exit 2 as "block" (tool denied, prompt erased); a failing observer exits 1.
+    let hook = argv.windows(2).any(|w| w == ["session", "hook"]);
+    if hook && let Err(e) = Args::try_parse() {
+        let _ = e.print();
+        std::process::exit(1)
+    }
     if let Err(e) = run() {
         eprintln!(
             "{}",
             json!({"schema_version":1,"ok":false,"error":format!("{e:#}"),"error_code":pctl::error_code(&format!("{e:#}"))})
         );
-        std::process::exit(2)
+        std::process::exit(if hook { 1 } else { 2 })
     }
 }
 fn run() -> Result<()> {

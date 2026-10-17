@@ -354,7 +354,7 @@ Codex storage is `$CODEX_HOME` when set, otherwise `$HOME/.codex`. Automatic fir
 
 Before a saved or explicit Codex resume, `session add`, `start`, `restart` and `restore` look for the ID in both `sessions/` and `archived_sessions/`. A missing or invalid rollout returns `conversation_unknown` with the searched root and recovery guidance. Restart checks before stopping the old run. Restore the file or correct HOME/CODEX_HOME; `session start/restart --new` clears PCTL's saved conversation ID when a fresh conversation is intended. Explicit resume arguments in a profile still select their own conversation.
 
-Session add/start/restart/restore wait 500 ms after releasing the launch gate, then check the registered process. An early exit is `start_failed`, including exit status and the last 12 screen lines; its dead pane stays registered for inspection or restart. Survival of this short check is not a guarantee of later health or task completion. Lower-level `agent start/restart` keep their immediate launch semantics.
+Session add/start/restart/restore wait 500 ms after releasing the launch gate, then check the registered process. An early exit is `start_failed`, including exit status and the last 12 screen lines; its dead pane stays registered for inspection or restart. Survival of this short check is not a guarantee of later health or task completion. Restart first waits up to 10 s for the old process to exit after its pane closes (Claude Code takes about 2 s). If it is still alive, restart stops with `old_process_survived`, starts nothing, and the session shows `lost` until `session restore`. Lower-level `agent start/restart` keep their immediate launch semantics.
 
 ## Telling another agent (`pctl tell`)
 

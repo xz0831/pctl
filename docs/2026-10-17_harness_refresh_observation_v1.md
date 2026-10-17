@@ -8,7 +8,7 @@ Merge these entries into the existing Claude settings `hooks` object; preserve a
 
 Validate hook payload support on the installed build before relying on observations. The [official Stop hook schema](https://code.claude.com/docs/en/hooks#stop-input) documents task and scheduled-work arrays. Missing arrays mean unknown, never empty. The handler stores only IDs, counters, booleans, counts and timestamps, never prompt/tool bodies, transcript paths, assistant messages or environment dumps. Tool/subagent starts invalidate readiness; completion alone cannot create readiness. Stop requires an instrumented run, matching conversation/current input epoch, no outstanding tool/subagent, explicit empty task/cron arrays, and stop_hook_active=false. Unmatched completion events or unsupported events invalidate instrumentation until a fresh SessionStart.
 
-The snippet deliberately adds no SessionEnd command: process/lifecycle observation already invalidates exited runs, and an exit hook waiting for PCTL's registry lock must not delay existing manual restart.
+`session hook` exits 1, never 2, on any error, so a failing observer never blocks a tool, erases a prompt or holds a Stop (Claude Code reads exit 2 as block). The snippet deliberately adds no SessionEnd command: process/lifecycle observation already invalidates exited runs, and an exit hook waiting for PCTL's registry lock must not delay existing manual restart.
 
 ```json
 {

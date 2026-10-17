@@ -99,6 +99,12 @@ try:
   cli('session','hook','--refresh-observe',extra={'PCTL_AGENT_ID':s['agent_id'],'PCTL_RUN_ID':s['run_id']},stdin=json.dumps({'session_id':'wrong','hook_event_name':'Stop'}))
   assert (state/'refresh-observe.json').read_bytes()==before
  case('missing/background/stale/mismatched hooks cannot mark ready; payload contents are not stored',hooks_fail_closed)
+ def hook_errors_never_block():
+  s=sessions['a-main'];e=dict(env,PCTL_AGENT_ID=s['agent_id'],PCTL_RUN_ID=s['run_id'])
+  for argv in (['session','hook','--refresh-observe'],['session','hook','--no-such-flag']):
+   q=subprocess.run([B,'--state',str(state),'--tmux',T,*argv],env=e,input='not json',text=True,capture_output=True,timeout=30)
+   assert q.returncode==1,(argv,q.returncode,q.stderr)
+ case('hook errors exit 1, never 2 (Claude Code reads 2 as block)',hook_errors_never_block)
  def inputs():
   cli('session','keys','a-main','Space')
   hook('a-main','Stop',background_tasks=[],session_crons=[],stop_hook_active=False)
