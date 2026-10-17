@@ -378,7 +378,13 @@ impl Core {
             return Ok(false);
         }
         let views = self.session_observations(r);
-        let clients = self.tm(&["list-clients", "-F", "#{session_id}"])?;
+        let clients = self.tm(&[
+            "list-clients",
+            "-f",
+            crate::bridge::NOT_CONTROL,
+            "-F",
+            "#{session_id}",
+        ])?;
         let sessions = self.tm(&[
             "list-sessions",
             "-F",
@@ -462,7 +468,15 @@ impl Core {
         let views = self.session_observations(&r);
         let mailbox = self.mailbox_summaries(&r)?;
 
-        let clients = self.tm(&["list-clients", "-F", "#{session_id}"]).ok();
+        let clients = self
+            .tm(&[
+                "list-clients",
+                "-f",
+                crate::bridge::NOT_CONTROL,
+                "-F",
+                "#{session_id}",
+            ])
+            .ok();
         let sessions = self
             .tm(&[
                 "list-sessions",

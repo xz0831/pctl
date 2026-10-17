@@ -14,6 +14,7 @@ mod quips;
 pub(crate) mod term;
 
 use crate::clipboard;
+use crate::control::Control;
 use crate::{
     Core,
     bridge::{self, KINDS, Screen},
@@ -56,10 +57,15 @@ use std::{
 use std::{
     panic,
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
 };
+
+/// A mutex of ours: a thread that panicked holding it left a set that is still fine to use.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// At most one notification per agent in this long.
 const NOTICE_EVERY: Duration = Duration::from_secs(10);
@@ -148,6 +154,9 @@ impl Drop for TerminalGuard {
 
 /// While an answer from another computer is on its way, look for it this often.
 const SOON: Duration = Duration::from_millis(10);
+/// A cell read over a control connection is read at least this often even if its pane wrote
+/// nothing (a resize, a new run print nothing).
+const SAFETY: Duration = Duration::from_secs(1);
 /// The longest the loop sleeps: lists, reconnects and notices are checked at least this often.
 const IDLE: Duration = Duration::from_millis(250);
 
@@ -320,6 +329,8 @@ struct View {
     quiet: u32,
     /// The one screen request to another computer in flight.
     pending: Option<mpsc::Receiver<Result<Value>>>,
+    /// For a pane read over a control connection: the next read even when nothing wrote.
+    safety: Option<Instant>,
 }
 
 /// One cell of the terminal area: the agent it shows and everything it keeps about the screen.
@@ -532,6 +543,10 @@ struct App {
     /// Keys, a paste or a wheel tick went to another computer since the loop last looked: the
     /// loop keeps looking (without sleeping) for a moment, see `WARM`.
     expect_reply: bool,
+    /// Control connections to this computer's tmux: its panes tell us when they write.
+    control: Option<Arc<Control>>,
+    /// Local panes that wrote since their last read.
+    wrote: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Write a complete escape sequence (a clipboard write, a notification) to the same terminal the
@@ -695,6 +710,16 @@ pub fn run(core: &Core) -> Result<()> {
     // computers' bridges. The loop sleeps until one of them comes, or something is due.
     let (wake_tx, wake_rx) = mpsc::channel::<Wake>();
     let ends = Arc::new(AtomicBool::new(false));
+    // This computer's panes tell us when they write (over tmux control mode, when it works).
+    let control = Control::new(core);
+    {
+        let (wake, wrote) = (wake_tx.clone(), app.wrote.clone());
+        control.on_dirty(Arc::new(move |pane| {
+            lock(&wrote).insert(pane.to_string());
+            let _ = wake.send(Wake::Push);
+        }));
+    }
+    app.control = Some(control);
     for m in app.machines.iter_mut().filter(|m| !m.is_local()) {
         let wake = wake_tx.clone();
         m.set_waker(Arc::new(move |pushed| {
@@ -946,6 +971,8 @@ impl App {
             tasks: vec![],
             reading: None,
             expect_reply: false,
+            control: None,
+            wrote: Arc::default(),
         }
     }
     fn say(&mut self, text: impl Into<String>) {
@@ -1080,6 +1107,16 @@ impl App {
     /// Tell each pushing-capable computer which of its cells are on screen, at what size and
     /// scroll. A cell that now shows another agent starts from nothing.
     fn sync_watches(&mut self) {
+        if let Some(control) = &self.control {
+            let panes: Vec<String> = self
+                .visible()
+                .into_iter()
+                .filter_map(|id| self.agent_in(id).filter(|a| a.machine.is_empty()))
+                .filter_map(|a| a.pane.clone())
+                .collect();
+            control.watch(&panes);
+            control.sweep();
+        }
         let mut want: HashMap<String, Vec<(u32, machines::Watched)>> = HashMap::new();
         for id in self.visible() {
             let Some(a) = self
@@ -1718,11 +1755,91 @@ impl App {
     fn capture_due(&mut self, core: &Core) -> bool {
         let mut dirty = false;
         for id in self.visible() {
-            if !self.pushed(id) && self.view(id).next.is_none_or(|t| Instant::now() >= t) {
+            if self.pushed(id) {
+                continue;
+            }
+            let now = Instant::now();
+            let (next, safety) = {
+                let v = self.view(id);
+                (v.next, v.safety)
+            };
+            let due = self.owner_changed(id)
+                || match self.controlled_pane(id) {
+                    // Read when the pane wrote (not more often than the rate below), and now and
+                    // then in case something changed without output.
+                    Some(pane) => {
+                        (lock(&self.wrote).contains(&pane) && next.is_none_or(|t| now >= t))
+                            || safety.is_none_or(|t| now >= t)
+                    }
+                    None => next.is_none_or(|t| now >= t),
+                };
+            if due {
                 dirty |= self.capture(core, id);
             }
         }
         dirty
+    }
+    /// When a cell is next read: by timer, or for a cell read by control connection when its pane
+    /// has written (at the rate limit) or else at the safety read.
+    fn next_read(&self, id: u32) -> Option<Instant> {
+        let view = &self.panes.get(&id)?.view;
+        if self.owner_changed(id) {
+            return None;
+        }
+        if self.resized(id) {
+            return view.next;
+        }
+        match self.controlled_pane(id) {
+            Some(pane) if view.safety.is_some() => {
+                if lock(&self.wrote).contains(&pane) {
+                    view.next
+                } else {
+                    view.safety
+                }
+            }
+            _ => view.next,
+        }
+    }
+    /// The cell shows another agent than its screen was read from: read it now, so its window is
+    /// asked for the cell's size however quickly the person switched there and back.
+    fn owner_changed(&self, id: u32) -> bool {
+        let Some(pane) = self.panes.get(&id) else {
+            return false;
+        };
+        let now = self
+            .agent_in(id)
+            .filter(|a| a.running())
+            .filter(|a| a.run.is_some())
+            .and_then(|a| Some((a.machine.clone(), a.pane.clone()?)))
+            .unwrap_or_default();
+        pane.view.owner != now
+    }
+    /// The cell here has another size than its window was asked for: read it to ask again (at
+    /// the rate of reads, so a window that cannot be asked is not tried in a loop).
+    fn resized(&self, id: u32) -> bool {
+        let Some(pane) = self.panes.get(&id) else {
+            return false;
+        };
+        let local = self
+            .agent_in(id)
+            .is_some_and(|a| a.running() && a.machine.is_empty() && a.pane.is_some());
+        local
+            && pane.inner.width >= 2
+            && pane.inner.height >= 2
+            && pane.view.asked != (pane.inner.width, pane.inner.height)
+    }
+    /// The pane of a cell here whose output reaches us over a control connection, so the cell is
+    /// read when the pane wrote and not by timer. (A scrolled-back cell is read by timer.)
+    fn controlled_pane(&self, id: u32) -> Option<String> {
+        let control = self.control.as_ref()?;
+        let a = self
+            .agent_in(id)
+            .filter(|a| a.running() && a.machine.is_empty())?;
+        if self.panes.get(&id)?.view.scroll > 0 {
+            return None;
+        }
+        let pane = a.pane.clone()?;
+        control.covers(&pane).then_some(pane)
     }
     /// How long until the first cell is due.
     fn due_in(&self) -> Duration {
@@ -1730,12 +1847,9 @@ impl App {
             .iter()
             .filter(|id| !self.pushed(**id))
             .map(|id| {
-                self.panes
-                    .get(id)
-                    .and_then(|p| p.view.next)
-                    .map_or(Duration::ZERO, |t| {
-                        t.saturating_duration_since(Instant::now())
-                    })
+                self.next_read(*id).map_or(Duration::ZERO, |t| {
+                    t.saturating_duration_since(Instant::now())
+                })
             })
             .min()
             .unwrap_or(IDLE)
@@ -1743,15 +1857,34 @@ impl App {
     }
     /// Read a cell's screen and schedule its next read. Whether the screen changed.
     fn capture(&mut self, core: &Core, id: u32) -> bool {
+        let controlled = self.controlled_pane(id);
+        if let Some(pane) = &controlled {
+            lock(&self.wrote).remove(pane);
+        }
         let Some(changed) = self.read_screen(core, id) else {
             // The answer from another computer is on its way.
             self.view(id).next = Some(Instant::now() + SOON);
             return false;
         };
+        if controlled.is_some() {
+            self.scheduled_by_output(id, changed);
+            return changed;
+        }
         let view = self.view(id);
         view.quiet = if changed { 0 } else { view.quiet + 1 };
+        view.safety = None;
         view.next = Some(Instant::now() + capture_every(view.quiet));
         changed
+    }
+    /// A cell read over the control connection is read again when its pane writes, but not within
+    /// 40 ms while it keeps changing (15 ms otherwise), and anyway after `SAFETY`.
+    fn scheduled_by_output(&mut self, id: u32, changed: bool) {
+        let now = Instant::now();
+        let view = self.view(id);
+        view.quiet = if changed { 0 } else { view.quiet + 1 };
+        let gap = if view.quiet <= 2 { 40 } else { 15 };
+        view.next = Some(now + Duration::from_millis(gap));
+        view.safety = Some(now + SAFETY);
     }
     /// Read a cell's agent's screen, resizing its window to the cell first. Whether the screen
     /// changed; None while the answer of another computer is still to come.
@@ -1761,6 +1894,7 @@ impl App {
             return Some(self.blank(id));
         };
         let (Some(pane), Some(run)) = (a.pane.clone(), a.run.clone()) else {
+            self.view(id).owner = Default::default();
             return Some(self.blank(id));
         };
         let owner = (a.machine.clone(), pane.clone());
@@ -1790,14 +1924,22 @@ impl App {
             let _ = bridge::resize(core, &pane, w, h);
         }
         let scroll = self.view(id).scroll;
-        Some(match bridge::read_screen(core, &pane, &run, h, scroll) {
-            Ok(Some(s)) => self.show(id, s),
-            Ok(None) => {
-                self.poke();
-                self.blank(id)
-            }
-            Err(_) => false,
-        })
+        let read = match (&self.control, scroll) {
+            (Some(control), 0) => control
+                .read_screens(&[(&pane, &run, h)])
+                .and_then(|mut r| r.pop()),
+            _ => None,
+        };
+        Some(
+            match read.unwrap_or_else(|| bridge::read_screen(core, &pane, &run, h, scroll)) {
+                Ok(Some(s)) => self.show(id, s),
+                Ok(None) => {
+                    self.poke();
+                    self.blank(id)
+                }
+                Err(_) => false,
+            },
+        )
     }
     /// The screen of an agent on another computer: one request at a time, the answer taken up on a
     /// later pass. The bridge there does the resizing.
