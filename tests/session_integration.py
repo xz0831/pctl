@@ -23,7 +23,7 @@ while IFS= read -r line; do
   esac
 done
 '''
-for name in ('claude', 'codex', 'plain'):
+for name in ('claude', 'codex', 'opencode', 'plain'):
     (bindir / name).write_text(FAKE); (bindir / name).chmod(0o755)
 # Raw mode: nothing is buffered or echoed, so every byte a key sends shows as its hex value.
 # It announces itself first: keys sent before the pane is raw land in the line buffer instead.
@@ -142,8 +142,47 @@ try:
         assert until(lambda: log.exists() and log.read_text().strip())
         assert log.read_text().splitlines()[0] == 'claude --resume moved-convo-1'
         assert cli('session', 'get', 'c-moved')['conversation'] == 'moved-convo-1'
-        assert 'needs a claude or codex' in cli('session', 'add', '--name', 'p-moved', '--cwd', cwd('p-moved'), '--conversation', 'x', '--', bindir / 'plain', ok=False)
+        assert 'needs a claude, codex or opencode' in cli('session', 'add', '--name', 'p-moved', '--cwd', cwd('p-moved'), '--conversation', 'x', '--', bindir / 'plain', ok=False)
     case('add --conversation starts a moved session in its existing conversation', moved)
+    def opencode_resume():
+        # The fake is reached by absolute path, never the real binary or its storage.
+        cli('session', 'add', '--name', 'o-main', '--cwd', cwd('o-main'), '--', bindir / 'opencode')
+        c = cli('session', 'get', 'o-main')['conversation']
+        assert c and c.startswith('ses_'), c
+        log = cwd('o-main') / 'argv.log'
+        assert until(lambda: log.exists() and log.read_text().strip())
+        assert log.read_text().splitlines()[0] == f'opencode --session {c}'
+        cli('session', 'restart', 'o-main')
+        assert until(lambda: len(log.read_text().splitlines()) == 2)
+        assert log.read_text().splitlines()[1] == f'opencode --session {c}', 'the same session id resumes'
+        assert cli('session', 'get', 'o-main')['conversation'] == c
+    case('opencode: a picked --session id on the first start, the same one on restart', opencode_resume)
+    def opencode_model():
+        cli('session', 'add', '--name', 'o-model', '--cwd', cwd('o-model'), '--model', 'opencode/glm-5.3-flash-free', '--', bindir / 'opencode')
+        c = cli('session', 'get', 'o-model')['conversation']
+        assert c and c.startswith('ses_'), c
+        log = cwd('o-model') / 'argv.log'
+        assert until(lambda: log.exists() and log.read_text().strip())
+        assert log.read_text().splitlines()[0] == f'opencode --standalone --session {c}'
+        env = cwd('o-model') / 'env.txt'
+        assert until(env.exists) and 'OPENCODE_CONFIG_CONTENT={"model":"opencode/glm-5.3-flash-free"}' in env.read_text(), 'the private-server model path still applies'
+        cli('session', 'restart', 'o-model')
+        assert until(lambda: log.read_text().splitlines()[-1] == f'opencode --standalone --session {c}')
+    case('opencode --model: the session id rides along with OPENCODE_CONFIG_CONTENT and --standalone', opencode_model)
+    def opencode_moved():
+        cli('session', 'add', '--name', 'o-moved', '--cwd', cwd('o-moved'), '--conversation', 'ses_moved-1', '--', bindir / 'opencode')
+        log = cwd('o-moved') / 'argv.log'
+        assert until(lambda: log.exists() and log.read_text().strip())
+        assert log.read_text().splitlines()[0] == 'opencode --session ses_moved-1'
+        assert cli('session', 'get', 'o-moved')['conversation'] == 'ses_moved-1'
+        assert 'invalid conversation ID' in cli('session', 'add', '--name', 'o-bad', '--cwd', cwd('o-bad'), '--conversation', 'ses_x;rm -rf', '--', bindir / 'opencode', ok=False)
+        # A profile that picks its own conversation keeps doing so.
+        cli('session', 'add', '--name', 'o-own', '--cwd', cwd('o-own'), '--', bindir / 'opencode', '--continue')
+        assert cli('session', 'get', 'o-own')['conversation'] is None, 'no id is recorded for a profile that picks its own'
+        log = cwd('o-own') / 'argv.log'
+        assert until(lambda: log.exists() and log.read_text().strip())
+        assert log.read_text().splitlines()[0] == 'opencode --continue'
+    case('opencode: --conversation resumes a known id; a profile that picks its own is untouched', opencode_moved)
     def start_stopped():
         assert 'has_run' in cli('session', 'start', 'c-moved', ok=False)
         s = cli('session', 'get', 'c-moved')
