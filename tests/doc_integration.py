@@ -108,11 +108,12 @@ try:
         view_keys('Down', 'Down', 'Down', 'Down', 'Enter')
         assert until(lambda: 'Enter send' in view_screen())
         view_text('second question'); view_keys('Enter')
-        assert until(lambda: '사람의 결정' in view_screen()), view_screen()
+        assert until(lambda: '보관' in view_screen()), view_screen()
         assert 'second question' not in screen('demo-main') and screen('demo-main') == before, 'nothing was typed into a blocked session'
         assert 'second question' in (root / 'threads.jsonl').read_text(), 'the question is kept'
+        assert cli('session', 'get', 'demo-main')['tell_queue'] == 1, 'tell keeps it for later delivery'
         view_stop()
-    case('a blocked main gets nothing typed (exit 6 -> Blocked) and the question is kept', ask_to_blocked_main_is_saved_not_sent)
+    case('a blocked main gets nothing typed; tell keeps the question for later (queued_blocked) and the reader says so', ask_to_blocked_main_is_saved_not_sent)
     def show_list_read():
         f = proj / 'shown.md'; f.write_text('# shown\n')
         doc = cli('show', f, '--project', 'demo', '--title', 'Plan', '--note', 'read the second part')

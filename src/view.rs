@@ -91,6 +91,8 @@ fn ask_outcome(out: &tell::Outcome) -> AskOutcome {
         Verdict::Reached => AskOutcome::Delivered("도달".into()),
         Verdict::Queued => AskOutcome::Delivered("대기열".into()),
         Verdict::TypedUnconfirmed => AskOutcome::Delivered("입력함·확인 안 됨".into()),
+        // tell keeps it and delivers it once the main can take it: done here, so no resend.
+        Verdict::QueuedBlocked => AskOutcome::Delivered("보관(열리면 전달)".into()),
         v if v.exit_code() == 0 => AskOutcome::Delivered(out.plain()),
         v => AskOutcome::Failed(out.note.clone().unwrap_or_else(|| v.name().into())),
     }
@@ -149,6 +151,7 @@ mod tests {
             context: None,
             reply: None,
             note: note.map(String::from),
+            queue: None,
         };
         assert_eq!(
             ask_outcome(&out(Verdict::Reached, None)),
