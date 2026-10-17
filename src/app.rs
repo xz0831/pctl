@@ -53,7 +53,13 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use std::{panic, sync::Arc};
+use std::{
+    panic,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 /// At most one notification per agent in this long.
 const NOTICE_EVERY: Duration = Duration::from_secs(10);
@@ -142,6 +148,48 @@ impl Drop for TerminalGuard {
 
 /// While an answer from another computer is on its way, look for it this often.
 const SOON: Duration = Duration::from_millis(10);
+/// The longest the loop sleeps: lists, reconnects and notices are checked at least this often.
+const IDLE: Duration = Duration::from_millis(250);
+
+/// After keys, a paste or a wheel tick went to another computer, the answer comes back within about
+/// this long. A sleeping loop takes it ~12 ms later than one that is looking (measured on a laptop
+/// on battery: the idle core takes that long to come back), so for this long the loop looks without
+/// sleeping. Idle, and for a pointer moving over the app, it uses no CPU at all.
+const WARM: Duration = Duration::from_millis(70);
+
+/// Wait for the next wake for at most `wait`; until `warm` look without sleeping. Ok(None): time
+/// ran out.
+fn wait_for(
+    rx: &mpsc::Receiver<Wake>,
+    wait: Duration,
+    warm: Instant,
+) -> Result<Option<Wake>, mpsc::RecvTimeoutError> {
+    let end = Instant::now() + wait;
+    let looking = warm.min(end);
+    while Instant::now() < looking {
+        match rx.try_recv() {
+            Ok(w) => return Ok(Some(w)),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(mpsc::RecvTimeoutError::Disconnected);
+            }
+            Err(mpsc::TryRecvError::Empty) => std::hint::spin_loop(),
+        }
+    }
+    match rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
+        Ok(w) => Ok(Some(w)),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// What wakes the app's loop.
+enum Wake {
+    Input(io::Result<Vec<Event>>),
+    /// Pushed screens came in from another computer.
+    Push,
+    /// An answer or a list came in.
+    Answer,
+}
 
 #[derive(Clone, Debug)]
 struct Agent {
@@ -481,6 +529,9 @@ struct App {
     tasks: Vec<(mpsc::Receiver<Result<Value>>, Task)>,
     /// The local clipboard being read for this agent, on a thread of its own.
     reading: Option<(Agent, ClipRead)>,
+    /// Keys, a paste or a wheel tick went to another computer since the loop last looked: the
+    /// loop keeps looking (without sleeping) for a moment, see `WARM`.
+    expect_reply: bool,
 }
 
 /// Write a complete escape sequence (a clipboard write, a notification) to the same terminal the
@@ -590,7 +641,7 @@ pub fn run(core: &Core) -> Result<()> {
             saved
                 .iter()
                 .filter(|m| m.enabled)
-                .map(|m| Mach::remote(&m.label, &m.target)),
+                .map(|m| Mach::remote(&m.label, &m.target, core.state.join("app-machines.log"))),
         ),
         Err(e) => app.say(format!("Machines: {e:#}")),
     }
@@ -640,7 +691,18 @@ pub fn run(core: &Core) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Update>();
     let (req_tx, req_rx) = mpsc::channel::<()>();
     app.refresh = Some(req_tx);
+    // Everything that makes the loop look again: terminal input, and lines from the other
+    // computers' bridges. The loop sleeps until one of them comes, or something is due.
+    let (wake_tx, wake_rx) = mpsc::channel::<Wake>();
+    let ends = Arc::new(AtomicBool::new(false));
+    for m in app.machines.iter_mut().filter(|m| !m.is_local()) {
+        let wake = wake_tx.clone();
+        m.set_waker(Arc::new(move |pushed| {
+            let _ = wake.send(if pushed { Wake::Push } else { Wake::Answer });
+        }));
+    }
     let observer = core.clone();
+    let observer_wake = wake_tx.clone();
     thread::spawn(move || {
         loop {
             if tx
@@ -649,6 +711,7 @@ pub fn run(core: &Core) -> Result<()> {
             {
                 return;
             }
+            let _ = observer_wake.send(Wake::Answer);
             match req_rx.recv_timeout(Duration::from_millis(1500)) {
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 _ => while req_rx.try_recv().is_ok() {},
@@ -662,32 +725,79 @@ pub fn run(core: &Core) -> Result<()> {
         // Draw only what changed: an event, a new list, a different screen, or a notice running out.
         let (mut dirty, mut notice) = (true, false);
         let mut viewed: HashMap<String, Vec<String>> = HashMap::new();
+        // The last wake was nothing but pushed screens: what is on screen and where did not
+        // change, so the housekeeping that follows input and lists is skipped.
+        let mut pushed_only = false;
+        // After input the loop waits by looking in a tight loop for a moment, see `WARM`.
+        let mut warm_until = Instant::now();
+        // The terminal input, read on a thread of its own so the loop can sleep on one channel.
+        {
+            let (wake, ends) = (wake_tx.clone(), ends.clone());
+            thread::spawn(move || {
+                while !ends.load(Ordering::Relaxed) {
+                    match event::poll(Duration::from_millis(250)) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            // Everything already waiting goes together, so fast typing is one
+                            // tmux call and a paste is not split between two passes.
+                            let mut batch = vec![];
+                            let read = loop {
+                                match event::read() {
+                                    Ok(ev) => batch.push(ev),
+                                    Err(e) => break Err(e),
+                                }
+                                if batch.len() >= 256
+                                    || !event::poll(Duration::ZERO).unwrap_or(false)
+                                {
+                                    break Ok(batch);
+                                }
+                            };
+                            let failed = read.is_err();
+                            if wake.send(Wake::Input(read)).is_err() || failed {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = wake.send(Wake::Input(Err(e)));
+                            return;
+                        }
+                    }
+                }
+            });
+        }
         while !app.quit {
             while let Ok(u) = rx.try_recv() {
                 app.apply(u);
                 dirty = true;
             }
             dirty |= app.tick();
-            dirty |= app.end_viewers(core);
+            // An answer that just came in may free the keys that were waiting for it.
+            app.flush_typed_when_free(core);
+            // Cells here are read when due, whatever else woke the loop: a computer that pushes
+            // often must not keep a quiet local cell from being read.
             dirty |= app.capture_due(core);
-            for machine in &app.machines {
-                if machine.unusable().is_some() {
-                    viewed.remove(&machine.id);
-                    continue;
-                }
-                let runs: Vec<String> = app
-                    .on_screen()
-                    .iter()
-                    .filter(|id| id.machine == machine.id)
-                    .filter_map(|id| app.agents.iter().find(|a| a.id() == *id)?.run.clone())
-                    .collect();
-                if viewed.get(&machine.id) != Some(&runs) {
-                    if machine.is_local() {
-                        core.set_app_viewed(&runs)?;
-                    } else {
-                        let _ = machine.request(json!({"op":"view", "runs":runs}), None);
+            if !std::mem::take(&mut pushed_only) {
+                dirty |= app.end_viewers(core);
+                app.sync_watches();
+                for machine in &app.machines {
+                    if machine.unusable().is_some() {
+                        viewed.remove(&machine.id);
+                        continue;
                     }
-                    viewed.insert(machine.id.clone(), runs);
+                    let runs: Vec<String> = app
+                        .on_screen()
+                        .iter()
+                        .filter(|id| id.machine == machine.id)
+                        .filter_map(|id| app.agents.iter().find(|a| a.id() == *id)?.run.clone())
+                        .collect();
+                    if viewed.get(&machine.id) != Some(&runs) {
+                        if machine.is_local() {
+                            core.set_app_viewed(&runs)?;
+                        } else {
+                            let _ = machine.request(json!({"op":"view", "runs":runs}), None);
+                        }
+                        viewed.insert(machine.id.clone(), runs);
+                    }
                 }
             }
             let live = app.notice_live();
@@ -697,19 +807,52 @@ pub fn run(core: &Core) -> Result<()> {
             }
             let wait = app.due_in();
             let wait = if app.waiting() { wait.min(SOON) } else { wait };
-            if event::poll(wait)? {
-                // Everything already waiting goes in one go, so fast typing is one tmux call.
-                loop {
-                    app.handle(core, event::read()?);
-                    if app.quit || !event::poll(Duration::ZERO)? {
-                        break;
+            // Sleep until input or a line from a bridge comes, or something is due.
+            let first = match wait_for(&wake_rx, wait, warm_until) {
+                Ok(w) => w,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+            };
+            if let Some(first) = first {
+                // Everything already waiting goes in one go, so fast typing is one tmux call and
+                // a burst of pushed screens is one draw.
+                let (mut typed, mut pushed) = (false, false);
+                for w in
+                    std::iter::once(first).chain(std::iter::from_fn(|| wake_rx.try_recv().ok()))
+                {
+                    match w {
+                        Wake::Input(events) => {
+                            for ev in events? {
+                                app.handle(core, ev);
+                                if app.quit {
+                                    break;
+                                }
+                            }
+                            typed = true;
+                            if app.quit {
+                                break;
+                            }
+                        }
+                        Wake::Push => pushed = true,
+                        Wake::Answer => typed = true,
                     }
                 }
-                app.place();
+                pushed_only = pushed && !typed;
+
+                if typed {
+                    app.place();
+                }
                 dirty = true;
             }
             app.flush_typed_when_free(core);
+            // Something went to another computer for the person's keys, paste or wheel: its answer
+            // is on its way.
+            if std::mem::take(&mut app.expect_reply) {
+                warm_until = Instant::now() + WARM;
+            }
         }
+        // The input thread notices within its poll time and ends; the process is leaving anyway.
+        ends.store(true, Ordering::Relaxed);
         Ok(())
     })();
     let _ = core.set_app_viewed(&[]);
@@ -802,6 +945,7 @@ impl App {
             typed: None,
             tasks: vec![],
             reading: None,
+            expect_reply: false,
         }
     }
     fn say(&mut self, text: impl Into<String>) {
@@ -884,6 +1028,10 @@ impl App {
         for u in updates {
             self.apply(u);
         }
+        let pushed: Vec<(u32, Value)> = self.machines.iter_mut().flat_map(Mach::pushed).collect();
+        for (id, ev) in pushed {
+            dirty |= self.apply_push(id, &ev);
+        }
         let mut done = vec![];
         let mut i = 0;
         while i < self.tasks.len() {
@@ -916,12 +1064,65 @@ impl App {
         }
         dirty
     }
+    /// A screen or a change the bridge of another computer pushed for a cell. Whether the screen
+    /// changed.
+    fn apply_push(&mut self, id: u32, ev: &Value) -> bool {
+        if ev["ev"] == "changed" {
+            let machine = self.agent_in(id).map(|a| a.machine.clone());
+            let changed = self.blank(id);
+            if let Some(m) = machine {
+                self.poke_machine(&m);
+            }
+            return changed;
+        }
+        self.show(id, Screen::from_answer(ev))
+    }
+    /// Tell each pushing-capable computer which of its cells are on screen, at what size and
+    /// scroll. A cell that now shows another agent starts from nothing.
+    fn sync_watches(&mut self) {
+        let mut want: HashMap<String, Vec<(u32, machines::Watched)>> = HashMap::new();
+        for id in self.visible() {
+            let Some(a) = self
+                .agent_in(id)
+                .filter(|a| a.running() && !a.machine.is_empty())
+            else {
+                continue;
+            };
+            let (Some(pane), Some(run)) = (a.pane.clone(), a.run.clone()) else {
+                continue;
+            };
+            let inner = self.panes.get(&id).map_or(Rect::default(), |p| p.inner);
+            if inner.width < 2 || inner.height < 2 {
+                continue;
+            }
+            let (machine, name) = (a.machine.clone(), a.name.clone());
+            let owner = (machine.clone(), pane);
+            if self.view(id).owner != owner {
+                *self.view(id) = View {
+                    owner,
+                    ..View::default()
+                };
+            }
+            let scroll = self.view(id).scroll;
+            want.entry(machine)
+                .or_default()
+                .push((id, (name, run, inner.width, inner.height, scroll)));
+        }
+        for m in self.machines.iter_mut().filter(|m| !m.is_local()) {
+            m.watch(want.get(&m.id).map_or(&[], Vec::as_slice));
+        }
+    }
+    /// Whether the bridge pushes this cell's screen, so it is not read here.
+    fn pushed(&self, id: u32) -> bool {
+        self.agent_in(id)
+            .filter(|a| a.running() && a.pane.is_some() && a.run.is_some())
+            .and_then(|a| self.mach(&a.machine))
+            .is_some_and(Mach::pushing)
+    }
     /// Something is in flight, so the loop looks again soon.
     fn waiting(&self) -> bool {
-        self.panes.values().any(|p| p.view.pending.is_some())
-            || !self.tasks.is_empty()
-            || self.reading.is_some()
-            || self.machines.iter().any(Mach::waiting)
+        // Answers from other computers wake the loop themselves; the clipboard thread does not.
+        self.reading.is_some()
     }
     /// An answer for a task: nothing to say when it went well; why it did not otherwise.
     fn finish(&mut self, task: Task, answer: Result<Value>) {
@@ -1517,7 +1718,7 @@ impl App {
     fn capture_due(&mut self, core: &Core) -> bool {
         let mut dirty = false;
         for id in self.visible() {
-            if self.view(id).next.is_none_or(|t| Instant::now() >= t) {
+            if !self.pushed(id) && self.view(id).next.is_none_or(|t| Instant::now() >= t) {
                 dirty |= self.capture(core, id);
             }
         }
@@ -1527,6 +1728,7 @@ impl App {
     fn due_in(&self) -> Duration {
         self.visible()
             .iter()
+            .filter(|id| !self.pushed(**id))
             .map(|id| {
                 self.panes
                     .get(id)
@@ -1536,7 +1738,8 @@ impl App {
                     })
             })
             .min()
-            .unwrap_or(Duration::ZERO)
+            .unwrap_or(IDLE)
+            .min(IDLE)
     }
     /// Read a cell's screen and schedule its next read. Whether the screen changed.
     fn capture(&mut self, core: &Core, id: u32) -> bool {
@@ -1735,6 +1938,7 @@ impl App {
         let op = json!({"op": "keys", "agent": a.name, "run": run, "keys": keys});
         if let Some(rx) = self.request(&a.machine, op, None) {
             self.tasks.push((rx, Task::Keys(a.clone())));
+            self.expect_reply = true;
         }
         self.read_soon(&a);
     }
@@ -1824,6 +2028,7 @@ impl App {
             let op = json!({"op": "paste", "agent": a.name, "run": run, "text": text});
             if let Some(rx) = self.request(&a.machine, op, None) {
                 self.tasks.push((rx, Task::Paste(a.clone())));
+                self.expect_reply = true;
             }
             return self.read_soon(&a);
         }
@@ -2237,6 +2442,7 @@ impl App {
                     let view = self.view(id);
                     view.scroll = (view.scroll + 3).min(view.max_scroll(inner_h));
                     view.next = None;
+                    self.expect_reply |= self.agent_in(id).is_some_and(|a| !a.machine.is_empty());
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -2245,6 +2451,7 @@ impl App {
                     let view = self.view(id);
                     view.scroll = view.scroll.saturating_sub(3);
                     view.next = None;
+                    self.expect_reply |= self.agent_in(id).is_some_and(|a| !a.machine.is_empty());
                 }
             }
             _ => {}

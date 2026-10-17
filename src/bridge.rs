@@ -9,6 +9,7 @@ use crate::{
     clipboard::{self, MAX_IMAGE},
     human::literal,
 };
+mod watch;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::{Map, Value, json};
 use std::{
@@ -43,12 +44,7 @@ pub fn run(core: &Core) -> Result<()> {
         !crate::app::agent_caller(core),
         "agent_caller: the bridge serves the app of a person on another computer; agents use `pctl session` and `msg`"
     );
-    // One locked write per line: a list answers from its own thread, and lines must not interleave.
-    let send = |line: Value| -> std::io::Result<()> {
-        let mut out = std::io::stdout().lock();
-        writeln!(out, "{line}")?;
-        out.flush()
-    };
+    let send = emit;
     send(hello())?;
     let stdin = std::io::stdin();
     let mut input = BufReader::new(stdin.lock());
@@ -56,6 +52,7 @@ pub fn run(core: &Core) -> Result<()> {
     // viewer (the app on the other computer) from being resized back and forth.
     let mut asked: HashMap<String, (u16, u16)> = HashMap::new();
     let mut clip = Clip::new(core);
+    let watch = watch::Watch::new();
     let mut lists: Vec<thread::JoinHandle<std::io::Result<()>>> = vec![];
     while let Some((line, over)) = next_line(&mut input)? {
         let (id, result) = if over {
@@ -73,7 +70,7 @@ pub fn run(core: &Core) -> Result<()> {
                         lists.push(thread::spawn(move || send(answer(Some(id), list(&core)))));
                         continue;
                     }
-                    Some(id) => (Some(id), op(core, &req, &mut asked, &mut clip)),
+                    Some(id) => (Some(id), op(core, &req, &mut asked, &mut clip, &watch)),
                 },
             }
         };
@@ -83,8 +80,17 @@ pub fn run(core: &Core) -> Result<()> {
     for h in lists {
         let _ = h.join();
     }
+    watch.stop();
     core.set_app_viewed(&[])?;
     Ok(())
+}
+
+/// One line on stdout, written under the lock in one piece: answers, events and the list thread's
+/// answer must never interleave.
+fn emit(line: Value) -> std::io::Result<()> {
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{line}")?;
+    out.flush()
 }
 
 /// One request. The run check happens before anything is touched.
@@ -93,6 +99,7 @@ fn op(
     req: &Value,
     asked: &mut HashMap<String, (u16, u16)>,
     clip: &mut Clip,
+    watch: &Arc<watch::Watch>,
 ) -> Result<Value> {
     let text = |name: &str| -> Result<&str> {
         req.get(name)
@@ -113,10 +120,20 @@ fn op(
         "list" => list(core),
         "doc_read" => core.doc_read(text("doc")?),
         "screen" => screen(core, text("agent")?, text("run")?, req, asked),
-        "keys" => send_keys(core, text("agent")?, text("run")?, req),
-        "paste" => paste(core, text("agent")?, text("run")?, req),
+        "watch" => watch.set(core, req, asked),
+        // Whatever went in, the pane's next screen is read at once.
+        "keys" => send_keys(core, text("agent")?, text("run")?, req, watch),
+        "paste" => {
+            let r = paste(core, text("agent")?, text("run")?, req);
+            watch.heat(text("run")?);
+            r
+        }
         "clip_put" => clip.put(core, text("agent")?, text("run")?, req),
-        "clip_set" => clip.set(core, text("agent")?, text("run")?, req),
+        "clip_set" => {
+            let r = clip.set(core, text("agent")?, text("run")?, req);
+            watch.heat(text("run")?);
+            r
+        }
         "act" => act(core, req),
         other => bail!("unknown op {other}"),
     }
@@ -163,11 +180,16 @@ fn screen(
     let Some(s) = read_screen(core, &pane, run, h, scroll)? else {
         bail!("changed: pane {pane} no longer holds run {run}; touch nothing");
     };
-    Ok(json!({
+    Ok(screen_json(&s))
+}
+
+/// A screen as the `screen` answer and the `screen` event carry it.
+fn screen_json(s: &Screen) -> Value {
+    json!({
         "rows": s.text, "history": s.history,
         "cursor": s.cursor.map(|(x, y)| json!([x, y])), "size": [s.size.0, s.size.1],
         "alt": s.alt, "mouse": s.mouse, "sgr": s.sgr,
-    }))
+    })
 }
 
 /// The pane a run is on, from the registry. The run must exist and belong to the agent asked for.
@@ -297,6 +319,12 @@ pub fn read_screen(
         Err(e) => return Err(e),
     };
     let (body, last) = out.rsplit_once('\n').unwrap_or(("", out.as_str()));
+    Ok(screen_from(body, last, run))
+}
+
+/// A screen from the rows and the `CURSOR_FORMAT` line read after them; None when the pane holds
+/// another run.
+fn screen_from(body: &str, last: &str, run: &str) -> Option<Screen> {
     let mut fields = last.splitn(10, ' ');
     let m: Vec<u64> = fields
         .by_ref()
@@ -304,7 +332,7 @@ pub fn read_screen(
         .filter_map(|v| v.parse().ok())
         .collect();
     if fields.next() != Some(run) {
-        return Ok(None);
+        return None;
     }
     let mut screen = Screen {
         text: body.to_string(),
@@ -316,7 +344,47 @@ pub fn read_screen(
         screen.history = m[5] as usize;
         (screen.alt, screen.mouse, screen.sgr) = (m[6] == 1, m[7] == 1, m[8] == 1);
     }
-    Ok(Some(screen))
+    Some(screen)
+}
+
+/// Starts the line `read_screens` reads each pane's fields from: a control character no pane text
+/// holds.
+const END: char = '\u{1e}';
+
+/// Several panes' live screens (not scrolled back) in one tmux call, each checked for its run as in
+/// `read_screen`: `(pane, run, height)` in, one answer each out. If tmux fails for the whole call
+/// (one pane is gone: tmux stops at the first error) every pane is read on its own.
+pub fn read_screens(core: &Core, cells: &[(&str, &str, u16)]) -> Vec<Result<Option<Screen>>> {
+    let format = format!("{END}{CURSOR_FORMAT}");
+    let mut args: Vec<&str> = vec![];
+    for (i, (pane, ..)) in cells.iter().enumerate() {
+        if i > 0 {
+            args.push(";");
+        }
+        args.extend(["capture-pane", "-p", "-e", "-N", "-t", pane]);
+        args.extend([";", "display-message", "-p", "-t", pane, &format]);
+    }
+    if let Ok(out) = core.tm(&args) {
+        let mut found = vec![];
+        let mut rows: Vec<&str> = vec![];
+        for line in out.split('\n') {
+            match line.strip_prefix(END) {
+                Some(fields) => {
+                    let run = cells.get(found.len()).map_or("", |c| c.1);
+                    found.push(screen_from(&rows.join("\n"), fields, run));
+                    rows.clear();
+                }
+                None => rows.push(line),
+            }
+        }
+        if found.len() == cells.len() {
+            return found.into_iter().map(Ok).collect();
+        }
+    }
+    cells
+        .iter()
+        .map(|(pane, run, h)| read_screen(core, pane, run, *h, 0))
+        .collect()
 }
 
 /// `s` as one tmux command argument, for a command inside another command.
@@ -356,8 +424,12 @@ pub fn type_keys(core: &Core, pane: &str, run: &str, keys: &[(bool, String)]) ->
     if !core.refresh_pane_input(pane, run)? {
         return Ok(false);
     }
-    let send: Vec<String> = keys
-        .iter()
+    while_run(core, pane, run, &send_command(pane, keys), "")
+}
+
+/// The tmux commands that type `keys` into the pane.
+fn send_command(pane: &str, keys: &[(bool, String)]) -> String {
+    keys.iter()
         .map(|(lit, key)| {
             format!(
                 "send-keys -t {pane} {}-- {}",
@@ -365,11 +437,17 @@ pub fn type_keys(core: &Core, pane: &str, run: &str, keys: &[(bool, String)]) ->
                 quote(key)
             )
         })
-        .collect();
-    while_run(core, pane, run, &send.join(" ; "), "")
+        .collect::<Vec<_>>()
+        .join(" ; ")
 }
 
-fn send_keys(core: &Core, agent: &str, run: &str, req: &Value) -> Result<Value> {
+fn send_keys(
+    core: &Core,
+    agent: &str,
+    run: &str,
+    req: &Value,
+    watch: &watch::Watch,
+) -> Result<Value> {
     let asked = req
         .get("keys")
         .and_then(Value::as_array)
@@ -389,11 +467,21 @@ fn send_keys(core: &Core, agent: &str, run: &str, req: &Value) -> Result<Value> 
         })
         .collect::<Result<_>>()?;
     let pane = pane_of(core, agent, run)?;
+    // Typed first, recorded after: recording the keystroke for the refresh state takes ~20 ms,
+    // which the person would feel on every key and wheel tick. It is safe because the app sending
+    // these keys told us the run it views (`view`, kept by app_visible), which stops a hand-over of
+    // the pane in between; the run check is also inside the tmux call that types.
+    let typed = while_run(core, &pane, run, &send_command(&pane, &keys), "")?;
+    watch.heat(run);
     ensure!(
-        type_keys(core, &pane, run, &keys)?,
+        typed,
         "changed: pane {pane} no longer holds run {run}; touch nothing"
     );
-    Ok(json!({}))
+    // The keys are in the pane either way, so a failure here is a warning, not an error.
+    Ok(match core.refresh_pane_input(&pane, run) {
+        Ok(_) => json!({}),
+        Err(e) => json!({"warning": format!("typed, but not recorded: {e:#}")}),
+    })
 }
 
 /// Paste `text` into the pane as one bracketed paste, checking the run in the call that pastes.
@@ -809,9 +897,20 @@ pub struct Hello {
 /// thread can call it.
 pub struct Remote {
     target: String,
+    /// `screen` and `changed` events of the bridge, from every connection this Remote has had.
+    events: Mutex<mpsc::Receiver<Value>>,
+    events_tx: mpsc::Sender<Value>,
+    /// Counts connections: a watch belongs to the one that got it.
+    generation: AtomicU64,
+    /// Told whenever a line comes in (`true`: a pushed event, `false`: an answer), so the app can
+    /// sleep until something arrives instead of looking every few ms.
+    waker: Waker,
     /// The current connection. Only `reconnect` swaps it, and the old one goes down first.
     inner: Mutex<Arc<Inner>>,
 }
+
+/// Shared by a `Remote` and every connection it has had.
+pub type Waker = Arc<Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>>;
 
 struct Inner {
     state: Mutex<RemoteState>,
@@ -822,6 +921,9 @@ struct Inner {
     lines: Mutex<Option<mpsc::Sender<String>>>,
     child: Mutex<Option<Child>>,
     started: Instant,
+    /// Where lines with an `ev` and no id go (the `screen` and `changed` events).
+    events: Option<mpsc::Sender<Value>>,
+    waker: Waker,
 }
 
 struct Pending {
@@ -845,9 +947,21 @@ impl Remote {
     }
 
     fn connect_with(ssh: &str, bin: &str, target: &str) -> Result<Remote> {
+        let (events_tx, events) = mpsc::channel();
+        let waker = Waker::default();
         Ok(Remote {
             target: target.to_string(),
-            inner: Mutex::new(Inner::spawn_with(ssh, bin, target)?),
+            events: Mutex::new(events),
+            inner: Mutex::new(Inner::spawn_with(
+                ssh,
+                bin,
+                target,
+                Some(events_tx.clone()),
+                waker.clone(),
+            )?),
+            events_tx,
+            generation: AtomicU64::new(1),
+            waker,
         })
     }
 
@@ -890,17 +1004,48 @@ impl Remote {
 
     /// Start a new connection over the same target. Pending requests on the old one fail.
     pub fn reconnect(&self) -> Result<()> {
-        self.replace(Inner::spawn_with(&env_ssh(), &env_bin(), &self.target)?);
+        self.replace(Inner::spawn_with(
+            &env_ssh(),
+            &env_bin(),
+            &self.target,
+            Some(self.events_tx.clone()),
+            self.waker.clone(),
+        )?);
         Ok(())
     }
 
     #[cfg(test)]
     fn reconnect_with(&self, ssh: &str, bin: &str) -> Result<()> {
-        self.replace(Inner::spawn_with(ssh, bin, &self.target)?);
+        self.replace(Inner::spawn_with(
+            ssh,
+            bin,
+            &self.target,
+            Some(self.events_tx.clone()),
+            self.waker.clone(),
+        )?);
         Ok(())
     }
 
+    /// Call `f(true)` when an event is pushed and `f(false)` when an answer comes in, from the
+    /// reader thread (keep it short).
+    pub fn set_waker(&self, f: Arc<dyn Fn(bool) + Send + Sync>) {
+        *lock(&self.waker) = Some(f);
+    }
+
+    /// The events that came in since the last call, oldest first.
+    pub fn events(&self) -> Vec<Value> {
+        let rx = lock(&self.events);
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// Which connection this is: it changes with every `reconnect`, so a caller can tell that what
+    /// it told the bridge (a watch) is gone.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
     fn replace(&self, next: Arc<Inner>) -> Arc<Inner> {
+        self.generation.fetch_add(1, Ordering::Relaxed);
         let old = std::mem::replace(&mut *lock(&self.inner), next);
         old.down("reconnected");
         old
@@ -930,7 +1075,13 @@ fn env_bin() -> String {
 }
 
 impl Inner {
-    fn spawn_with(ssh: &str, bin: &str, target: &str) -> Result<Arc<Inner>> {
+    fn spawn_with(
+        ssh: &str,
+        bin: &str,
+        target: &str,
+        events: Option<mpsc::Sender<Value>>,
+        waker: Waker,
+    ) -> Result<Arc<Inner>> {
         let line = format!("{} bridge", crate::shell_quote(bin));
         let mut child = Command::new(ssh)
             .args([
@@ -962,6 +1113,8 @@ impl Inner {
             lines: Mutex::new(None),
             child: Mutex::new(Some(child)),
             started: Instant::now(),
+            events,
+            waker,
         });
         let (tx, rx) = mpsc::channel::<String>();
         *lock(&inner.lines) = Some(tx);
@@ -1023,11 +1176,24 @@ impl Inner {
         let Ok(answer) = serde_json::from_str::<Value>(line) else {
             return;
         };
+        let wake = |pushed: bool| {
+            let f = lock(&self.waker).clone();
+            if let Some(f) = f {
+                f(pushed);
+            }
+        };
         let Some(id) = answer.get("id").and_then(Value::as_u64) else {
+            if matches!(answer["ev"].as_str(), Some("screen" | "changed"))
+                && let Some(tx) = &self.events
+            {
+                let _ = tx.send(answer);
+                wake(true);
+            }
             return;
         };
         if let Some(e) = lock(&self.pending).remove(&id) {
             let _ = e.tx.send(Ok(answer));
+            wake(false);
         }
     }
 
@@ -1140,6 +1306,8 @@ mod tests {
                 lines: Mutex::new(Some(tx)),
                 child: Mutex::new(None),
                 started,
+                events: None,
+                waker: Waker::default(),
             }),
             rx,
         )
@@ -1363,6 +1531,48 @@ mod tests {
     }
 
     #[test]
+    fn every_line_from_the_bridge_wakes_the_app() {
+        let (tx, _rx) = mpsc::channel();
+        let (mut inner, _sent) = bare();
+        {
+            let i = Arc::get_mut(&mut inner).expect("sole owner");
+            i.events = Some(tx);
+        }
+        let wakes = Arc::new(Mutex::new(vec![]));
+        let seen = wakes.clone();
+        *lock(&inner.waker) = Some(Arc::new(move |pushed| lock(&seen).push(pushed)));
+        let _waiting = inner.request(json!({"op": "list"}), None);
+        inner.route(r#"{"ev":"screen","key":"1","rev":1}"#);
+        inner.route(r#"{"id":1,"ok":true}"#);
+        inner.route(r#"{"id":99,"ok":true}"#);
+        assert_eq!(
+            *lock(&wakes),
+            [true, false],
+            "an answer nobody waits for wakes nothing"
+        );
+    }
+
+    #[test]
+    fn pushed_events_go_to_the_event_channel_not_to_requests() {
+        let (tx, rx) = mpsc::channel();
+        let (mut inner, _sent) = bare();
+        Arc::get_mut(&mut inner).expect("sole owner").events = Some(tx);
+        let waiting = inner.request(json!({"op": "list"}), None);
+        inner.route(r#"{"ev":"screen","key":"3","rev":2,"rows":"x"}"#);
+        inner.route(r#"{"ev":"changed","key":"4","rev":1}"#);
+        inner.route(r#"{"ev":"hello"}"#);
+        inner.route("not json");
+        assert!(waiting.try_recv().is_err(), "an event answers no request");
+        let got: Vec<Value> = rx.try_iter().collect();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            (got[0]["ev"].as_str(), got[0]["rev"].as_u64()),
+            (Some("screen"), Some(2))
+        );
+        assert_eq!(got[1]["ev"], "changed");
+    }
+
+    #[test]
     fn answers_match_their_ids_in_any_order() {
         let (inner, sent) = bare();
         let first = inner.request(json!({"op": "list"}), None);
@@ -1419,12 +1629,22 @@ mod tests {
     fn a_reconnect_goes_down_a_fresh_connection_and_fails_the_old_one() {
         let (old, _sent) = bare();
         let waiting = old.request(json!({"op": "list"}), None);
+        let (events_tx, events) = mpsc::channel();
         let remote = Remote {
             target: "somewhere".into(),
             inner: Mutex::new(old.clone()),
+            events: Mutex::new(events),
+            events_tx,
+            generation: AtomicU64::new(1),
+            waker: Waker::default(),
         };
         let (next, _next_sent) = bare_in(RemoteState::Connecting, Instant::now());
         let gone = remote.replace(next);
+        assert_eq!(
+            remote.generation(),
+            2,
+            "a new connection is a new generation"
+        );
         assert!(std::ptr::eq(&*gone, &*old));
         assert_eq!(remote.state(), RemoteState::Connecting);
         assert!(waiting.try_recv().expect("failed").is_err());
