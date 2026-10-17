@@ -4,7 +4,7 @@ outer "monitor" tmux; its screen is read with capture-pane, keys go in with send
 clicks are SGR mouse sequences typed into it. Covers the sidebar, tabs and live terminal, typing,
 clicks, prefix shortcuts, the new-agent form, the right-click menu with its confirmation (and that
 clicks on a box never reach what is behind it; double-click and ctrl+b m open the same menu), Start for a stopped agent, wheel scroll-back,
-drag-to-copy to the clipboard, Leave (stops nothing, reopens in place, never leaves window-size at manual, even when killed), shortcuts from a config file, the
+drag-to-copy to the clipboard (OSC 52 and a local command, with honest wording where the terminal ignores it), desktop notices, Leave (stops nothing, reopens in place, never leaves window-size at manual, even when killed), shortcuts from a config file, the
 empty state with no server (which starts nothing), and that agents cannot open the app."""
 import argparse, json, os, pathlib, re, subprocess, tempfile, time
 p = argparse.ArgumentParser(); p.add_argument('--bin', required=True); p.add_argument('--tmux', required=True); p.add_argument('--report', required=True); a = p.parse_args()
@@ -13,7 +13,11 @@ root = pathlib.Path(tempfile.mkdtemp(prefix='pctl-app-', dir=os.path.realpath('/
 V = root / 'v.sock'; bindir = root / 'bin'; bindir.mkdir(); cfg = root / 'cfg'
 (bindir / 'plain').write_text('#!/bin/bash\nif [ "$(basename "$PWD")" = b-block ]; then echo "Do you want to proceed?"; echo "❯ 1. Yes"; fi\necho "ready in $(basename "$PWD")"\necho "> "\nwhile IFS= read -r line; do echo "got: $line"; echo "> "; done\n')
 (bindir / 'plain').chmod(0o755)
-ENV = {k: v for k, v in os.environ.items() if not k.startswith(('PCTL_', 'TMUX', 'XDG_CONFIG', 'NO_COLOR'))}  # NO_COLOR (some agent shells set it) would turn the app's colours off
+(bindir / 'clipw').write_text('#!/bin/sh\ncat > "$0.out"\n'); (bindir / 'clipw').chmod(0o755)  # PCTL_CLIP_WRITE_TEXT: keeps what it is given
+(bindir / 'notify').write_text('#!/bin/sh\nprintf "%s|" "$@" >> "$0.out"; echo >> "$0.out"\n'); (bindir / 'notify').chmod(0o755)  # PCTL_NOTIFY_SEND
+(bindir / 'flip').write_text('#!/bin/bash\necho "esc to interrupt"\nwhile [ ! -e "$PWD/../go" ]; do sleep 0.2; done\nclear; echo "Do you want to proceed?"; echo "❯ 1. Yes"; sleep 600\n')
+(bindir / 'flip').chmod(0o755)  # works until a file appears, then asks a question
+ENV = {k: v for k, v in os.environ.items() if not k.startswith(('PCTL_', 'TMUX', 'XDG_CONFIG', 'VTE_VERSION', 'SSH_CONNECTION', 'TERM_PROGRAM', 'WAYLAND_DISPLAY', 'DISPLAY', 'NO_COLOR'))}  # NO_COLOR (some agent shells set it) would turn the app's colours off
 ENV['XDG_CONFIG_HOME'] = str(root / 'no-config')  # the person's own config.toml stays out
 ENV.update(TERM='xterm-256color', SHELL='/bin/bash', PS1='$ ')
 def cli(*args, ok=True, st=None):
@@ -306,7 +310,8 @@ try:
         subprocess.run([T, '-S', str(other / 'tmux.sock'), 'kill-server'], capture_output=True)
     case('first run: + Project, then the first agent; without leave to start a server the form says why, and PCTL_STANDALONE=1 starts it', first_run)
     def copy_drag():
-        app()
+        clipw = bindir / 'clipw'; out = pathlib.Path(str(clipw) + '.out'); out.unlink(missing_ok=True)
+        app(env={'PCTL_CLIP_WRITE_TEXT': clipw})
         click(*side('a-main'))
         assert until(lambda: 'alpha / ● a-main' in status() and '>' in screen()), screen()
         vt('set-option', '-g', 'set-clipboard', 'on')  # the outer tmux then stores an OSC 52 write
@@ -321,11 +326,58 @@ try:
         release(x2, y)
         assert until(lambda: 'Copied 21 characters' in status()), status()
         assert until(lambda: vt('show-buffer').strip() == 'got: echo HELLO-WORLD'), vt('show-buffer')
+        assert until(lambda: out.exists() and out.read_text() == 'got: echo HELLO-WORLD'), out  # the local command got the exact text too
         vt('delete-buffer')
         drag(x2, y, x1, y)  # dragging backwards copies the same text
         release(x1, y)
         assert until(lambda: vt('show-buffer').strip() == 'got: echo HELLO-WORLD'), vt('show-buffer')
     case('a left drag in the terminal copies the selection to the clipboard, either direction; a plain click copies nothing', copy_drag)
+    def copy_wording():
+        clipw = bindir / 'clipw'; out = pathlib.Path(str(clipw) + '.out')
+        def copied(env):
+            out.unlink(missing_ok=True)
+            app(env=env)
+            vt('resize-window', '-t', 'view', '-x', '150')  # the status line cuts a notice at the window edge
+            click(*side('a-main'))
+            assert until(lambda: 'alpha / ● a-main' in status() and '>' in screen()), screen()
+            text('echo HELLO-WORLD'); keys('Enter')
+            assert until(lambda: 'got: echo HELLO-WORLD' in screen()), screen()
+            x1, x2, y = span('got: echo HELLO-WORLD')
+            drag(x1, y, x2, y); release(x2, y)
+            time.sleep(0.5)
+            return status()
+        s = copied({'PCTL_CLIP_WRITE_TEXT': clipw, 'SSH_CONNECTION': '1'})
+        assert 'Sent 21 characters' in s and 'Shift+drag does' in s, s
+        assert not out.exists(), 'over ssh this computer\'s clipboard is not the person\'s: the command is not run'
+        s = copied({'PCTL_CLIP_WRITE_TEXT': 'false'})
+        assert 'Sent 21 characters' in s and 'Copied' not in s, s
+        s = copied({'PCTL_CLIP_WRITE_TEXT': 'false', 'VTE_VERSION': '6402'})
+        assert 'This terminal ignores copying: Shift+drag, then ctrl+shift+c' in s, s
+        s = copied({'PCTL_CLIP_WRITE_TEXT': clipw, 'VTE_VERSION': '6402'})
+        assert 'Copied 21 characters' in s and out.read_text() == 'got: echo HELLO-WORLD', s  # a working command beats the VTE warning
+        s = copied({'PCTL_CLIP_WRITE_TEXT': 'false', 'TERM_PROGRAM': 'ghostty'})
+        assert 'Copied 21 characters' in s, s  # a terminal known to honour OSC 52
+    case('a copy says Copied only when a command or a known terminal took it; over ssh the command is not run; VTE gets the Shift+drag hint', copy_wording)
+    def notice_command():
+        nsend = bindir / 'notify'; out = pathlib.Path(str(nsend) + '.out'); out.unlink(missing_ok=True)
+        d = root / 'proj' / 'alpha' / 'flip'; d.mkdir(parents=True, exist_ok=True); (root / 'proj' / 'alpha' / 'go').unlink(missing_ok=True)
+        cli('session', 'add', '--name', 'a-flip', '--cwd', d, '--project', 'alpha', '--', bindir / 'flip')
+        assert until(lambda: cli('session', 'get', 'a-flip')['status'] == 'working'), cli('session', 'get', 'a-flip')
+        app(env={'PCTL_NOTIFY_SEND': nsend})
+        click(*side('a-main'))
+        assert until(lambda: 'a-flip' in screen()), screen()
+        time.sleep(3)  # the app has watched a-flip work
+        (root / 'proj' / 'alpha' / 'go').write_text('')
+        assert until(lambda: out.exists() and 'a-flip: needs you' in out.read_text(), 20), out.read_text() if out.exists() else 'no call'
+        assert out.read_text().splitlines()[0] == '--|pctl|a-flip: needs you|', out.read_text()
+        assert out.read_text().count('\n') == 1, 'one notice, not one per refresh'
+    case('an agent that goes from working to waiting also gets a desktop notice (notify-send stand-in), once', notice_command)
+    def help_line():
+        app()
+        click(*find('? Help'))
+        assert until(lambda: 'keep the right button' in screen()), screen()
+        keys('Escape')
+    case('the help screen says some terminals keep the right button', help_line)
     pathlib.Path(a.report).write_text(json.dumps({'results': results, 'passed': len(results)}, indent=1))
 finally:
     vt('kill-server')

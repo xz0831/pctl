@@ -3,11 +3,11 @@
 //!
 //! Test seams: `PCTL_CLIP_READ` (a shell command that prints a PNG on stdout) and `PCTL_CLIP_WRITE`
 //! (one that reads a PNG on stdin) stand in for the platform commands when set. Tests use them so
-//! that no real clipboard is touched.
+//! that no real clipboard is touched. `PCTL_CLIP_WRITE_TEXT` does the same for `write_text`.
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::{
     fs::File,
-    io::{ErrorKind, Read},
+    io::{ErrorKind, Read, Write},
     path::Path,
     process::{Child, Command, Stdio},
     sync::mpsc,
@@ -20,6 +20,8 @@ pub const MAX_IMAGE: usize = 20 << 20;
 /// A read of the clipboard that takes longer is given up; a write gets longer for a big image.
 const READ_WITHIN: Duration = Duration::from_secs(2);
 const WRITE_WITHIN: Duration = Duration::from_secs(10);
+/// Copied text is short and the app waits for the command, so it gets less time than an image.
+const TEXT_WITHIN: Duration = Duration::from_secs(2);
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
 pub fn is_png(bytes: &[u8]) -> bool {
@@ -136,6 +138,106 @@ pub fn write_image(file: &Path) -> Result<()> {
     }
 }
 
+/// The command that puts text on this computer's clipboard, by environment: `wl-copy` under
+/// Wayland, else `xclip` or `xsel` under X. `has` says whether a command is installed.
+fn text_tool(
+    macos: bool,
+    wayland: bool,
+    x11: bool,
+    has: impl Fn(&str) -> bool,
+) -> Option<(&'static str, &'static [&'static str])> {
+    if macos {
+        return Some(("pbcopy", &[]));
+    }
+    if wayland && has("wl-copy") {
+        return Some(("wl-copy", &[]));
+    }
+    if x11 && has("xclip") {
+        return Some(("xclip", &["-selection", "clipboard", "-i"]));
+    }
+    (x11 && has("xsel")).then_some(("xsel", &["-ib"]))
+}
+
+fn on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join(name))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+/// Put `text` on the clipboard of the computer this runs on, waiting at most `TEXT_WITHIN`. Err:
+/// there is no tool (or no display) here, or the tool failed or was too slow.
+pub fn write_text(text: &str) -> Result<()> {
+    let mut cmd = if let Some(script) = std::env::var_os("PCTL_CLIP_WRITE_TEXT") {
+        sh(script)
+    } else {
+        let (name, args) = text_tool(
+            cfg!(target_os = "macos"),
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+            std::env::var_os("DISPLAY").is_some(),
+            on_path,
+        )
+        .ok_or_else(|| anyhow!("no clipboard tool here (needs pbcopy, wl-copy, xclip or xsel)"))?;
+        let mut c = Command::new(name);
+        c.args(args);
+        c
+    };
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("could not start the clipboard command")?;
+    let mut stdin = child.stdin.take().context("stdin is piped")?;
+    let text = text.to_owned();
+    // Not joined: a command that never reads must not hold the caller; it dies at the deadline.
+    thread::spawn(move || {
+        let _ = stdin.write_all(text.as_bytes());
+    });
+    match wait_within(&mut child, TEXT_WITHIN)? {
+        status if status.success() => Ok(()),
+        status => bail!("the clipboard command failed ({status})"),
+    }
+}
+
+/// What the terminal is known to do with an OSC 52 write.
+pub struct CopyWay {
+    /// `write_text` put the text on the clipboard.
+    pub command_ok: bool,
+    /// The terminal is one known to turn OSC 52 into a clipboard.
+    pub honours_osc52: bool,
+    /// The terminal is a VTE one (MATE Terminal, GNOME Terminal), which ignores OSC 52.
+    pub vte: bool,
+}
+
+impl CopyWay {
+    pub fn from_env(command_ok: bool) -> Self {
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let (program, term) = (var("TERM_PROGRAM"), var("TERM"));
+        CopyWay {
+            command_ok,
+            honours_osc52: ["ghostty", "iTerm.app", "WezTerm"].contains(&program.as_str())
+                || ["xterm-ghostty", "xterm-kitty", "alacritty", "foot"].contains(&term.as_str()),
+            vte: std::env::var_os("VTE_VERSION").is_some(),
+        }
+    }
+
+    /// The status line after a copy of `count` characters: only a copy that is known to have
+    /// landed says "Copied". The status line cuts a notice at the window edge, so these are short.
+    pub fn status(&self, count: usize) -> String {
+        if self.command_ok || self.honours_osc52 {
+            format!("Copied {count} characters")
+        } else if self.vte {
+            "This terminal ignores copying: Shift+drag, then ctrl+shift+c".into()
+        } else {
+            format!("Sent {count} characters (the terminal may not copy; Shift+drag does)")
+        }
+    }
+}
+
 /// Everything `cmd` prints, when it succeeds. None: it is not installed, it failed (the clipboard
 /// holds no image) or it printed nothing. Err: it ran past `within`, or printed over `cap` bytes.
 /// The command is killed in both cases.
@@ -179,7 +281,7 @@ fn output_within(mut cmd: Command, cap: usize, within: Duration) -> Result<Optio
 }
 
 /// Wait for `child` at most `within`; a child still running then is killed and reaped.
-fn wait_within(child: &mut Child, within: Duration) -> Result<std::process::ExitStatus> {
+pub(crate) fn wait_within(child: &mut Child, within: Duration) -> Result<std::process::ExitStatus> {
     let deadline = Instant::now() + within;
     loop {
         if let Some(status) = child.try_wait()? {
@@ -249,6 +351,86 @@ mod tests {
             output_within(sh("sleep 30 & echo x; wait".into()), 10, SHORT).expect_err("never ends");
         assert!(e.to_string().contains("in time"), "{e:#}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_text_tool_follows_the_environment() {
+        let all = |_: &str| true;
+        let only = |n: &'static str| move |c: &str| c == n;
+        assert_eq!(
+            text_tool(true, false, false, |_| false).map(|t| t.0),
+            Some("pbcopy")
+        );
+        assert_eq!(
+            text_tool(false, true, true, all).map(|t| t.0),
+            Some("wl-copy")
+        );
+        assert_eq!(
+            text_tool(false, false, true, all).map(|t| t.0),
+            Some("xclip")
+        );
+        assert_eq!(
+            text_tool(false, false, true, only("xsel")).map(|t| t.0),
+            Some("xsel")
+        );
+        // Wayland without wl-copy still reaches X clipboards through XWayland.
+        assert_eq!(
+            text_tool(false, true, true, only("xclip")).map(|t| t.0),
+            Some("xclip")
+        );
+        assert_eq!(
+            text_tool(false, true, false, only("xclip")),
+            None,
+            "no DISPLAY"
+        );
+        assert_eq!(
+            text_tool(false, false, false, all),
+            None,
+            "no display at all"
+        );
+        assert_eq!(text_tool(false, false, true, |_| false), None, "no tool");
+    }
+
+    #[test]
+    fn the_copy_status_says_only_what_is_known() {
+        let way = |command_ok, honours_osc52, vte| CopyWay {
+            command_ok,
+            honours_osc52,
+            vte,
+        };
+        assert_eq!(way(true, false, true).status(5), "Copied 5 characters");
+        assert_eq!(way(false, true, false).status(5), "Copied 5 characters");
+        assert_eq!(
+            way(false, false, true).status(5),
+            "This terminal ignores copying: Shift+drag, then ctrl+shift+c"
+        );
+        let unknown = way(false, false, false).status(5);
+        assert!(
+            unknown.starts_with("Sent 5 characters") && unknown.contains("Shift+drag"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn written_text_reaches_the_command_and_a_stuck_command_is_cut_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("out");
+        // Env is process-wide: this is the only test that sets the seam.
+        // SAFETY: no other test reads or writes this variable.
+        unsafe { std::env::set_var("PCTL_CLIP_WRITE_TEXT", format!("cat > {}", out.display())) };
+        let big = "한글 line\n".repeat(10_000);
+        write_text(&big).expect("written");
+        assert_eq!(std::fs::read_to_string(&out).expect("read"), big);
+        unsafe { std::env::set_var("PCTL_CLIP_WRITE_TEXT", "exit 3") };
+        assert!(write_text("x").is_err(), "a failing command is an error");
+        unsafe { std::env::set_var("PCTL_CLIP_WRITE_TEXT", "sleep 30") };
+        let started = Instant::now();
+        assert!(write_text(&big).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cut off at the deadline"
+        );
+        unsafe { std::env::remove_var("PCTL_CLIP_WRITE_TEXT") };
     }
 
     #[test]
