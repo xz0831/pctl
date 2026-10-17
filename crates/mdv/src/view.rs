@@ -514,14 +514,24 @@ impl App {
         self.layout.rows.len().saturating_sub(self.height())
     }
     fn rewrap(&mut self) {
-        let anchor_row = (self.state.top..self.layout.rows.len())
-            .find(|&i| !self.layout.rows[i].discussion)
-            .unwrap_or(self.state.top);
-        let anchor = self.layout.anchor(anchor_row);
+        let row = self.layout.rows.get(self.state.top).cloned();
+        let anchor = self.layout.anchor(self.state.top);
         self.layout = Layout::new(&self.doc, &self.src, self.width(), &self.style);
         self.insert_threads();
-        if let Some(p) = anchor {
-            self.state.top = self.layout.row_for(p).min(self.max_top());
+        if let Some(row) = row {
+            let exact = self.layout.rows.iter().position(|r| {
+                if row.discussion {
+                    r.thread == row.thread
+                } else {
+                    !r.discussion
+                        && r.line.block_id == row.line.block_id
+                        && r.range == row.range
+                        && r.line.plain == row.line.plain
+                }
+            });
+            if let Some(top) = exact.or_else(|| anchor.map(|p| self.layout.row_for(p))) {
+                self.state.top = top.min(self.max_top());
+            }
         }
     }
     fn insert_threads(&mut self) {
@@ -529,14 +539,19 @@ impl App {
         let original = std::mem::take(&mut self.layout.rows);
         let append = |rows: &mut Vec<mdv::reader::Row>,
                       e: &mdv::threads::Event,
+                      event: usize,
                       block_id: usize,
                       changed: bool| {
-            for mut line in mdv::threads::lines(e, changed, self.width(), &self.style) {
+            for (offset, mut line) in mdv::threads::lines(e, changed, self.width(), &self.style)
+                .into_iter()
+                .enumerate()
+            {
                 line.block_id = block_id;
                 rows.push(mdv::reader::Row {
                     line,
                     range: 0..0,
                     discussion: true,
+                    thread: Some((event, offset)),
                 });
             }
         };
@@ -548,20 +563,21 @@ impl App {
             {
                 continue;
             }
-            for e in self.threads.iter().filter(|e| {
+            for (event, e) in self.threads.iter().enumerate().filter(|(_, e)| {
                 e.path == self.path.to_string_lossy()
                     && mdv::threads::target(e, &self.doc) == Some(row.line.block_id)
             }) {
-                append(&mut rows, e, row.line.block_id, false);
+                append(&mut rows, e, event, row.line.block_id, false);
             }
         }
         // Detached history survives even if the entire current document is empty.
-        for e in self.threads.iter().filter(|e| {
+        for (event, e) in self.threads.iter().enumerate().filter(|(_, e)| {
             e.path == self.path.to_string_lossy() && mdv::threads::target(e, &self.doc).is_none()
         }) {
             append(
                 &mut rows,
                 e,
+                event,
                 self.doc.blocks.last().map_or(0, |b| b.id),
                 true,
             );
@@ -2219,7 +2235,7 @@ mod tests {
     }
     #[test]
     fn discussion_rows_never_enter_source_copy() {
-        let mut app = fixture("# Target\n\nbody");
+        let mut app = fixture(&format!("# Target\n\n{}", "body\n\n".repeat(40)));
         app.threads.push(mdv::threads::Event {
             kind: "answer".into(),
             req_id: "fixture".into(),
@@ -2244,6 +2260,22 @@ mod tests {
         assert!(app.layout.point(row, 0).is_none());
         assert!(!app.layout.texts[0].contains("reply only"));
         assert!(app.layout.rows[row].line.plain.contains("Answer ready"));
+        let mut answer = app.threads[0].clone();
+        answer.text = "second answer".into();
+        app.threads.push(answer.clone());
+        app.rewrap();
+        app.state.top = app
+            .layout
+            .rows
+            .iter()
+            .position(|r| r.line.plain.contains("second answer"))
+            .unwrap();
+        let top = app.state.top;
+        answer.text = "third answer".into();
+        app.threads.push(answer);
+        app.rewrap();
+        assert_eq!(app.state.top, top);
+        assert!(app.layout.rows[top].line.plain.contains("second answer"));
     }
     #[test]
     fn search_does_not_fire_commands_and_side_changes_keep_selection() {

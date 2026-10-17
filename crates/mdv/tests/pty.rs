@@ -711,3 +711,78 @@ fn search_cursor_follows_hangul() {
     p.send(ESC);
     p.quit();
 }
+
+fn answer_keeps_top(mode: &str) {
+    let source: String = (0..65)
+        .map(|i| format!("Paragraph {i:03} stays in place.\n\n"))
+        .collect();
+    let f = Fixture::new("anchor.md", &source);
+    let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
+    p.wait_for("T -> Tree");
+    if mode == "bottom" {
+        for _ in 0..6 {
+            p.send(b"\x1b[Z");
+        }
+    } else {
+        p.send(TAB);
+    }
+    p.compose(true, "anchor question");
+    p.wait_for("Not confirmed");
+    let ask = f.events().into_iter().find(|e| e["kind"] == "ask").unwrap();
+    match mode {
+        "bottom" => {
+            p.send(b"G");
+            p.wait_for("100%");
+        }
+        "discussion" => {
+            for _ in 0..10 {
+                if p.screen().lines().nth(1).unwrap_or("").contains("ask:") {
+                    break;
+                }
+                let before = p.screen();
+                p.send(DOWN);
+                p.wait(|s| s != before);
+            }
+            assert!(
+                p.screen().lines().nth(1).unwrap().contains("ask:"),
+                "{}",
+                p.screen()
+            );
+        }
+        "elsewhere" => {}
+        _ => unreachable!(),
+    }
+    let unchanged = if mode == "discussion" { 2 } else { 3 };
+    let before: Vec<_> = p
+        .screen()
+        .lines()
+        .skip(1)
+        .take(unchanged)
+        .map(String::from)
+        .collect();
+    f.answer(ask["req_id"].as_str().unwrap(), "anchor reply");
+    p.wait_for("Answer ready: anchor reply");
+    let after: Vec<_> = p
+        .screen()
+        .lines()
+        .skip(1)
+        .take(unchanged)
+        .map(String::from)
+        .collect();
+    assert_eq!(before, after, "answer moved the top rows ({mode})");
+
+    p.quit();
+}
+
+#[test]
+fn answer_at_bottom_keeps_top_row() {
+    answer_keeps_top("bottom");
+}
+#[test]
+fn answer_on_discussion_keeps_top_row() {
+    answer_keeps_top("discussion");
+}
+#[test]
+fn answer_elsewhere_keeps_top_row() {
+    answer_keeps_top("elsewhere");
+}

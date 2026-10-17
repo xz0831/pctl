@@ -168,6 +168,7 @@ pub struct Row {
     pub line: Line,
     pub range: Range<usize>,
     pub discussion: bool,
+    pub thread: Option<(usize, usize)>,
 }
 pub struct Layout {
     pub rows: Vec<Row>,
@@ -216,6 +217,7 @@ impl Layout {
                     line,
                     range: start..end,
                     discussion: false,
+                    thread: None,
                 }
             })
             .collect();
