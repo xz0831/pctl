@@ -207,10 +207,7 @@ try:
         click(*side('r-wheel', 'rproj')); assert until(lambda: 'POS=0' in screen()), screen()
         x, y = find('POS=')
         before = reqlog.read_text().count('"keys"')
-        # In bursts of 50 (about 600 bytes): crossterm 0.29 on Linux drops what follows its first 1024-byte read, so one write of 1200 bytes
-        # arrives as 85 ticks. A terminal sends wheel events as they happen, not as one block.
-        for _ in range(2):
-            vt('send-keys', '-t', 'view', '-l', f'\x1b[<64;{x};{y + 2}M' * 50); time.sleep(0.1)
+        vt('send-keys', '-t', 'view', '-l', f'\x1b[<64;{x};{y + 2}M' * 100)  # one 1200-byte write; the reader must not leave a tail waiting for more input
         assert until(lambda: 'POS=100' in screen()), screen()
         sent = reqlog.read_text().count('"keys"') - before
         assert 1 <= sent <= 5, f'100 wheel ticks took {sent} keys requests'
