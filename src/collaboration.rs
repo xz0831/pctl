@@ -363,6 +363,7 @@ impl Core {
             sender_trust:
                 "caller_claimed; run generation validated, sender process not authenticated".into(),
         };
+        self.refresh_event_locked(r, &q.to_agent, &q.to_run, "queue")?;
         store.messages.push(message.clone());
         ensure_mailbox_capacity(&store)?;
         atomic_json(&self.mailbox_path(&from.project_id), &store).context("mailbox persistence failed; outcome_unknown: retain request UUID and inspect receipt before retrying")?;

@@ -695,6 +695,15 @@ fn local(core: &Core, to: &str, name: &str, line: &str, req: &Request) -> Outcom
     }
     match before.as_str() {
         "blocked" => {
+            if let Err(e) =
+                core.refresh_queue_event(name, view["run_id"].as_str().unwrap_or_default())
+            {
+                return Outcome::because(
+                    Verdict::NotSent,
+                    to,
+                    format!("cannot record tell activity: {e:#}"),
+                );
+            }
             return match crate::tellq::push(
                 &core.state,
                 name,

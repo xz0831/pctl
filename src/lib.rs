@@ -20,6 +20,7 @@ pub mod human;
 pub mod machine;
 pub mod notify;
 pub mod orchestration;
+pub mod refresh;
 pub mod session;
 pub mod tell;
 pub mod tellq;
@@ -779,6 +780,7 @@ impl Core {
             "synchronize-panes",
             "off",
         ])?;
+        self.refresh_event_locked(r, &run.agent_id, &run.id, "launch")?;
         self.audit("start", &run.id, "registered; releasing launch gate")?;
         fs::write(&gate, b"ready\n")?;
         fs::remove_file(intent)?;
@@ -1051,6 +1053,7 @@ impl Core {
     }
     fn terminate_locked(&self, r: &mut Registry, agent: &str, expected: &str) -> Result<()> {
         let p = self.guard(r, agent, expected, false)?;
+        self.refresh_event_locked(r, agent, expected, "lifecycle")?;
         self.retire_old_panel()?;
         self.tm(&["kill-pane", "-t", &p.pane])?;
         ensure!(
@@ -1078,6 +1081,7 @@ impl Core {
         required_build: Option<&build::Build>,
     ) -> Result<Run> {
         let p = self.guard(r, agent, expected, false)?;
+        self.refresh_event_locked(r, agent, expected, "lifecycle")?;
         let old = r
             .runs
             .iter()
@@ -1175,6 +1179,7 @@ impl Core {
             !pane.synchronized,
             "synchronize-panes is enabled; input rejected"
         );
+        self.refresh_event_locked(r, agent, expected, "input")?;
         match self.tm(&["send-keys", "-t", &pane.pane, "C-c"]) {
             Ok(_) => self
                 .audit(
@@ -1227,6 +1232,7 @@ impl Core {
             !pane.synchronized,
             "synchronize-panes is enabled; input rejected"
         );
+        self.refresh_event_locked(&r, agent, expected, "input")?;
         match self.tm(&["send-keys", "-t", &pane.pane, "Enter"]) {
             Ok(_) => self
                 .audit(
@@ -1269,6 +1275,7 @@ impl Core {
         if bracketed {
             paste.push("-p");
         }
+        self.refresh_event_locked(r, agent, expected, "input")?;
         match self.tm(&paste) {
             Ok(_) => self
                 .audit(action, expected, "input_delivered; acceptance unverified")

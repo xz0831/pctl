@@ -192,8 +192,29 @@ impl Core {
             "protected": a.protected, "swap_blockers": blockers})
     }
     pub(crate) fn set_app_viewed(&self, runs: &[String]) -> Result<()> {
+        let _lock = self.lock()?;
+        let r = self.registry()?;
         let dir = self.state.join("viewers");
         let pid = std::process::id().to_string();
+        let old: serde_json::Value = fs::read(dir.join(format!("{pid}.json")))
+            .ok()
+            .and_then(|s| serde_json::from_slice(&s).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let old_runs: Vec<String> = old["runs"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if old_runs != runs {
+            for run in &r.runs {
+                if old_runs.contains(&run.id) || runs.contains(&run.id) {
+                    self.refresh_event_locked(&r, &run.agent_id, &run.id, "visibility")?;
+                }
+            }
+        }
         if runs.is_empty() {
             let path = dir.join(format!("{pid}.json"));
             if path.exists() {
