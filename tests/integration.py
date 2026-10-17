@@ -30,6 +30,7 @@ def start_agent(project,name='generic',argv=None,adapter='generic',cwd=None):
  r=cli('agent','start','--agent',a['id']);return a,r
 try:
  demo=cli('demo'); ps=demo['projects']; rs=demo['runs']; ag=[r['agent_id'] for r in rs]
+ assert set(tm('list-panes','-a','-F','#{pane_id}').splitlines())=={r['pane'] for r in rs}, 'demo has only its four agent panes'
  def four():
   s=cli('agent','list');assert s['connected'];assert len(s['agents'])==4;assert all(a['process']=='running' for a in s['agents'])
   for r in rs:
@@ -105,6 +106,17 @@ try:
   e=cli('agent','start','--agent',a['id'],ok=False);assert 'unresolved launch intent' in e['error']
   assert not (root/'MUST_NOT_RUN').exists()
  case('partial tmux launch failure remains gated and refuses duplicate retry',failed_launch)
+ def failed_first_launch():
+  project=cli('project','add','--name','first-fault','--root',root)
+  a=cli('agent','add','--project',project['id'],'--name','first-gated','--cwd',root,'--','/bin/sh','-c',f'touch {root}/FIRST_MUST_NOT_RUN; sleep 60')
+  wrapper=root/'first-fault-tmux'
+  wrapper.write_text('#!/usr/bin/python3\nimport os,subprocess,sys\n'+f'T={T!r}\n'+
+   'if "new-session" in sys.argv[1:]:\n subprocess.run([T,*sys.argv[1:]],stdout=subprocess.DEVNULL)\n raise SystemExit(66)\nos.execv(T,[T,*sys.argv[1:]])\n');wrapper.chmod(0o700)
+  q=subprocess.run([B,'--state',str(state),'--tmux',str(wrapper),'agent','start','--agent',a['id']],capture_output=True,text=True,timeout=10)
+  assert q.returncode and (state/f"pending-{a['id']}.json").exists(),q
+  assert not (root/'FIRST_MUST_NOT_RUN').exists()
+  assert 'unresolved launch intent' in cli('agent','start','--agent',a['id'],ok=False)['error']
+ case('partial first-session launch failure stays gated and refuses retry',failed_first_launch)
  def replace_server():
   tm('kill-server');time.sleep(.1);s=cli('agent','list');assert not s['connected'];assert all(a['process']=='unknown' for a in s['agents'] if a['run']);tm('new-session','-d','-s','foreign','exec /bin/sleep 60');s=cli('agent','list');assert not s['connected'];r=rs[1];assert 'server identity changed' in send(r['agent_id'],r['id'],'echo wrong-server',ok=False)['error'];assert 'wrong-server' not in tm('capture-pane','-p','-t','foreign')
  case('disconnection differs from missing and server replacement is locked',replace_server)

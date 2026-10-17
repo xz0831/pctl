@@ -3,11 +3,7 @@ pub mod custom;
 
 use crate::{Core, atomic_json};
 use anyhow::{Result, ensure};
-use ratatui::{
-    style::{Color, Modifier, Style},
-    text::Line,
-    widgets::{Block, BorderType, Borders},
-};
+use ratatui::style::{Color, Style};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -59,10 +55,6 @@ impl ThemeName {
         Self::ALL
             .into_iter()
             .find(|t| t.label().eq_ignore_ascii_case(name))
-    }
-    pub fn next(self) -> Self {
-        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
-        Self::ALL[(i + 1) % Self::ALL.len()]
     }
     pub fn palette(self) -> Palette {
         match self {
@@ -300,35 +292,6 @@ impl Palette {
     pub fn body(self) -> Style {
         Style::default().fg(self.text).bg(self.panel)
     }
-    pub fn muted(self) -> Style {
-        self.body().fg(self.muted)
-    }
-    pub fn accent(self) -> Style {
-        self.body().fg(self.accent).add_modifier(Modifier::BOLD)
-    }
-    pub fn selected(self) -> Style {
-        if self.name == ThemeName::Mono {
-            self.body()
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else if self.name == ThemeName::Classic {
-            // Some 16-color terminals brighten bold black into unreadable gray.
-            Style::default().fg(self.ink).bg(self.accent)
-        } else {
-            Style::default()
-                .fg(self.ink)
-                .bg(self.accent)
-                .add_modifier(Modifier::BOLD)
-        }
-    }
-    pub fn block<'a>(self, title: impl Into<Line<'a>>) -> Block<'a> {
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .style(self.body())
-            .border_style(self.body().fg(self.border))
-            .title_style(self.accent())
-            .title(title)
-    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -368,34 +331,13 @@ impl Core {
             Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
             _ => "default".to_string(),
         };
-        let named = |v: [&str; 6]| v.map(String::from);
-        let [bg, text, muted, accent, ink, alert] = match theme {
-            ThemeName::Classic => named(["black", "white", "colour7", "cyan", "black", "red"]),
-            ThemeName::Mono => named(["default"; 6]),
-            _ => [p.bg, p.text, p.muted, p.accent, p.ink, p.danger].map(hex),
+        let named = |v: [&str; 5]| v.map(String::from);
+        let [bg, text, muted, accent, ink] = match theme {
+            ThemeName::Classic => named(["black", "white", "colour7", "cyan", "black"]),
+            ThemeName::Mono => named(["default"; 5]),
+            _ => [p.bg, p.text, p.muted, p.accent, p.ink].map(hex),
         };
-        // Tabs show the agent's name and a state mark written by `session marks` (! blocked,
-        // * working, x exited); the status line reruns it every 5 s while a client is attached.
-        let name =
-            "#{?#{==:#{window_name},manager},CONTROL,#{?#{@pctl_tab},#{@pctl_tab},#{window_name}}}";
-        let mark = |base: &str| {
-            format!(
-                "#{{?#{{==:#{{@pctl_status}},blocked}},#[fg={alert}]!#[fg={base}] ,#{{?#{{==:#{{@pctl_status}},working}},* ,#{{?#{{==:#{{@pctl_status}},exited}},x ,}}}}}}"
-            )
-        };
-        let marks_job = [
-            std::env::current_exe()?.to_string_lossy().to_string(),
-            "--state".into(),
-            self.state.to_string_lossy().to_string(),
-            "--tmux".into(),
-            self.tmux.to_string_lossy().to_string(),
-            "session".into(),
-            "marks".into(),
-        ]
-        .iter()
-        .map(|a| crate::shell_quote(a))
-        .collect::<Vec<_>>()
-        .join(" ");
+        let name = "#{?#{@pctl_tab},#{@pctl_tab},#{window_name}}";
         let selected = if theme == ThemeName::Mono {
             "reverse,bold".to_string()
         } else if theme == ThemeName::Classic {
@@ -412,17 +354,14 @@ impl Core {
             ("status-left-length", "40".into()),
             (
                 "status-right",
-                format!("#[fg={muted}] #({marks_job}) │ ^b s tree  m manager  q detach "),
+                format!("#[fg={muted}] ^b s tree  q detach "),
             ),
             ("status-right-length", "80".into()),
             ("status-interval", "5".into()),
-            (
-                "window-status-format",
-                format!("#[fg={muted}] #I:{}{name} ", mark(&muted)),
-            ),
+            ("window-status-format", format!("#[fg={muted}] #I:{name} ")),
             (
                 "window-status-current-format",
-                format!("#[fg={accent},bold] ▸ #I:{}{name} ", mark(&accent)),
+                format!("#[fg={accent},bold] ▸ #I:{name} "),
             ),
             ("pane-border-style", format!("fg={muted}")),
             ("pane-active-border-style", format!("fg={accent}")),
@@ -432,7 +371,7 @@ impl Core {
         }
         // Workspace keys: ^b s shows projects and agents by name, ^b q detaches.
         let tree = format!(
-            "#{{?window_format,{name} #{{@pctl_status}},#{{?session_format,#{{?#{{@pctl_name}},#{{@pctl_name}},#{{session_name}}}},#{{pane_current_command}}}}}}"
+            "#{{?window_format,{name},#{{?session_format,#{{?#{{@pctl_name}},#{{@pctl_name}},#{{session_name}}}},#{{pane_current_command}}}}}}"
         );
         self.tm(&["bind-key", "s", "choose-tree", "-Zw", "-F", &tree])?;
         self.tm(&["bind-key", "q", "detach-client"])?;

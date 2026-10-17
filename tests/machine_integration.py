@@ -76,7 +76,9 @@ class Bridge:
 
 try:
     # Four synthetic workers on the "remote" computer's own state and tmux server.
-    subprocess.run([B, '--state', str(state2), '--tmux', T, 'demo'], text=True, capture_output=True, timeout=30, env=env, check=True)
+    demo = json.loads(subprocess.run([B, '--state', str(state2), '--tmux', T, 'demo'], text=True, capture_output=True, timeout=30, env=env, check=True).stdout)
+    panes = subprocess.run([T, '-S', str(state2 / 'tmux.sock'), 'list-panes', '-a', '-F', '#{pane_id}'], text=True, capture_output=True, check=True).stdout.splitlines()
+    assert set(panes) == {r['pane'] for r in demo['runs']}, 'remote fixture has no control-panel panes'
 
     def silent_bridge_is_refused():
         marker.write_text('silent')

@@ -72,8 +72,21 @@ pid=$(p project list | sed -n 's/^    "id": "\(.*\)",$/\1/p' | head -1)
 "$T" -S "$root/outer.sock" new-session -d -x 120 -y 40 \
   "env -u TMUX PCTL_STANDALONE=1 '$B' --state '$S' --tmux '$T' attach --project $pid"
 waitfor '[ -n "$("$T" -S "$S/tmux.sock" list-clients 2>/dev/null)" ]' || fail "attach: no client"
+active=$("$T" -S "$S/tmux.sock" list-clients -F '#{pane_id}')
+[ "$active" = "$(field alpha pane)" ] || [ "$active" = "$(field beta pane)" ] || fail "attach landed on an unregistered pane: $active"
+[ "$("$T" -S "$S/tmux.sock" list-panes -a -F '#{pane_id}' | wc -l | tr -d ' ')" = 2 ] || fail "unexpected control-panel/placeholder pane"
+"$T" -S "$root/outer.sock" send-keys -t 0 'raw-smoke' Enter
+waitfor 'p session read alpha --lines 10 | grep -q "got: raw-smoke" || p session read beta --lines 10 | grep -q "got: raw-smoke"' || fail "raw attach typing"
 "$T" -S "$root/outer.sock" kill-server
-pass "attach opens a terminal client on the project session"
+pass "attach lands on an agent pane; raw typing reaches it; no manager exists"
+"$T" -S "$root/outer.sock" new-session -d -x 120 -y 40 \
+  "env -u TMUX -u NO_COLOR '$B' --state '$S' --tmux '$T'; echo APP-LEFT; sleep 60"
+waitfor '"$T" -S "$root/outer.sock" capture-pane -p -t 0 | grep -q "+ agent"' || fail "app did not open"
+"$T" -S "$root/outer.sock" send-keys -t 0 C-b q
+waitfor '"$T" -S "$root/outer.sock" capture-pane -p -t 0 | grep -q APP-LEFT' || fail "app Leave"
+[ "$(field alpha process)" = running ] && [ "$(field beta process)" = running ] || fail "Leave stopped an agent"
+"$T" -S "$root/outer.sock" kill-server
+pass "pctl alone opens the app; Leave exits and both agents survive"
 
 as alpha peers | grep -q '"role": "beta"' || fail "peers"
 sent=$(as alpha send beta --key k1 --text "please review" 2>&1)

@@ -17,13 +17,20 @@ use crate::{
     Core,
     bridge::{self, KINDS, Screen},
     theme::{Palette, ThemeName},
-    ui::TerminalGuard,
 };
 use anyhow::Result;
 use bridge::CLIP_PIECE;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
+};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
+use crossterm::{
+    cursor::Show,
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use keys::{ACTIONS, Action, Keymap};
 use layout::{Dir, Divider, Side, Tree};
@@ -44,6 +51,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use std::{panic, sync::Arc};
 
 /// A drag longer than this is refused: an OSC 52 sequence this size is more than a terminal reads.
 const MAX_COPY: usize = 100_000;
@@ -77,6 +85,59 @@ fn clip_ops(agent: &str, run: &str, png: &[u8]) -> VecDeque<Value> {
 const TYPED_MAX: usize = 2048;
 /// A paste to another computer travels in one bridge line of at most 1 MiB, escapes included.
 const REMOTE_PASTE_MAX: usize = 400_000;
+type PanicHook = dyn Fn(&panic::PanicHookInfo<'_>) + Send + Sync + 'static;
+
+pub(crate) struct TerminalGuard {
+    previous_hook: Option<Arc<PanicHook>>,
+}
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    );
+}
+
+impl TerminalGuard {
+    pub(crate) fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        if let Err(error) = execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ) {
+            restore_terminal();
+            return Err(error.into());
+        }
+        let previous_hook: Arc<PanicHook> = Arc::from(panic::take_hook());
+        let on_panic = Arc::clone(&previous_hook);
+        panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            on_panic(info);
+        }));
+        Ok(Self {
+            previous_hook: Some(previous_hook),
+        })
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+        // set_hook panics if called from an unwinding thread.
+        if !std::thread::panicking()
+            && let Some(previous) = self.previous_hook.take()
+        {
+            panic::set_hook(Box::new(move |info| previous(info)));
+        }
+    }
+}
+
 /// While an answer from another computer is on its way, look for it this often.
 const SOON: Duration = Duration::from_millis(10);
 
@@ -462,6 +523,7 @@ pub fn run(core: &Core) -> Result<()> {
         !agent_caller(core),
         "agent_caller: the app is for a person at a terminal. An agent of this server (PCTL_AGENT_ID, PCTL_RUN_ID, or a pane of its tmux) could answer another agent's question with a keystroke; use `pctl session` and `msg`"
     );
+    core.retire_old_panel()?;
     let (keys, warnings) = Keymap::load();
     let mut app = App::new(core.theme()?, keys);
     match crate::machine::load() {

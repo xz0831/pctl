@@ -33,7 +33,7 @@ Unsupported: automatic PTY/prompt delivery, remote computer routes, A2A, externa
 
 # Appearance additions in 0.5
 
-Global `--theme portal|classic|mono` saves and applies a preset to this state directory. `theme [NAME]` changes or inspects it and returns JSON with `theme` and `config`. These commands do not start or send input to agents. The running pctl UIs refresh on the normal observation cadence. `t` cycles presets and `?` opens help in the manager. See docs/0.5-portal-appearance.md for persistence, compatibility, and exact mouse geometry.
+Global `--theme portal|classic|mono` saves and applies a preset to this state directory. `theme [NAME]` changes or inspects it and returns JSON with `theme` and `config`. These commands do not start or send input to agents. The running pctl UIs refresh on the normal observation cadence. The app’s Theme button chooses presets and `? Help` opens its shortcuts.
 
 # 0.6 bounded native agent orchestration
 
@@ -104,7 +104,7 @@ A pair operation can use another owned child (`--with c2`) or the explicit `self
 "$PCTL_BIN" --state "$PCTL_STATE" --tmux "$PCTL_TMUX" team stop c1
 ```
 
-Stopping a child is different from closing the manager UI (`q`), closing the sidebar, or detaching a client (`Ctrl-b d`), which leave worker processes running. External/daemonized descendants can survive a pane stop. There is deliberately no ambiguous `team close` action.
+Stopping a child is different from leaving the app, closing an app cell, or detaching a client (`Ctrl-b d`), which leave worker processes running. External/daemonized descendants can survive a pane stop. There is deliberately no ambiguous `team close` action.
 
 `team stage` accepts at most 8192 bytes and uses the existing run-bound local draft store. It never transmits, sends Enter, or schedules a later commit. Generic terminal paste and Enter remain separate operator-native interfaces with their original input-mode and authorization requirements. The team facade has neither action, and has no approval shortcut.
 
@@ -166,7 +166,7 @@ pctl --state STATE --tmux TMUX client detach --client OPAQUE_TOKEN
 pctl --state STATE --tmux TMUX attach --project PROJECT
 ```
 
-`layout split` separates an already joined pane into its own window; it does not create a second agent. `pair` uses two distinct same-project agents. `focus` supports one attached interactive client. `attach` is an interactive terminal command, so its normal output is tmux rather than JSON; `ui` is also interactive. `worker` is a test fixture rather than a JSON command.
+`layout split` separates an already joined pane into its own window; it does not create a second agent. `pair` uses two distinct same-project agents. `focus` supports one attached interactive client. `attach` is an interactive terminal command, so its normal output is tmux rather than JSON. `worker` is a test fixture rather than a JSON command.
 
 ## Explicit input
 
@@ -259,30 +259,6 @@ Additional runtime errors: `cross_project`, `idempotency_conflict`, and `mailbox
 Audit refinements: serialized mailbox storage is also capped at 16 MiB, reserving space for future receipt timestamps so valid heavily escaped bodies cannot make the store unreadable. Capacity can be reached before 1024 messages. The installer rejects control characters in runtime paths and encodes path display fields. Static symlinks are refused; concurrent ancestor replacement by the same Unix user remains unsupported. Identical send retries still require the original live run pair; after exit/restart they return a stale/unavailable-target error rather than recovering an old receipt. Retain the original request ID and use preserved history/operator review; never retarget or generate a new ID to hide uncertain delivery.
 
 
-## Optional compact native sidebar (0.4)
-
-```sh
-pctl --state STATE --tmux TMUX sidebar open --agent A --expected-run RA --width 28
-pctl --state STATE --tmux TMUX sidebar inspect
-pctl --state STATE --tmux TMUX agent focus --agent B --expected-run RB
-pctl --state STATE --tmux TMUX sidebar manager --project PROJECT
-pctl --state STATE --tmux TMUX sidebar close --id SIDEBAR_UUID
-```
-
-Open is explicit and requires a registered exact agent/run. Width is 20–40 columns (default28); the native window must initially have at least width+41 columns and10 rows. One sidebar pane/process is registered per private server. Repeated open reuses its generation and process. Only the sidebar is moved with full-height native tmux join-pane; native agent panes, PIDs, windows, sessions and run IDs remain unchanged by navigation. Ordinary agent focus follows the optional sidebar. The lifecycle guards are unchanged, with an additional agent recheck after the optional layout operation.
-
-Compact UI: click an agent or press Enter to focus its native pane; arrows/j/k/wheel select rows. A project row focuses its first registered run when one exists, otherwise opens its verified full manager. `m` or the footer opens the live full manager for registration/editing/input/lifecycle confirmations. `q`, Ctrl-C, or the close footer restores terminal modes and invokes one short-lived exact-ID close command. Native input belongs to whichever native pane has focus; the sidebar does not forward keystrokes or paste. It ignores lifecycle, prompt, approval and bracketed-paste shortcuts. Mouse events are scoped to the sidebar's native pane.
-
-The sidebar UI only offers navigation and status. It labels process state, unacknowledged mail counts and selected-agent self-reports separately. Opening a native pane is not proof of task completion. The full manager remains the place for consequential controls and confirmations. A live full manager must match the expected executable and exact ui/state/project argv; an unrelated window merely named manager is rejected. This route does not create or respawn a manager; use explicit attach to restore an exited full manager.
-
-This first pass follows pctl navigation only. Raw tmux window cycling may leave the sidebar behind, and native zoom hides it until unzoom. No tmux hooks, terminal re-rendering, global shell integration or per-agent sidebar process is installed. The sidebar adds one bounded background observer, normally two tmux read queries per refresh, at a one-second interval; explicit focus remains synchronous. Initial observation can still block up to existing command deadlines. A slow refresh is labeled stale after1.5 seconds.
-
-Inspect returns `{sidebar,pending,guard_error,scope}`. Sidebar metadata includes schema_version, id, server_instance, pane, pid, process_start, width, host_project_id, host_agent_id, host_run_id and started_at. Close requires that exact sidebar generation. It validates native metadata/PID start and removes only its pane. If the original server identity is verified and the exact sidebar pane is definitively absent, close clears that stale registration without touching any other pane. A changed/reused pane or replacement server stays locked. `stale_sidebar` identifies a wrong generation.
-
-Creation has a persisted launch intent and gate. Inspect exposes pending state. An exact known gated launcher can be closed before metadata installation completes; successful close clears only its matching intent. An ambiguous launch with no recoverable pane identity remains blocked for explicit operator review. It is never automatically adopted or duplicated. Close-helper errors, if any, are in the private state directory's sidebar-close.log. A failed/OSC-closed sidebar may leave a dead pane until explicitly closed; agent runs remain alive.
-
-Synchronization must be off in both source and destination windows. Opening/following refuses synchronized windows. Manually enabling tmux synchronize-panes afterward is unsupported: tmux could broadcast physical keys before the sidebar application can filter them. Do not enable it around a sidebar. This limitation is not fixed by application-level guards. The feature retains the same single-interactive-client pilot and same-Unix-user/non-authentication boundaries as the core.
-
 
 ## Explicit unique-reply receipt convenience (0.4)
 
@@ -365,12 +341,11 @@ Other behaviour:
 - Leaving the app stops nothing.
 - The app never starts a server. Adding a session goes through `session add`, which keeps its own server-start rule.
 
-`pctl attach --project <name|id>` attaches a plain tmux client at that project's manager window. Without `--project` it attaches at the most recently used project and window: it never starts a server, switches the client inside the same PCTL server, and refuses inside another tmux.
+`pctl attach [--project <name|id>]` is advanced raw tmux access to a verified registered agent pane. It keeps the active eligible agent window, falling back to the first eligible agent window. Without a project it chooses the most recently used eligible project. It never starts a server, creates a placeholder or opens a control panel. Empty projects refuse with guidance to open the app and start an agent. Inside the same server it switches the client; inside another tmux it refuses nesting.
 
-tmux display for plain clients:
-- Agent windows carry `@pctl_tab` and `@pctl_status`. Project sessions carry `@pctl_name`.
-- The status line reruns the hidden `pctl session marks` every 5 seconds while a client is attached.
-- `^b s` is a names-and-state `choose-tree`, and `^b q` detaches.
+Raw clients keep static project/agent labels, the built-in theme, `ctrl+b s` (tree) and `ctrl+b q` (detach). There is no background `session marks` job or native manager shortcut. The app’s separate `ctrl+b m` menu and built-in sidebar remain.
+
+New sessions start with their first gated agent window; the owned server stays alive when its last session is removed. Upgrading never kills existing manager/sidebar panes, rewrites registries or restarts agents. On a verified owned server, app/start/attach retire only the exact old manager binding and generated status jobs for that state. Custom bindings/jobs remain. Legacy windows, sidebar metadata and inert decorations may remain until the server is next restarted or a person closes them. Native unpair excludes a legacy navigation pane only when its saved generation, server, pane tags and live process identity all match; unknown panes are ordinary panes. A replaced server is never adopted. `pctl demo` remains a synthetic-worker fixture usable from the app.
 
 ## Codex conversation recovery
 

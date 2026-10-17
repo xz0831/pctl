@@ -26,7 +26,7 @@ The real-tmux suites start their own servers in temporary state directories. Eac
 ```sh
 B=target/release/pctl T=$(command -v tmux); mkdir -p test-results
 for s in integration collaboration_integration msg_workflow_integration orchestration_integration \
-         session_integration sidebar_integration sidebar_recovery snapshot_batch_integration \
+         session_integration snapshot_batch_integration \
          team_context_preflight tmux_encoding_integration wake_integration web_integration worktree_integration human_entry app_integration; do
   python3 tests/$s.py --bin $B --tmux $T --report test-results/$s.json >test-results/$s.out 2>&1; echo "$s exit $?"
 done
@@ -112,7 +112,7 @@ Make your own: `pctl theme --new mine --from garage` writes `~/.config/pctl/them
 
 A little dry humour shows up where nothing is at stake: loading, empty screens, tips, goodbye. It never appears in errors or anything agents read. `[ui]` with `wit = false` in the config file turns it off.
 
-`pctl` reopens on the project and tab you left. It never starts a server by itself; adding the first agent follows the same rule as `session add` (see [Starting the server](#starting-the-server)). tmux still keeps the processes behind the app. `pctl attach [--project <name>]` opens a plain tmux client instead.
+`pctl` reopens on the project and tab you left. It never starts a server by itself; adding the first agent follows the same rule as `session add` (see [Starting the server](#starting-the-server)). tmux still keeps the processes behind the app. `pctl attach [--project <name>]` is an advanced raw tmux client that lands on a verified agent window. It never opens another control panel; an empty project has nothing to attach to. `pctl demo` still creates four synthetic workers, which you can view in the app.
 
 ## Starting the server
 
