@@ -337,9 +337,10 @@ Mouse (SGR mouse reporting):
 Shortcuts:
 - Defaults are a prefix (`ctrl+b`) and a key: `c` new bash tab, `a` new agent, `shift+c` new project, `n`/`p` tabs, `1`–`9` tab N, `x` stop, `r` restart, `b` sidebar, `w` keyboard sidebar, `?` help, `q` leave. Prefix twice sends the prefix to the session.
 - Override them in `$XDG_CONFIG_HOME/pctl/config.toml` or `~/.config/pctl/config.toml`, under `[keys]`, with `name = "key"`.
-  - Names: `prefix`, `new_tab`, `new_agent`, `new_project`, `next_tab`, `prev_tab`, `stop_agent`, `restart_agent`, `toggle_sidebar`, `focus_sidebar`, `help`, `detach`.
+  - Names: `prefix`, `new_tab`, `new_agent`, `new_project`, `next_tab`, `prev_tab`, `stop_agent`, `restart_agent`, `toggle_sidebar`, `focus_sidebar`, `help`, `detach`, `image_paste`.
   - Keys look like `ctrl+b`, `alt+right`, `shift+c`, `f2` or `?`; a `prefix+` in front means after the prefix.
-- Unknown names and bad keys are reported in the status line, and the default is kept.
+- Unknown names and bad keys are reported in the status line, and the default is kept. An empty value (`image_paste = ""`) turns a shortcut off.
+- `image_paste` (default `ctrl+v`): with an agent of another computer on screen, an image on this computer's clipboard is sent to that computer's clipboard (PNG, at most 20 MB), then `ctrl+v` goes to the agent, so Claude Code there pastes it. With no image, or for an agent on this computer, it is an ordinary `ctrl+v`. Text needs no key: pasting (`⌘V`) already reaches agents on other computers. It reads the clipboard with `osascript` (macOS), `wl-paste` or `xclip`; the other computer sets it with the same tools.
 
 Themes:
 - Built-in: `portal`, `garage`, `nebula`, `void`, `lab`, `classic`, `mono`. `pctl theme <name>` sets one per state (`appearance.json`); the app's `◐ Theme` button and `ctrl+b t` do the same.

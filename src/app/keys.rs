@@ -6,6 +6,7 @@
 //! prefix = "ctrl+b"
 //! next_tab = "prefix+n"    # after the prefix
 //! prev_tab = "alt+left"    # or a direct key, no prefix
+//! image_paste = ""         # an empty value turns a shortcut off
 //! ```
 //!
 //! shortcut: only `[keys]` with `name = "key"` lines is read (no full TOML parser); a real
@@ -28,10 +29,11 @@ pub enum Action {
     Theme,
     Help,
     Detach,
+    ImagePaste,
 }
 
 /// Name in the config file, default key, and what the help screen says.
-pub const ACTIONS: [(&str, &str, Action, &str); 13] = [
+pub const ACTIONS: [(&str, &str, Action, &str); 14] = [
     (
         "new_tab",
         "prefix+c",
@@ -89,6 +91,12 @@ pub const ACTIONS: [(&str, &str, Action, &str); 13] = [
         "prefix+q",
         Action::Detach,
         "Leave; agents keep running",
+    ),
+    (
+        "image_paste",
+        "ctrl+v",
+        Action::ImagePaste,
+        "Paste an image copied here into an agent on another computer",
     ),
 ];
 
@@ -223,6 +231,7 @@ impl Keymap {
         }
         let binds = ACTIONS
             .iter()
+            .filter(|(name, ..)| lookup(name).is_none_or(|v| !v.is_empty()))
             .map(|(name, default, action, _)| {
                 let chosen = lookup(name).and_then(|v| match parse_key(&v) {
                     Some(k) => Some(k),
@@ -372,6 +381,18 @@ mod tests {
             "{warn:?}"
         );
         assert_eq!(m.label(Action::NextTab), "alt+right");
+        assert_eq!(
+            d.action(false, &ev(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            Some(Action::ImagePaste)
+        );
+        let (off, warn) = Keymap::from_pairs(&[("image_paste".into(), "".into())]);
+        assert!(warn.is_empty(), "{warn:?}");
+        assert_eq!(
+            off.action(false, &ev(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            None,
+            "an empty value turns it off"
+        );
+        assert_eq!(off.label(Action::ImagePaste), "");
         assert_eq!(d.label(Action::NewProject), "ctrl+b shift+c");
     }
 }

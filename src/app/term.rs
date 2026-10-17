@@ -268,11 +268,74 @@ pub fn base64(data: &[u8]) -> String {
     out
 }
 
+/// The reverse of `base64`: strict RFC 4648 (padded, no whitespace, no other characters), or None.
+pub fn unbase64(text: &str) -> Option<Vec<u8>> {
+    let b = text.as_bytes();
+    if !b.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(b.len() / 4 * 3);
+    for (i, quad) in b.chunks(4).enumerate() {
+        // Only the last group may be padded, with at most two `=`.
+        let pad = if (i + 1) * 4 == b.len() {
+            quad.iter().rev().take_while(|c| **c == b'=').count()
+        } else {
+            0
+        };
+        if pad > 2 {
+            return None;
+        }
+        let mut n = 0u32;
+        for c in &quad[..4 - pad] {
+            let sextet = match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => return None,
+            };
+            n = n << 6 | u32::from(sextet);
+        }
+        n <<= 6 * pad;
+        out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn row(s: &str) -> Row {
         vec![(s.to_string(), Style::default())]
+    }
+    #[test]
+    fn unbase64_reads_the_rfc4648_vectors_and_what_base64_writes() {
+        for (plain, coded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(unbase64(coded), Some(plain.as_bytes().to_vec()), "{coded}");
+        }
+        let all: Vec<u8> = (0..=255).collect();
+        for len in 0..=all.len() {
+            assert_eq!(
+                unbase64(&base64(&all[..len])),
+                Some(all[..len].to_vec()),
+                "{len}"
+            );
+        }
+        for bad in [
+            "Zg=", "Zg", "Z===", "====", "Zg==Zg==", "Zm9v\n", "Zm 9", "Zm9-", "Zm9_", "Zm9é",
+            "Zg=a",
+        ] {
+            assert_eq!(unbase64(bad), None, "{bad:?}");
+        }
     }
     #[test]
     fn base64_matches_rfc4648_vectors() {

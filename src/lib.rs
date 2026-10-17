@@ -12,6 +12,7 @@ use std::{
 use uuid::Uuid;
 pub mod app;
 pub mod bridge;
+pub mod clipboard;
 pub mod collaboration;
 pub mod human;
 pub mod machine;
