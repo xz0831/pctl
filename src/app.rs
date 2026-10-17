@@ -162,6 +162,10 @@ struct View {
     asked: (u16, u16),
     scroll: usize,
     history: usize,
+    /// The program in the pane is full-screen; `mouse`/`sgr`: it reads the mouse (SGR encoding).
+    alt: bool,
+    mouse: bool,
+    sgr: bool,
     next: Option<Instant>,
     /// The last screen read; an equal one needs no parsing and no redraw.
     last: Option<Screen>,
@@ -301,6 +305,21 @@ fn write_out(sequence: &str) {
     let mut out = io::stdout();
     let _ = out.write_all(sequence.as_bytes());
     let _ = out.flush();
+}
+
+/// What one wheel notch at pane cell (`col`, `row`) types into a full-screen program: an SGR mouse
+/// wheel event where it reads the mouse that way, three arrow keys where it does not read the mouse.
+/// shortcut: the legacy X10 mouse encoding gets nothing (it needs raw bytes over 127); every agent
+/// seen so far asks for SGR.
+fn wheel_input(up: bool, col: u16, row: u16, mouse: bool, sgr: bool) -> Vec<(bool, String)> {
+    match (mouse, sgr) {
+        (true, true) => {
+            let button = if up { 64 } else { 65 };
+            vec![(true, format!("\x1b[<{button};{};{}M", col + 1, row + 1))]
+        }
+        (true, false) => vec![],
+        (false, _) => vec![(false, if up { "Up" } else { "Down" }.to_string()); 3],
+    }
 }
 
 /// The view cell a mouse position points at: `skip` is how many of the pane's own rows the view
@@ -976,6 +995,7 @@ impl App {
         self.view.cursor = s.cursor;
         self.view.size = s.size;
         self.view.history = s.history;
+        (self.view.alt, self.view.mouse, self.view.sgr) = (s.alt, s.mouse, s.sgr);
         self.view.scroll = self.view.scroll.min(s.history);
         self.view.rows = term::parse_capture(&s.text);
         self.view.last = Some(s);
@@ -1001,6 +1021,10 @@ impl App {
         let Some((lit, key)) = term::key_args(k) else {
             return;
         };
+        self.queue(core, a, lit, key);
+    }
+    /// Queue input for the agent shown; the main loop sends the queue after each batch of events.
+    fn queue(&mut self, core: &Core, a: Agent, lit: bool, key: String) {
         if let Some(why) = self.refused(&a.machine) {
             return self.say(format!("{why}; not typing"));
         }
@@ -1381,6 +1405,20 @@ impl App {
             MouseEventKind::Up(_) => {
                 self.drag = false;
                 self.copy_selection();
+            }
+            // A full-screen program (most agents) has no tmux history to scroll: the wheel is its
+            // own, as a mouse event where it reads the mouse, else as arrow keys like a terminal.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                if matches!(hit, Some(Hit::Terminal)) && self.view.alt && self.view.scroll == 0 =>
+            {
+                self.sel = None;
+                if let Some(a) = self.current().filter(|a| a.running()).cloned() {
+                    let (row, col) = self.cell_at(m.column, m.row);
+                    let up = m.kind == MouseEventKind::ScrollUp;
+                    for (lit, key) in wheel_input(up, col, row, self.view.mouse, self.view.sgr) {
+                        self.queue(core, a.clone(), lit, key);
+                    }
+                }
             }
             MouseEventKind::ScrollUp if matches!(hit, Some(Hit::Terminal)) => {
                 self.sel = None;
@@ -3002,6 +3040,26 @@ mod tests {
             "\x1b]777;notify;pctl;abc: needs you\x07\x07"
         );
         assert_eq!(sanitize("x;y\x0bz\tc"), "xyzc");
+    }
+    #[test]
+    fn the_wheel_goes_to_a_full_screen_program_as_its_own_input() {
+        assert_eq!(
+            wheel_input(true, 4, 9, true, true),
+            vec![(true, "\x1b[<64;5;10M".to_string())]
+        );
+        assert_eq!(
+            wheel_input(false, 0, 0, true, true),
+            vec![(true, "\x1b[<65;1;1M".to_string())]
+        );
+        assert_eq!(
+            wheel_input(true, 4, 9, false, false),
+            vec![(false, "Up".to_string()); 3]
+        );
+        assert_eq!(
+            wheel_input(false, 4, 9, false, true),
+            vec![(false, "Down".to_string()); 3]
+        );
+        assert!(wheel_input(true, 4, 9, true, false).is_empty());
     }
     #[test]
     fn a_mouse_cell_maps_through_the_pane_offset_and_the_scroll() {

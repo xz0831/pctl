@@ -24,7 +24,7 @@ const MAX_LINE: usize = 1 << 20;
 /// The hello must arrive this quickly, and one answer within `ANSWER`.
 const HELLO_WITHIN: Duration = Duration::from_secs(10);
 const ANSWER_WITHIN: Duration = Duration::from_secs(5);
-const CURSOR_FORMAT: &str = "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_width} #{pane_height} #{history_size} #{@pctl_run}";
+const CURSOR_FORMAT: &str = "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_width} #{pane_height} #{history_size} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{@pctl_run}";
 
 /// `pctl bridge` (hidden): answer requests on stdin with one JSON object per line on stdout, until
 /// stdin closes. The hello goes out first, unasked, so a client knows who answered.
@@ -126,6 +126,7 @@ fn screen(
     Ok(json!({
         "rows": s.text, "history": s.history,
         "cursor": s.cursor.map(|(x, y)| json!([x, y])), "size": [s.size.0, s.size.1],
+        "alt": s.alt, "mouse": s.mouse, "sgr": s.sgr,
     }))
 }
 
@@ -188,13 +189,17 @@ pub fn resize(core: &Core, pane: &str, w: u16, h: u16) -> Result<()> {
 }
 
 /// A pane's screen as the viewer needs it: the raw text, the cursor when it is visible, the pane
-/// size and the history size.
+/// size and the history size, and whether the program there is full-screen (`alt`) and reads the
+/// mouse (`mouse`, `sgr` for the SGR encoding): then the wheel belongs to it, not to tmux history.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Screen {
     pub text: String,
     pub cursor: Option<(u16, u16)>,
     pub size: (u16, u16),
     pub history: usize,
+    pub alt: bool,
+    pub mouse: bool,
+    pub sgr: bool,
 }
 
 impl Screen {
@@ -210,6 +215,9 @@ impl Screen {
             cursor: pair("cursor"),
             size: pair("size").unwrap_or_default(),
             history: v["history"].as_u64().unwrap_or(0) as usize,
+            alt: v["alt"].as_bool().unwrap_or(false),
+            mouse: v["mouse"].as_bool().unwrap_or(false),
+            sgr: v["sgr"].as_bool().unwrap_or(false),
         }
     }
 }
@@ -238,10 +246,10 @@ pub fn read_screen(
         Err(e) => return Err(e),
     };
     let (body, last) = out.rsplit_once('\n').unwrap_or(("", out.as_str()));
-    let mut fields = last.splitn(7, ' ');
+    let mut fields = last.splitn(10, ' ');
     let m: Vec<u64> = fields
         .by_ref()
-        .take(6)
+        .take(9)
         .filter_map(|v| v.parse().ok())
         .collect();
     if fields.next() != Some(run) {
@@ -251,10 +259,11 @@ pub fn read_screen(
         text: body.to_string(),
         ..Screen::default()
     };
-    if m.len() == 6 {
+    if m.len() == 9 {
         screen.cursor = (m[2] == 1).then_some((m[0] as u16, m[1] as u16));
         screen.size = (m[3] as u16, m[4] as u16);
         screen.history = m[5] as usize;
+        (screen.alt, screen.mouse, screen.sgr) = (m[6] == 1, m[7] == 1, m[8] == 1);
     }
     Ok(Some(screen))
 }
@@ -1303,10 +1312,13 @@ mod tests {
             cursor: Some((3, 1)),
             size: (80, 24),
             history: 7,
+            alt: true,
+            mouse: true,
+            sgr: true,
         };
         let answer = json!({
             "rows": s.text, "history": s.history,
-            "cursor": [3, 1], "size": [80, 24],
+            "cursor": [3, 1], "size": [80, 24], "alt": true, "mouse": true, "sgr": true,
         });
         assert_eq!(Screen::from_answer(&answer), s);
         let hidden = json!({"rows": "", "history": 0, "cursor": null, "size": [1, 1]});

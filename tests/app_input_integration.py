@@ -25,6 +25,19 @@ try:
     assert q.returncode == 0, q.stderr
     run = json.loads(subprocess.run([B, '--state', str(state), '--tmux', T, 'session', 'get', 'r-main'], text=True, capture_output=True, env=ENV).stdout)
     pane, run_id = run['pane'], run['run_id']
+    # Full-screen programs like today's agents: one reads the mouse (SGR), one does not.
+    for name, mouse in (('r-mouse', '\x1b[?1000h\x1b[?1006h'), ('r-keys', '')):
+        prog = root / f'{name}.py'
+        prog.write_text(f"""import os, sys, tty
+sys.stdout.write('\\x1b[?1049h{mouse}READY-{name}\\r\\n'); sys.stdout.flush(); tty.setraw(0)
+f = open({str(root / name)!r}, 'ab', buffering=0)
+while True:
+    b = os.read(0, 1024)
+    if not b: break
+    f.write(b)
+""")
+        q = subprocess.run([B, '--state', str(state), '--tmux', T, 'session', 'add', '--name', name, '--cwd', d, '--project', 'alpha', '--', 'python3', prog], text=True, capture_output=True, env=ENV, timeout=60)
+        assert q.returncode == 0, q.stderr
     subprocess.run([T, '-S', str(V), '-f', '/dev/null', 'new-session', '-d', '-x', '110', '-y', '26', '-s', 'view', f"env -u TMUX {B} --state {state} --tmux {T}; sleep 600"], env=ENV, check=True, timeout=10)
     assert until(lambda: '+ agent' in vt('capture-pane', '-p', '-t', 'view')), vt('capture-pane', '-p', '-t', 'view')
     time.sleep(1)
@@ -51,6 +64,28 @@ try:
         vt('send-keys', '-t', 'view', '-l', 'back')
         assert until(lambda: typed() == before + 'back'), repr(typed()[len(before):])
     case('a pane whose run changed gets no typing and no paste, the person is told, and it works again once the run matches', changed)
+    def got(name): return (root / name).read_bytes() if (root / name).exists() else b''
+    def open_agent(name):
+        rows = vt('capture-pane', '-p', '-t', 'view').split('\n')
+        y = next(i for i, l in enumerate(rows) if name in l[:26]); x = rows[y].index(name)
+        vt('send-keys', '-t', 'view', '-l', f'\x1b[<0;{x + 1};{y + 1}M\x1b[<0;{x + 1};{y + 1}m')
+        assert until(lambda: f'READY-{name}' in vt('capture-pane', '-p', '-t', 'view') or name == 'r-main'), vt('capture-pane', '-p', '-t', 'view')
+    def wheel(up=True): vt('send-keys', '-t', 'view', '-l', f'\x1b[<{64 if up else 65};70;12M')
+    def wheel_to_mouse():
+        assert until(lambda: 'r-mouse' in vt('capture-pane', '-p', '-t', 'view')), 'the list shows the new agents'
+        open_agent('r-mouse'); time.sleep(0.5); wheel(); wheel(False)
+        assert until(lambda: got('r-mouse').count(b'M') >= 2), got('r-mouse')
+        b = got('r-mouse'); assert b.startswith(b'\x1b[<64;') and b'\x1b[<65;' in b, b
+    case('the wheel over a full-screen program that reads the mouse reaches it as SGR wheel events', wheel_to_mouse)
+    def wheel_to_keys():
+        open_agent('r-keys'); time.sleep(0.5); wheel()
+        assert until(lambda: len(got('r-keys')) >= 9), got('r-keys')
+        assert got('r-keys') in (b'\x1b[A' * 3, b'\x1bOA' * 3), got('r-keys')
+    case('the wheel over a full-screen program without the mouse reaches it as three arrow keys', wheel_to_keys)
+    def wheel_scrolls_history():
+        open_agent('r-main'); time.sleep(0.5); before = typed(); wheel(); wheel(False); time.sleep(1)
+        assert typed() == before, 'the wheel over an ordinary screen scrolls tmux history and types nothing'
+    case('the wheel over an ordinary screen still scrolls history and types nothing', wheel_scrolls_history)
     json.dump(results, open(a.report, 'w'), indent=2)
 finally:
     vt('kill-server'); st('kill-server'); shutil.rmtree(root, ignore_errors=True)
