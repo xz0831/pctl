@@ -37,6 +37,9 @@ pub struct Config {
     pub door_services: Vec<String>,
     /// Stripped from the start of any other `XPC_SERVICE_NAME`; the sender is `job:<rest>`.
     pub job_prefix: String,
+    /// launchd job labels (macOS) of this computer's front door: a caller with no other marker
+    /// whose parent processes include that job's process is the front door (its code tool).
+    pub door_parents: Vec<String>,
     /// How an A2A agent not waited on is told to answer; default "reply with tell".
     pub reply_hint: Option<String>,
     pub a2a: BTreeMap<String, A2a>,
@@ -88,6 +91,14 @@ impl Config {
                 })
                 .unwrap_or_default(),
             job_prefix: get("job_prefix").unwrap_or_default(),
+            door_parents: get("door_parents")
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
             reply_hint: get("reply_hint"),
             a2a,
         }
@@ -130,6 +141,8 @@ pub fn route(to: &str, cfg: &Config, host: &str) -> Route {
 /// What the environment says about the caller.
 pub struct Caller<'a> {
     pub env: &'a dyn Fn(&str) -> Option<String>,
+    /// Whether one of these launchd jobs is among the caller's parent processes.
+    pub under: &'a dyn Fn(&[String]) -> bool,
     pub host: String,
     pub cwd: String,
     pub home: String,
@@ -137,11 +150,8 @@ pub struct Caller<'a> {
 
 /// Who is sending, first match wins. `whoami` is the name of the caller's own session;
 /// `by_conversation` finds the session that holds a Codex conversation.
-///
-/// shortcut: the old script also walked the parent processes to spot a front door's code tool,
-/// which has no marker in its environment. Here that case reads `ssh` or `?` unless the front
-/// door's service name is listed in `door_services`; a list of parent process names would be
-/// the replacement if it turns out to matter.
+/// A front door's code tool has no marker in its environment: `door_parents` finds it by its
+/// parent processes.
 pub fn sender(
     c: &Caller,
     cfg: &Config,
@@ -170,10 +180,54 @@ pub fn sender(
         };
         return format!("job:{rest}");
     }
+    if !cfg.door_parents.is_empty() && (c.under)(&cfg.door_parents) {
+        return c.host.clone();
+    }
     if var("SSH_CONNECTION").is_some() {
         return "ssh".into();
     }
     "?".into()
+}
+
+/// Whether the process of one of these launchd jobs is a parent (at any depth) of this process.
+/// Not on macOS, or with no such job running, it is false.
+pub fn under_launchd_jobs(labels: &[String]) -> bool {
+    let out = |cmd: &str, args: &[&str]| {
+        std::process::Command::new(cmd)
+            .args(args)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    let Some(uid) = out("id", &["-u"]).map(|u| u.trim().to_string()) else {
+        return false;
+    };
+    let jobs: Vec<u32> = labels
+        .iter()
+        .filter_map(|l| out("launchctl", &["print", &format!("gui/{uid}/{l}")]))
+        .filter_map(|t| {
+            t.lines()
+                .find_map(|l| l.trim().strip_prefix("pid = ")?.trim().parse().ok())
+        })
+        .collect();
+    if jobs.is_empty() {
+        return false;
+    }
+    let mut pid = std::os::unix::process::parent_id();
+    for _ in 0..64 {
+        if jobs.contains(&pid) {
+            return true;
+        }
+        match out("ps", &["-o", "ppid=", "-p", &pid.to_string()])
+            .and_then(|p| p.trim().parse().ok())
+        {
+            Some(parent) if parent > 1 && parent != pid => pid = parent,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// `$PWD` with `$HOME` written `~`.
@@ -531,6 +585,7 @@ pub fn run(core: &Core, req: &Request) -> Outcome {
             let env = |k: &str| std::env::var(k).ok();
             let caller = Caller {
                 env: &env,
+                under: &under_launchd_jobs,
                 host: host.clone(),
                 cwd: short_cwd(&working_dir(), &home),
                 home: home.clone(),
@@ -965,6 +1020,7 @@ mod tests {
         let env = env_of(env);
         let c = Caller {
             env: &env,
+            under: &|_| false,
             host: "alpha".into(),
             cwd: "/w".into(),
             home: "/h".into(),
@@ -972,6 +1028,37 @@ mod tests {
         sender(&c, &cfg(), &|| names.map(String::from), &|_| {
             conv.map(String::from)
         })
+    }
+    #[test]
+    fn a_caller_under_a_front_door_job_is_the_host() {
+        let cfg =
+            Config::from_text("[tell]\nhost = \"alpha\"\ndoor_parents = \"door.job, other\"\n");
+        assert_eq!(cfg.door_parents, ["door.job", "other"]);
+        let env = env_of(&[("SSH_CONNECTION", "x")]);
+        let mk = |under: &dyn Fn(&[String]) -> bool| {
+            let c = Caller {
+                env: &env,
+                under,
+                host: "alpha".into(),
+                cwd: "/w".into(),
+                home: "/h".into(),
+            };
+            sender(&c, &cfg, &|| None, &|_| None)
+        };
+        assert_eq!(
+            mk(&|labels| labels.iter().any(|l| l == "door.job")),
+            "alpha"
+        );
+        assert_eq!(mk(&|_| false), "ssh", "not under the job: the usual rules");
+        let none = Config::from_text("[tell]\nhost = \"alpha\"\n");
+        let c = Caller {
+            env: &env,
+            under: &|_| panic!("no door_parents: never asked"),
+            host: "alpha".into(),
+            cwd: "/w".into(),
+            home: "/h".into(),
+        };
+        assert_eq!(sender(&c, &none, &|| None, &|_| None), "ssh");
     }
 
     #[test]
