@@ -30,7 +30,8 @@ const ENTER: &[u8] = b"\r";
 const ESC: &[u8] = b"\x1b";
 const DOWN: &[u8] = b"\x1b[B";
 const CTRL_C: &[u8] = b"\x03";
-const TIMEOUT: Duration = Duration::from_secs(4);
+const TIMEOUT: Duration = Duration::from_secs(15);
+static PTY_TEST: Mutex<()> = Mutex::new(());
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct Fixture {
@@ -272,14 +273,25 @@ impl Pty {
         let mut s = self.shared.0.lock().unwrap();
         loop {
             let screen = s.parser.screen().contents();
-            if predicate(&screen) {
-                return;
-            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !remaining.is_zero(),
                 "screen condition timed out:\n{screen}"
             );
+            if predicate(&screen) {
+                let length = s.raw.len();
+                let (next, _) = self
+                    .shared
+                    .1
+                    .wait_timeout(s, remaining.min(Duration::from_millis(20)))
+                    .unwrap();
+                s = next;
+                // A PTY read can end halfway through a frame; inspect the completed output.
+                if s.raw.len() == length {
+                    return;
+                }
+                continue;
+            }
             s = self
                 .shared
                 .1
@@ -312,7 +324,11 @@ impl Pty {
             if let Some(status) = self.child.try_wait().unwrap() {
                 return status;
             }
-            assert!(Instant::now() < deadline, "child did not exit");
+            assert!(
+                Instant::now() < deadline,
+                "child did not exit:\n{}",
+                self.screen()
+            );
             thread::park_timeout(Duration::from_millis(5));
         }
     }
@@ -347,7 +363,11 @@ impl Pty {
             {
                 return;
             }
-            assert!(Instant::now() < deadline, "OSC colors were not reset");
+            assert!(
+                Instant::now() < deadline,
+                "OSC colors were not reset:\n{}",
+                s.parser.screen().contents()
+            );
             drop(s);
             thread::park_timeout(Duration::from_millis(5));
         }
@@ -393,6 +413,7 @@ fn top_line(screen: &str) -> String {
 
 #[test]
 fn reader_navigation_resize_and_terminal_restoration() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let f = Fixture::gallery("long.md");
     let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
     p.wait_for("T -> Tree");
@@ -443,6 +464,7 @@ fn reader_navigation_resize_and_terminal_restoration() {
 
 #[test]
 fn folder_hostile_log_and_file_shortcut() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     for name in ["code.md", "hostile.log"] {
         let f = Fixture::gallery(name);
         let mut p = Pty::new(&f, &[f.doc.to_str().unwrap()], "dry.json");
@@ -465,6 +487,7 @@ fn folder_hostile_log_and_file_shortcut() {
 
 #[test]
 fn composer_comment_and_live_answer() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let f = Fixture::gallery("headings.md");
     let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
     p.wait_for("T -> Tree");
@@ -497,6 +520,7 @@ fn composer_comment_and_live_answer() {
 
 #[test]
 fn original_quote_survives_edit_in_all_looks() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let source = "# 합성 검토 문서\n\n이 구현은 메모리 사용량이 줄어들기 때문에 유리하다.\n\n다음 문단은 별도 주장입니다.\n";
     let f = Fixture::new("claim.md", source);
     let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
@@ -573,6 +597,7 @@ fn original_quote_survives_edit_in_all_looks() {
 
 #[test]
 fn explicit_project_routes_a_document_outside_projects() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let mut f = Fixture::new("outside.md", "# Outside document\n");
     let outside = f.root.join("outside.md");
     fs::rename(&f.doc, &outside).unwrap();
@@ -618,10 +643,8 @@ fn explicit_project_routes_a_document_outside_projects() {
 
 #[test]
 fn saved_question_keeps_its_project_on_retry() {
-    let f = Fixture::new(
-        "retry.md", "# Retry
-",
-    );
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("retry.md", "# Retry\n");
     fs::write(f.root.join("sessions"), "[]").unwrap();
     let mut p = Pty::new(
         &f,
@@ -664,7 +687,7 @@ fn assert_input_cursor(p: &Pty, text: &str) {
     let row = rows - 1;
     let mut line = String::new();
     for col in 0..cols {
-        line.push_str(&screen.cell(row, col).unwrap().contents());
+        line.push_str(screen.cell(row, col).unwrap().contents());
         if line.ends_with(text) {
             // The final Hangul syllable occupies this cell and the next one.
             assert_eq!(screen.cursor_position(), (row, col + 2));
@@ -676,6 +699,7 @@ fn assert_input_cursor(p: &Pty, text: &str) {
 
 #[test]
 fn question_and_comment_cursor_follows_hangul() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     for ask in [true, false] {
         let f = Fixture::new("input.md", "# Input\n");
         let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
@@ -701,6 +725,7 @@ fn question_and_comment_cursor_follows_hangul() {
 
 #[test]
 fn search_cursor_follows_hangul() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let f = Fixture::new("search.md", "# Search\n");
     let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
     p.wait_for("T -> Tree");
@@ -714,7 +739,16 @@ fn search_cursor_follows_hangul() {
 
 fn answer_keeps_top(mode: &str) {
     let source: String = (0..65)
-        .map(|i| format!("Paragraph {i:03} stays in place.\n\n"))
+        .map(|i| {
+            format!(
+                "Paragraph {i:03} stays in place.{}\n\n",
+                if i == 64 {
+                    " tail".repeat(14)
+                } else {
+                    String::new()
+                }
+            )
+        })
         .collect();
     let f = Fixture::new("anchor.md", &source);
     let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
@@ -760,6 +794,12 @@ fn answer_keeps_top(mode: &str) {
         .take(unchanged)
         .map(String::from)
         .collect();
+    if mode == "bottom" {
+        assert!(
+            before[0].trim().is_empty(),
+            "bottom fixture starts on a blank document row: {before:?}"
+        );
+    }
     f.answer(ask["req_id"].as_str().unwrap(), "anchor reply");
     p.wait_for("Answer ready: anchor reply");
     let after: Vec<_> = p
@@ -776,19 +816,23 @@ fn answer_keeps_top(mode: &str) {
 
 #[test]
 fn answer_at_bottom_keeps_top_row() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     answer_keeps_top("bottom");
 }
 #[test]
 fn answer_on_discussion_keeps_top_row() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     answer_keeps_top("discussion");
 }
 #[test]
 fn answer_elsewhere_keeps_top_row() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     answer_keeps_top("elsewhere");
 }
 
 #[test]
 fn block_menu_clears_its_box() {
+    let _serial = PTY_TEST.lock().unwrap_or_else(|e| e.into_inner());
     let source = format!("# Menu\n\n{}\n", "Z".repeat(2000));
     let f = Fixture::new("menu.md", &source);
     let mut p = Pty::new(&f, &["view", f.doc.to_str().unwrap()], "dry.json");
@@ -813,7 +857,7 @@ fn block_menu_clears_its_box() {
     for y in 1..=9 {
         let mut row = String::new();
         for x in 0..=right {
-            row.push_str(&screen.cell(y, x).unwrap().contents());
+            row.push_str(screen.cell(y, x).unwrap().contents());
         }
         if y == 1 {
             assert_eq!(row, format!("┌{}┐", "─".repeat(right as usize - 1)));
