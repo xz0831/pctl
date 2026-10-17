@@ -217,7 +217,8 @@ impl Core {
             .read(true)
             .write(true)
             .open(self.state.join("registry.lock"))?;
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // A Claude restart holds the lock ~2 s while the old process exits.
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match f.try_lock_exclusive() {
                 Ok(()) => return Ok(f),
@@ -1097,7 +1098,8 @@ impl Core {
             !self.panes()?.iter().any(|v| v.pane == p.pane),
             "restart outcome_unknown; no new run created"
         );
-        let deadline = Instant::now() + Duration::from_millis(500);
+        // Claude Code takes ~1.7 s to exit after SIGHUP; 0.5 s left every real Claude restart lost.
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !process_ended(&old)? {
             ensure!(
                 Instant::now() < deadline,
@@ -2051,7 +2053,7 @@ mod tests {
         let held = c.lock().unwrap();
         let begin = Instant::now();
         assert!(c.lock().unwrap_err().to_string().contains("lock timeout"));
-        assert!(begin.elapsed() < Duration::from_secs(4));
+        assert!(begin.elapsed() < Duration::from_secs(8));
         drop(held);
         assert!(c.lock().is_ok());
     }
