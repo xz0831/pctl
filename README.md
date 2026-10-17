@@ -138,18 +138,18 @@ Variables with the same prefix (`TERMAPP_` here) are not copied into agent panes
 
 `pctl tell <to> <text>` sends a message to another agent: a session here, `<machine>:<name>` on another computer, an A2A agent listed in `config.toml`, or `codex:<prefix>`. It puts a `[from <me> <host> <cwd>]` line in front, says whether the text `reached` the session, was `queued` behind its work or was `typed_unconfirmed`, and refuses a session that waits for a human decision (exit 6). See CLI.md.
 
-## Lite package
+## Package for offline install
 
-`scripts/package-lite.sh [target]` builds `dist/pctl-lite-<version>-<target>.zip` for offline install. The ZIP contains:
+`scripts/package.sh [target]` builds `dist/pctl-<version>-<target>.zip` for offline install. The ZIP contains:
 - a static binary
 - `install.sh` (copies the binary, no network)
-- `QUICKSTART.md` and `pctl.env.example`
-- `smoke.sh` (the same file as `scripts/lite-smoke.sh`)
+- `QUICKSTART.md` (the install guide) and `pctl.env.example`
+- `smoke.sh` (the same file as `scripts/smoke.sh`)
 - licenses, `BUILDINFO.txt` and `SHA256SUMS`
 
-The default target is `x86_64-unknown-linux-musl`. It links with the toolchain's `rust-lld` and needs `rustup target add x86_64-unknown-linux-musl`.
+The default target is `x86_64-unknown-linux-musl`. It links with the toolchain's `rust-lld` and needs `rustup target add x86_64-unknown-linux-musl`. For a Mac, run the script on that Mac with its own target, for example `scripts/package.sh aarch64-apple-darwin`.
 
-`scripts/lite-smoke.sh target/release/pctl` runs the offline smoke test: two fake agents, session control, messages, duplicate and blocked refusals, and restart.
+`scripts/smoke.sh target/release/pctl` runs the offline smoke test: two fake agents, session control, messages, duplicate and blocked refusals, and restart.
 
 ## Workflow
 

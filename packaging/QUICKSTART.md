@@ -1,9 +1,10 @@
-# pctl lite: quick start
+# pctl: install and quick start
 
-pctl runs interactive coding agents (any terminal CLI) in tmux panes, addressed by name, and lets them send each other messages. It works on one computer and needs no network.
+pctl runs interactive coding agents (any terminal CLI) in tmux panes, addressed by name, and lets them send each other messages. It works on one computer and needs no network, so this guide installs it from the ZIP on a machine that is offline.
 
 ## Requirements
-- Linux x86_64. The binary is statically linked, so it needs no glibc or other libraries.
+- **Linux:** x86_64 or aarch64, using the ZIP whose name ends in that target. The binary is statically linked, so it needs no glibc or other libraries.
+- **macOS:** a ZIP built on a Mac for that Mac's own target (`scripts/package.sh aarch64-apple-darwin` on Apple silicon).
 - tmux 3.8 or newer, on PATH or set with `PCTL_TMUX`
 - bash, only for `smoke.sh`
 
@@ -18,6 +19,7 @@ pctl runs interactive coding agents (any terminal CLI) in tmux panes, addressed 
    - It checks `SHA256SUMS` and copies `bin/pctl` to `~/.local/bin`.
    - To install somewhere else, give the directory: `sh install.sh /some/bin`.
    - Copying `bin/pctl` onto your PATH by hand works too.
+   - On macOS, if the system blocks the binary after you copied the ZIP from the web or a mail, run `xattr -d com.apple.quarantine ~/.local/bin/pctl` once.
 3. Add `export PCTL_STANDALONE=1` to your shell profile (see `pctl.env.example`). Without it, pctl refuses to start its tmux server.
 4. Check the install:
    - `pctl doctor`
@@ -93,4 +95,4 @@ pctl knows who is sending from the pane it runs in. Agents in the same project a
 - `pctl web` (an optional page on loopback or a Tailscale address) is not part of this quick start. pctl makes no outgoing network calls.
 - Agents use their own existing install and login. pctl never stores credentials.
 
-`BUILDINFO.txt` says which source commit and target this ZIP was built from. `LICENSE` covers pctl (MIT), and `THIRD_PARTY_NOTICES.txt` lists the bundled Rust crates and musl libc.
+`BUILDINFO.txt` says which source commit and target this ZIP was built from. `LICENSE` covers pctl (MIT), and `THIRD_PARTY_NOTICES.txt` lists the bundled Rust crates and, on Linux, musl libc.
