@@ -55,6 +55,8 @@ while True:
     out.write(f'\\x1b[2J\\x1b[HPOS={pos}\\r\\n'); out.flush()
 ''')
 (bindir / 'wheel').chmod(0o755)
+(bindir / 'tick').write_text('#!/bin/bash\ni=0; while :; do i=$((i+1)); echo "tick $i"; sleep 0.4; done\n'); (bindir / 'tick').chmod(0o755)  # a local cell that changes by itself
+(bindir / 'spin').write_text('#!/bin/bash\nwhile :; do printf "\\rspin $RANDOM   "; sleep 0.02; done\n'); (bindir / 'spin').chmod(0o755)  # a remote cell that pushes ~50 times a second
 for tag in ('L', 'R'):  # a fake agent: says which computer it runs on
     (bindir / f'plain{tag}').write_text(f'#!/bin/bash\necho "ready {tag} in $(basename "$PWD")"\necho "> "\nwhile IFS= read -r line; do echo "got {tag}: $line"; echo "> "; done\n')
     (bindir / f'plain{tag}').chmod(0o755)
@@ -326,6 +328,21 @@ try:
         finally:
             b.stdin.close(); b.wait(timeout=10)
     case('bridge: watch replaces the set, pushes a screen only when it changed, reports a changed run once, and lines never mix', bridge_push)
+    def local_next_to_spinner():
+        add(state, 'l-tick', 'alpha', 'tick'); add(remote, 'r-spin', 'rproj', 'spin')
+        assert until(lambda: 'l-tick' in screen() and 'r-spin' in screen(), 20), screen()
+        click(*side('l-tick', 'alpha')); assert until(lambda: 'tick 1' in screen()), screen()
+        keys('C-b', '%'); time.sleep(0.5)
+        click(*side('r-spin', 'rproj')); assert until(lambda: 'spin' in screen().split('\n')[3] or 'r-spin' in status(), 5), screen()
+        late = []
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            real = max(int(n) for n in re.findall(r'tick (\d+)', cli('session', 'read', 'l-tick', '--lines', '5')))
+            shown = max((int(n) for n in re.findall(r'tick (\d+)', screen())), default=0)
+            late.append(real - shown); time.sleep(0.1)
+        assert sorted(late)[len(late) * 9 // 10] <= 1, f'the local cell is read while the remote one pushes: lag in ticks {late}'
+        keys('C-b', '&')  # close the cell again
+    case('a local cell next to a remote cell that pushes all the time keeps updating', local_next_to_spinner)
     def machine_log():
         log = state / 'app-machines.log'
         assert log.exists() and oct(log.stat().st_mode & 0o777) == '0o600', log

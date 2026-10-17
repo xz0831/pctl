@@ -902,9 +902,15 @@ pub struct Remote {
     events_tx: mpsc::Sender<Value>,
     /// Counts connections: a watch belongs to the one that got it.
     generation: AtomicU64,
+    /// Told whenever a line comes in (`true`: a pushed event, `false`: an answer), so the app can
+    /// sleep until something arrives instead of looking every few ms.
+    waker: Waker,
     /// The current connection. Only `reconnect` swaps it, and the old one goes down first.
     inner: Mutex<Arc<Inner>>,
 }
+
+/// Shared by a `Remote` and every connection it has had.
+pub type Waker = Arc<Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>>;
 
 struct Inner {
     state: Mutex<RemoteState>,
@@ -917,6 +923,7 @@ struct Inner {
     started: Instant,
     /// Where lines with an `ev` and no id go (the `screen` and `changed` events).
     events: Option<mpsc::Sender<Value>>,
+    waker: Waker,
 }
 
 struct Pending {
@@ -941,6 +948,7 @@ impl Remote {
 
     fn connect_with(ssh: &str, bin: &str, target: &str) -> Result<Remote> {
         let (events_tx, events) = mpsc::channel();
+        let waker = Waker::default();
         Ok(Remote {
             target: target.to_string(),
             events: Mutex::new(events),
@@ -949,9 +957,11 @@ impl Remote {
                 bin,
                 target,
                 Some(events_tx.clone()),
+                waker.clone(),
             )?),
             events_tx,
             generation: AtomicU64::new(1),
+            waker,
         })
     }
 
@@ -999,6 +1009,7 @@ impl Remote {
             &env_bin(),
             &self.target,
             Some(self.events_tx.clone()),
+            self.waker.clone(),
         )?);
         Ok(())
     }
@@ -1010,8 +1021,15 @@ impl Remote {
             bin,
             &self.target,
             Some(self.events_tx.clone()),
+            self.waker.clone(),
         )?);
         Ok(())
+    }
+
+    /// Call `f(true)` when an event is pushed and `f(false)` when an answer comes in, from the
+    /// reader thread (keep it short).
+    pub fn set_waker(&self, f: Arc<dyn Fn(bool) + Send + Sync>) {
+        *lock(&self.waker) = Some(f);
     }
 
     /// The events that came in since the last call, oldest first.
@@ -1062,6 +1080,7 @@ impl Inner {
         bin: &str,
         target: &str,
         events: Option<mpsc::Sender<Value>>,
+        waker: Waker,
     ) -> Result<Arc<Inner>> {
         let line = format!("{} bridge", crate::shell_quote(bin));
         let mut child = Command::new(ssh)
@@ -1095,6 +1114,7 @@ impl Inner {
             child: Mutex::new(Some(child)),
             started: Instant::now(),
             events,
+            waker,
         });
         let (tx, rx) = mpsc::channel::<String>();
         *lock(&inner.lines) = Some(tx);
@@ -1156,16 +1176,24 @@ impl Inner {
         let Ok(answer) = serde_json::from_str::<Value>(line) else {
             return;
         };
+        let wake = |pushed: bool| {
+            let f = lock(&self.waker).clone();
+            if let Some(f) = f {
+                f(pushed);
+            }
+        };
         let Some(id) = answer.get("id").and_then(Value::as_u64) else {
             if matches!(answer["ev"].as_str(), Some("screen" | "changed"))
                 && let Some(tx) = &self.events
             {
                 let _ = tx.send(answer);
+                wake(true);
             }
             return;
         };
         if let Some(e) = lock(&self.pending).remove(&id) {
             let _ = e.tx.send(Ok(answer));
+            wake(false);
         }
     }
 
@@ -1279,6 +1307,7 @@ mod tests {
                 child: Mutex::new(None),
                 started,
                 events: None,
+                waker: Waker::default(),
             }),
             rx,
         )
@@ -1502,6 +1531,28 @@ mod tests {
     }
 
     #[test]
+    fn every_line_from_the_bridge_wakes_the_app() {
+        let (tx, _rx) = mpsc::channel();
+        let (mut inner, _sent) = bare();
+        {
+            let i = Arc::get_mut(&mut inner).expect("sole owner");
+            i.events = Some(tx);
+        }
+        let wakes = Arc::new(Mutex::new(vec![]));
+        let seen = wakes.clone();
+        *lock(&inner.waker) = Some(Arc::new(move |pushed| lock(&seen).push(pushed)));
+        let _waiting = inner.request(json!({"op": "list"}), None);
+        inner.route(r#"{"ev":"screen","key":"1","rev":1}"#);
+        inner.route(r#"{"id":1,"ok":true}"#);
+        inner.route(r#"{"id":99,"ok":true}"#);
+        assert_eq!(
+            *lock(&wakes),
+            [true, false],
+            "an answer nobody waits for wakes nothing"
+        );
+    }
+
+    #[test]
     fn pushed_events_go_to_the_event_channel_not_to_requests() {
         let (tx, rx) = mpsc::channel();
         let (mut inner, _sent) = bare();
@@ -1585,6 +1636,7 @@ mod tests {
             events: Mutex::new(events),
             events_tx,
             generation: AtomicU64::new(1),
+            waker: Waker::default(),
         };
         let (next, _next_sent) = bare_in(RemoteState::Connecting, Instant::now());
         let gone = remote.replace(next);

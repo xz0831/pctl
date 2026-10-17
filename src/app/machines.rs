@@ -10,7 +10,7 @@ use std::{
     io::Write,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
@@ -110,6 +110,8 @@ pub struct Mach {
     /// Where connection changes are written, and the last state written.
     log: Option<PathBuf>,
     logged: String,
+    /// Wakes the app's loop when a line comes in from the bridge (`true`: a pushed event).
+    waker: Option<Arc<dyn Fn(bool) + Send + Sync>>,
 }
 
 impl Mach {
@@ -151,7 +153,16 @@ impl Mach {
             push: Push::default(),
             log: None,
             logged: "connecting".into(),
+            waker: None,
         }
+    }
+
+    /// Have `f` called from the reader thread for every line the bridge sends.
+    pub fn set_waker(&mut self, f: Arc<dyn Fn(bool) + Send + Sync>) {
+        if let Some(r) = &self.remote {
+            r.set_waker(f.clone());
+        }
+        self.waker = Some(f);
     }
 
     /// One line in `app-machines.log`: UTC time, the computer, what changed, and why.
@@ -234,6 +245,9 @@ impl Mach {
         self.note("reconnect", "starting a new ssh connection");
         let mut fresh = Self::remote(&self.id, &self.target, self.log.clone().unwrap_or_default());
         fresh.log = self.log.take();
+        if let Some(f) = self.waker.take() {
+            fresh.set_waker(f);
+        }
         fresh.logged = std::mem::take(&mut self.logged);
         fresh.projects = std::mem::take(&mut self.projects);
         fresh.connected = self.connected;
@@ -398,11 +412,6 @@ impl Mach {
                 (ev["rev"].as_u64() == Some(*rev)).then_some((key, ev))
             })
             .collect()
-    }
-
-    /// Whether something is in flight, so the loop should look again soon.
-    pub fn waiting(&self) -> bool {
-        self.list.is_some()
     }
 }
 
