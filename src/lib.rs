@@ -20,6 +20,7 @@ pub mod notify;
 pub mod orchestration;
 pub mod session;
 pub mod sidebar;
+pub mod tell;
 pub mod terminal_input;
 pub mod theme;
 pub mod ui;

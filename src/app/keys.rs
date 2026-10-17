@@ -417,6 +417,24 @@ pub(crate) fn section(text: &str, name: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The names after `prefix` in section headers: `section_names(text, "a.b.")` gives `x` for `[a.b.x]`.
+pub(crate) fn section_names(text: &str, prefix: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.split(" #").next().unwrap_or("").trim();
+        if let Some(name) = line
+            .strip_prefix('[')
+            .and_then(|l| l.strip_suffix(']'))
+            .and_then(|l| l.strip_prefix(prefix))
+            && !name.is_empty()
+            && !out.iter().any(|n| n == name)
+        {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +510,12 @@ mod tests {
         );
         assert_eq!(off.label(Action::ImagePaste), "");
         assert_eq!(d.label(Action::NewProject), "ctrl+b shift+c");
+    }
+    #[test]
+    fn section_names_lists_the_headers_under_a_prefix() {
+        let text = "[tell]\nx = 1\n[tell.a2a.one]\nurl = u\n[tell.a2a.two] # note\n[tell.a2a.]\n[other.a2a.three]\n[tell.a2a.one]\n";
+        assert_eq!(section_names(text, "tell.a2a."), ["one", "two"]);
+        assert!(section_names("", "tell.a2a.").is_empty());
     }
     #[test]
     fn the_cell_commands_have_their_own_keys() {
