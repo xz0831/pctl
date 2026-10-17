@@ -22,6 +22,7 @@ pub mod session;
 pub mod tell;
 pub mod tellq;
 pub mod theme;
+pub mod view;
 pub mod web;
 pub mod worktree;
 

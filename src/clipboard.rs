@@ -168,6 +168,9 @@ fn on_path(name: &str) -> bool {
     })
 }
 
+/// A copy longer than this is refused: an OSC 52 sequence this size is more than a terminal reads.
+pub const MAX_COPY: usize = 100_000;
+
 /// Put `text` on the clipboard of the computer this runs on, waiting at most `TEXT_WITHIN`. Err:
 /// there is no tool (or no display) here, or the tool failed or was too slow.
 pub fn write_text(text: &str) -> Result<()> {

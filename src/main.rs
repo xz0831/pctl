@@ -113,6 +113,16 @@ enum Cmd {
         #[arg(long, hide = true)]
         from_line: Option<String>,
     },
+    /// Read a Markdown file or folder in the terminal: search, copy, and ask the project's main
+    /// agent about a passage. Needs an interactive terminal.
+    View {
+        path: PathBuf,
+        /// portal or garage.
+        #[arg(long, value_parser = ["portal", "garage"])]
+        look: Option<String>,
+        #[arg(long)]
+        dark: bool,
+    },
     Skill {
         #[command(subcommand)]
         cmd: SkillCmd,
@@ -1204,6 +1214,17 @@ fn run() -> Result<()> {
                 std::process::exit(out.result.exit_code());
             }
         }
+        Cmd::View { path, look, dark } => pctl::view::run(
+            &core,
+            &path,
+            mdv::view::ViewOptions {
+                look: look.map(|l| match l.as_str() {
+                    "garage" => mdv::Look::Garage,
+                    _ => mdv::Look::Portal,
+                }),
+                dark,
+            },
+        )?,
         Cmd::Skill { cmd } => match cmd {
             SkillCmd::Install { project } => print(&core.install_skill(&project)?)?,
         },

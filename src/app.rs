@@ -53,8 +53,6 @@ use std::{
 };
 use std::{panic, sync::Arc};
 
-/// A drag longer than this is refused: an OSC 52 sequence this size is more than a terminal reads.
-const MAX_COPY: usize = 100_000;
 /// At most one notification per agent in this long.
 const NOTICE_EVERY: Duration = Duration::from_secs(10);
 /// How often the screen is read: fast while it changes, slower the longer it stays the same.
@@ -952,7 +950,7 @@ impl App {
             return;
         }
         let count = text.chars().count();
-        if text.len() >= MAX_COPY {
+        if text.len() >= clipboard::MAX_COPY {
             self.say(format!("Selection too long to copy ({count} characters)"));
             return;
         }
