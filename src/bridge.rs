@@ -43,16 +43,20 @@ pub fn run(core: &Core) -> Result<()> {
         !crate::app::agent_caller(core),
         "agent_caller: the bridge serves the app of a person on another computer; agents use `pctl session` and `msg`"
     );
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    writeln!(out, "{}", hello())?;
-    out.flush()?;
+    // One locked write per line: a list answers from its own thread, and lines must not interleave.
+    let send = |line: Value| -> std::io::Result<()> {
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{line}")?;
+        out.flush()
+    };
+    send(hello())?;
     let stdin = std::io::stdin();
     let mut input = BufReader::new(stdin.lock());
     // The size this bridge last asked each pane for. Resizing only on a change keeps a second
     // viewer (the app on the other computer) from being resized back and forth.
     let mut asked: HashMap<String, (u16, u16)> = HashMap::new();
     let mut clip = Clip::new(core);
+    let mut lists: Vec<thread::JoinHandle<std::io::Result<()>>> = vec![];
     while let Some((line, over)) = next_line(&mut input)? {
         let (id, result) = if over {
             (None, Err(anyhow!("line over 1 MiB")))
@@ -61,12 +65,23 @@ pub fn run(core: &Core) -> Result<()> {
                 Err(_) => (None, Err(anyhow!("invalid json"))),
                 Ok(req) => match req.get("id").and_then(Value::as_u64) {
                     None => (None, Err(anyhow!("request needs a numeric id"))),
+                    // A list checks every agent's process (~0.1 s with 30 agents); screens and keys
+                    // must not wait behind it. The client keeps one list in flight.
+                    Some(id) if req["op"] == "list" => {
+                        let core = core.clone();
+                        lists.retain(|h| !h.is_finished());
+                        lists.push(thread::spawn(move || send(answer(Some(id), list(&core)))));
+                        continue;
+                    }
                     Some(id) => (Some(id), op(core, &req, &mut asked, &mut clip)),
                 },
             }
         };
-        writeln!(out, "{}", answer(id, result))?;
-        out.flush()?;
+        send(answer(id, result))?;
+    }
+    // A client that closes right after asking still gets its list.
+    for h in lists {
+        let _ = h.join();
     }
     core.set_app_viewed(&[])?;
     Ok(())

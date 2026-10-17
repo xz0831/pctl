@@ -9,6 +9,7 @@ import argparse, json, os, pathlib, pty, select, shutil, subprocess, tempfile, t
 os.environ['PCTL_STANDALONE'] = '1'  # Only disposable test servers start themselves.
 parser = argparse.ArgumentParser(); parser.add_argument('--bin', required=True); parser.add_argument('--tmux', required=True); parser.add_argument('--report', default='test-results/machine_integration.json'); args = parser.parse_args()
 B = str(pathlib.Path(args.bin).resolve()); T = str(pathlib.Path(args.tmux).resolve())
+VERSION = subprocess.run([B, '--version'], capture_output=True, text=True).stdout.split()[1]
 root = pathlib.Path(tempfile.mkdtemp(prefix='pctl-machine-', dir=os.path.realpath('/tmp')))
 config, state, state2, state3 = root/'config', root/'local', root/'remote', root/'empty'
 bindir = root/'bin'; marker = root/'ssh-mode'; pids = root/'pids'; arglog = root/'ssh-args'
@@ -89,7 +90,7 @@ try:
 
     def add_and_list():
         out = cli('machine', 'add', 'lab', 'lab-host')
-        assert out['version'] == '0.7.0' and out['host'], out
+        assert out['version'] == VERSION and out['host'], out
         assert machines.read_text() == 'lab\tlab-host\tenabled\n', saved()
         assert cli('machine', 'list')['machines'] == [{'label': 'lab', 'target': 'lab-host', 'enabled': True}]
         assert 'already exists' in cli('machine', 'add', 'lab', 'other', ok=False)['error']
@@ -103,7 +104,7 @@ try:
         assert [r['label'] for r in rows] == ['lab', 'lab2'], rows
         r = rows[0]
         assert (r['reachable'], r['state'], r['server'], r['agents']) == (True, 'up', True, 4), r
-        assert r['host'] and r['version'] == '0.7.0', r
+        assert r['host'] and r['version'] == VERSION, r
         cli('machine', 'remove', 'lab2')
     case('machine status reports host, version, server and agent count over the bridge', status_reports)
 
