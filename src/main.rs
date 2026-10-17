@@ -97,6 +97,26 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SidebarCmd,
     },
+    /// Tell another agent something: a session here, `<machine>:<name>` on another computer, an
+    /// A2A agent from `[tell.a2a.<name>]` in config.toml, or `codex:<prefix>`. A sender line
+    /// `[from <me> <host> <cwd>]` goes in front. Exit: 0 sent, 1 refused, 2 usage, 3 no token,
+    /// 4 no connection, 5 could not send, 6 the session waits for a human (nothing typed).
+    Tell {
+        to: String,
+        text: String,
+        /// Wait for the answer: a session's last 40 lines once it stops working, an A2A reply.
+        #[arg(long)]
+        wait: bool,
+        /// A2A conversation key; the default is one per sender per day.
+        #[arg(long)]
+        context: Option<String>,
+        /// One human line instead of JSON.
+        #[arg(long)]
+        plain: bool,
+        /// The sender line of a computer that ran this over ssh. Refused unless this is an ssh login.
+        #[arg(long, hide = true)]
+        from_line: Option<String>,
+    },
     Skill {
         #[command(subcommand)]
         cmd: SkillCmd,
@@ -1187,6 +1207,47 @@ fn run() -> Result<()> {
             }
             SidebarCmd::Ui { id } => pctl::sidebar::run(&core, &id)?,
         },
+        Cmd::Tell {
+            to,
+            text,
+            wait,
+            context,
+            plain,
+            from_line,
+        } => {
+            anyhow::ensure!(
+                !to.trim().is_empty() && !text.trim().is_empty(),
+                "usage: pctl tell <to> <text> [--wait] [--context KEY] [--plain]"
+            );
+            if let Some(line) = &from_line {
+                anyhow::ensure!(
+                    std::env::var_os("SSH_CONNECTION").is_some(),
+                    "--from-line is only accepted over ssh"
+                );
+                anyhow::ensure!(
+                    pctl::tell::valid_line(line),
+                    "--from-line is not a sender line"
+                );
+            }
+            let out = pctl::tell::run(
+                &core,
+                &pctl::tell::Request {
+                    to,
+                    text,
+                    wait,
+                    context,
+                    from_line,
+                },
+            );
+            match (plain, out.result.exit_code()) {
+                (false, _) => println!("{}", serde_json::to_string_pretty(&out.json())?),
+                (true, 0) => println!("{}", out.plain()),
+                (true, _) => eprintln!("{}", out.plain()),
+            }
+            if out.result.exit_code() != 0 {
+                std::process::exit(out.result.exit_code());
+            }
+        }
         Cmd::Skill { cmd } => match cmd {
             SkillCmd::Install { project } => print(&core.install_skill(&project)?)?,
         },

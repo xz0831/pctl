@@ -136,6 +136,8 @@ Variables with the same prefix (`TERMAPP_` here) are not copied into agent panes
 
 `pctl session add --name <name> --cwd <repo> --worktree <branch> [--base <ref>] [--model <provider/model>] -- <argv>` creates the branch, makes the worktree `<repo>-wt-<name>` and runs the session there. `--model` sets an OpenCode session's model. `pctl worktree list` shows each worktree's branch, base, dirty files, commits ahead and whether it is merged. `pctl worktree remove <name>` moves a stopped, clean, merged worktree to the trash, deletes the merged branch and unregisters the session. It refuses anything else. See CLI.md.
 
+`pctl tell <to> <text>` sends a message to another agent: a session here, `<machine>:<name>` on another computer, an A2A agent listed in `config.toml`, or `codex:<prefix>`. It puts a `[from <me> <host> <cwd>]` line in front, says whether the text `reached` the session, was `queued` behind its work or was `typed_unconfirmed`, and refuses a session that waits for a human decision (exit 6). See CLI.md.
+
 ## Lite package
 
 `scripts/package-lite.sh [target]` builds `dist/pctl-lite-<version>-<target>.zip` for offline install. The ZIP contains:

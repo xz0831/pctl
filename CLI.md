@@ -380,6 +380,43 @@ Before a saved or explicit Codex resume, `session add`, `start`, `restart` and `
 
 Session add/start/restart/restore wait 500 ms after releasing the launch gate, then check the registered process. An early exit is `start_failed`, including exit status and the last 12 screen lines; its dead pane stays registered for inspection or restart. Survival of this short check is not a guarantee of later health or task completion. Lower-level `agent start/restart` keep their immediate launch semantics.
 
+## Telling another agent (`pctl tell`)
+
+`pctl tell <to> <text> [--wait] [--context KEY] [--plain]` is one command for agent-to-agent messages. It is not the same-project mailbox (`pctl msg`, `pctl message`, `pctl peer`), which stays as it is.
+
+Where `<to>` goes:
+- `<name>`: a pctl session on this computer. The text is typed with the sender line in front (`session prompt`).
+  - `blocked` (waiting for a human decision): refused, exit 6, nothing typed.
+  - `stopped`, `lost` or `exited`, and unknown names: exit 5.
+  - Otherwise the result is `queued` (it was working when sent), `reached` (it became `working` or `blocked` within 8 s) or `typed_unconfirmed` (neither). All three exit 0; sending again would duplicate.
+  - `--wait` waits (up to 30 minutes) until the session stops working, then returns its last 40 lines as `reply`.
+- `<machine>:<name>`: a session on another computer. `<machine>` is a saved label (`pctl machine`) or an ssh target. It runs `pctl tell <name> <text> --from-line "<sender line>"` there over ssh (`PCTL_REMOTE_BIN`, like `--host`), so the sender is this computer's sender, not "ssh". Results and exit codes come back unchanged; ssh itself failing is exit 4. `--from-line` is accepted only in an ssh login (`SSH_CONNECTION` set).
+- `<name>` listed in `[tell.a2a.<name>]`: an A2A agent, through `curl`. Without `--wait`, `SendStreamingMessage` with `A2A-Version: 1.0`; only the first event is read, then the connection is dropped (`TASK_STATE_SUBMITTED` is `accepted`). With `--wait`, `SendMessage`, and the reply text is printed (up to 330 s).
+  - The conversation key is `--context` (sanitized to `[A-Za-z0-9_-]`), else `msg-<host>-<sender>-<YYYYMMDD>`: one conversation per sender per day.
+  - An "Anti-loop protection" refusal is retried once with `<key>-r2`, `-r3` and so on. The newest key is remembered in `<state>/tell/ctx-<name>-<key>` (mode 0600).
+  - The token is read from `token_file` (a file with `KEY=value` lines, the last one wins) when the message is sent and goes to `curl` on its standard input (`-H @-`). It is in no argument list, log or output.
+- `codex:<prefix>`: the session whose conversation starts with the prefix (at least 4 characters). It is the reply address for a sender that runs outside any pane.
+
+The sender line is `[from <me> <host> <cwd>]` (`$PWD` with `$HOME` as `~`). `<me>`, first match wins: the caller's own session (`PCTL_AGENT_ID`, as `session whoami`); the session holding `CODEX_THREAD_ID`'s conversation, else `codex:<first 8>`; a `door_services` value of `XPC_SERVICE_NAME` (the host name); any other `XPC_SERVICE_NAME` as `job:<name>` (without `job_prefix`); `ssh` in an ssh login; else `?`. An A2A message without `--wait` gets ` · reply with tell` inside the brackets. Telling yourself (`<me>` or `<host>:<me>`) prints and sends nothing, exit 0.
+
+Output is JSON `{to, result, context?, reply?, note?|error?}` or, with `--plain`, one line (`reached: <to> …`, then the reply). Results: `reached`, `queued`, `typed_unconfirmed`, `accepted`, `replied`, `self`, `refused`, `no_token`, `no_connection`, `not_sent`, `blocked`. Exit codes: 0 sent, 1 refused, 2 usage, 3 no token, 4 no connection, 5 could not send, 6 blocked. `<state>/tell.log` (mode 0600) gets one tab-separated line per send: time, sender, receiver, result, length of the text (never the text).
+
+Configuration in `config.toml` (the small `[section]` / `name = "value"` reader the shortcuts use):
+
+```toml
+[tell]
+host = "alpha"                  # this computer's name in sender lines (default: hostname -s)
+door_services = "svc.door"      # XPC_SERVICE_NAME values meaning "this computer's front door", comma separated
+job_prefix = "jobs."            # stripped from other XPC_SERVICE_NAME values: job:<rest>
+
+[tell.a2a.front]
+url = "http://127.0.0.1:9900/"
+token_file = "~/.config/secrets/api.env"
+token_key = "FRONT_TOKEN"
+```
+
+An agent running inside a front door's own code tool has no marker in its environment, so its sender reads `ssh` or `?` unless `door_services` names the service; a list of parent process names could replace that, but is not implemented.
+
 ## Explaining session status
 
 `pctl session explain <name>` prints `{status,rule,row,text,considered_rows,pane_title}` without adding fields to `session list` or `session get`. Rows are 1-based positions in the visible screen. `considered_rows` contains the last 12 nonempty rows as `{row,text}` (ANSI styling removed); the OpenCode footer rule uses only the last four. A title-spinner match or no match has null `row` and `text`. Stopped, lost and exited sessions have no considered rows and a null title. A failed capture reports `unknown` with the error in `rule`.
