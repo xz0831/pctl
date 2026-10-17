@@ -182,6 +182,8 @@ enum Hit {
     Detach,
     Start(Id, bool),
     SidebarEdge,
+    /// The "more" line at the top (true) or bottom of a sidebar that does not fit.
+    SideMore(bool),
     Menu(usize),
     Field(usize),
     Choice(usize, usize),
@@ -339,6 +341,34 @@ enum SideRow {
     Add(Id),
 }
 
+/// The sidebar's `len` rows in `cap` lines from row `off`: the first row shown (kept in range),
+/// how many rows, and how many are hidden above and below. A "more" line takes a line of its own.
+fn side_window(len: usize, cap: usize, off: usize) -> (usize, usize, usize, usize) {
+    if len <= cap || cap < 3 {
+        return (0, len.min(cap), 0, len - len.min(cap));
+    }
+    let off = off.min(len - cap + 1);
+    let mut shown = cap - usize::from(off > 0);
+    if off + shown < len {
+        shown -= 1;
+    }
+    (off, shown, off, len - off - shown)
+}
+/// The first row to show so that row `i` is on screen, scrolling as little as possible.
+fn reveal(len: usize, cap: usize, off: usize, i: usize) -> usize {
+    let mut off = side_window(len, cap, off).0;
+    if i < off {
+        return i;
+    }
+    loop {
+        let (o, shown, ..) = side_window(len, cap, off);
+        if i < o + shown || o + shown >= len {
+            return o;
+        }
+        off = o + 1;
+    }
+}
+
 /// The local clipboard's image, read on a thread of its own.
 type ClipRead = mpsc::Receiver<Result<Option<Vec<u8>>>>;
 
@@ -388,6 +418,12 @@ struct App {
     sidebar_w: u16,
     in_sidebar: bool,
     side_sel: usize,
+    /// The first sidebar row shown, how far it can go, the room it was drawn in, and what the
+    /// last draw saw (keyboard row, current agent) so a change brings its row into view.
+    side_off: usize,
+    side_max: usize,
+    side_area: Rect,
+    side_seen: (bool, usize, Option<Id>),
     /// Every cell there is, by number; the trees below hold the numbers.
     panes: HashMap<u32, Pane>,
     next_pane: u32,
@@ -680,6 +716,10 @@ impl App {
             sidebar: true,
             sidebar_w: 26,
             in_sidebar: false,
+            side_off: 0,
+            side_max: 0,
+            side_area: Rect::default(),
+            side_seen: (false, 0, None),
             side_sel: 0,
             panes: HashMap::from([(0, Pane::default())]),
             next_pane: 1,
@@ -2001,6 +2041,19 @@ impl App {
             // A full-screen program (most agents) has no tmux history to scroll: the wheel is its
             // own, as a mouse event where it reads the mouse, else as arrow keys like a terminal.
             // It goes to the cell under the pointer, whichever cell has the focus.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                if self.modal.is_none()
+                    && m.column >= self.side_area.x
+                    && m.column < self.side_area.x + self.side_area.width
+                    && m.row >= self.side_area.y
+                    && m.row < self.side_area.y + self.side_area.height =>
+            {
+                self.side_off = if m.kind == MouseEventKind::ScrollUp {
+                    self.side_off.saturating_sub(2)
+                } else {
+                    (self.side_off + 2).min(self.side_max)
+                };
+            }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if matches!(hit, Some(Hit::Pane(id)) if self.panes.get(&id).is_some_and(|p| p.view.alt && p.view.scroll == 0)) =>
             {
                 self.sel = None;
@@ -2063,6 +2116,14 @@ impl App {
             Hit::Start(a, true) => self.confirm_new(&a),
             Hit::Start(a, new) => self.run_act(core, Act::Start(a, new)),
             Hit::SidebarEdge => self.drag = true,
+            Hit::SideMore(up) => {
+                let page = (self.side_area.height as usize).saturating_sub(3).max(1);
+                self.side_off = if up {
+                    self.side_off.saturating_sub(page)
+                } else {
+                    (self.side_off + page).min(self.side_max)
+                };
+            }
             Hit::Menu(i) => self.menu_pick(core, i),
             Hit::Field(i) => {
                 if let Some(Modal::Form(f)) = &mut self.modal {
@@ -2683,6 +2744,7 @@ impl App {
     fn render_sidebar(&mut self, f: &mut Frame, r: Rect) {
         let p = self.pal;
         f.render_widget(Block::default().style(p.body()), r);
+        self.side_area = r;
         let mut y = r.y;
         let line = |f: &mut Frame, y: u16, spans: Vec<Span<'static>>, style: Style| {
             f.render_widget(
@@ -2745,10 +2807,49 @@ impl App {
         // With machines shown, their projects sit one step in.
         let step = u16::from(self.multi());
         let pad = |n: u16| " ".repeat((n + step) as usize);
-        for (i, row) in rows.iter().enumerate() {
-            if y >= r.y + r.height {
-                break;
-            }
+        // A row that came into focus (keyboard, or another agent on screen) is brought into view.
+        let cap = (r.height as usize).saturating_sub(1);
+        let current = self.current().map(Agent::id);
+        let seen = (self.in_sidebar, self.side_sel, current.clone());
+        let want = if self.in_sidebar && (seen.0, seen.1) != (self.side_seen.0, self.side_seen.1) {
+            Some(self.side_sel)
+        } else if seen.2 != self.side_seen.2 {
+            current.and_then(|c| {
+                rows.iter()
+                    .position(|r| matches!(r, SideRow::Agent(a) if *a == c))
+            })
+        } else {
+            None
+        };
+        self.side_seen = seen;
+        if let Some(i) = want {
+            self.side_off = reveal(rows.len(), cap, self.side_off, i);
+        }
+        let (off, shown, above, below) = side_window(rows.len(), cap, self.side_off);
+        self.side_off = off;
+        self.side_max = if rows.len() > cap && cap >= 3 {
+            rows.len() - cap + 1
+        } else {
+            0
+        };
+        let more = |f: &mut Frame, this: &mut Self, y: u16, up: bool, n: usize| {
+            let text = format!(" {} {n} more", if up { "▲" } else { "▼" });
+            line(f, y, vec![Span::raw(text)], Style::default().fg(p.muted));
+            this.hit(
+                Rect {
+                    x: r.x,
+                    y,
+                    width: r.width,
+                    height: 1,
+                },
+                Hit::SideMore(up),
+            );
+        };
+        if above > 0 {
+            more(f, self, y, true, above);
+            y += 1;
+        }
+        for (i, row) in rows.iter().enumerate().skip(off).take(shown) {
             let selected_row = self.in_sidebar && i == self.side_sel;
             let base = if selected_row {
                 Style::default().fg(p.text).bg(p.raised)
@@ -2865,6 +2966,9 @@ impl App {
                 }
             }
             y += 1;
+        }
+        if below > 0 {
+            more(f, self, y, false, below);
         }
     }
 
@@ -4021,6 +4125,35 @@ mod tests {
         app.split(Dir::Down);
         assert!(app.current().is_none());
     }
+    #[test]
+    fn the_sidebar_window_keeps_its_more_lines_and_stays_in_range() {
+        // Fits: everything shows, nothing is hidden, whatever the offset says.
+        assert_eq!(side_window(5, 8, 3), (0, 5, 0, 0));
+        // 20 rows in 10 lines: a "more" line below at the top, both in the middle, above at the end.
+        assert_eq!(side_window(20, 10, 0), (0, 9, 0, 11));
+        assert_eq!(side_window(20, 10, 4), (4, 8, 4, 8));
+        assert_eq!(side_window(20, 10, 99), (11, 9, 11, 0));
+        // Too little room for the lines: rows are cut, not hidden behind markers.
+        assert_eq!(side_window(20, 2, 5), (0, 2, 0, 18));
+    }
+
+    #[test]
+    fn a_row_is_revealed_with_the_least_scroll() {
+        let (len, cap) = (30, 10);
+        for i in 0..len {
+            for off in [0, 3, 12, 21, 99] {
+                let o = reveal(len, cap, off, i);
+                let (first, shown, ..) = side_window(len, cap, o);
+                assert!(first <= i && i < first + shown, "row {i} from {off}: {o}");
+                if i >= side_window(len, cap, off).0
+                    && i < side_window(len, cap, off).0 + side_window(len, cap, off).1
+                {
+                    assert_eq!(o, side_window(len, cap, off).0, "already shown: no scroll");
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_taller_pane_can_be_scrolled_back_over_its_own_hidden_top() {
         let view = View {

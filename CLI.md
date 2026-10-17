@@ -309,6 +309,7 @@ Mouse (SGR mouse reporting):
 - An open dialog takes every click; nothing behind it reacts.
 - The wheel over the terminal scrolls back (`capture-pane -S/-E`). Any key returns to live.
 - Dragging the sidebar edge resizes it.
+- The sidebar scrolls when its rows do not fit: the wheel over it moves two rows a notch, the keyboard selection (`ctrl+b w`, arrows) and an agent that comes on screen by any route are kept in view, and a muted `▲ N more` / `▼ N more` line at the top or bottom shows what is hidden (a click on it moves a page).
 - The terminal area can be split into cells (a tree of splits, at most 16 cells). Each cell has a one-row title `<computer> · <agent> <state>` (the computer only when machines are saved), its own screen, scroll and read schedule, and its agent's tmux window is resized to the cell. An agent is shown in at most one cell. Typing, paste and the shortcuts act on the focused cell; a click focuses a cell, a drag selects inside one cell, the wheel acts on the cell under the pointer. Dragging a divider resizes; a divider's line is a column between side-by-side cells, or the title row of the lower cell. With one cell nothing is drawn but the terminal itself, as before. These are views only: agents keep one tmux window each, and closing a cell stops nothing.
 
 Shortcuts:

@@ -390,6 +390,35 @@ try:
         assert until(lambda: 'keep the right button' in screen()), screen()
         keys('Escape')
     case('the help screen says some terminals keep the right button', help_line)
+    def sidebar_scroll():
+        for proj, n in (('pa', 14), ('pb', 13), ('pc', 13)):
+            for i in range(1, n + 1):
+                add('pc-last' if proj == 'pc' and i == n else f'{proj}-{i:02d}', proj)
+        app()
+        wheel = lambda up, n: (vt('send-keys', '-t', 'view', '-l', f'\x1b[<{64 if up else 65};5;10M' * n), time.sleep(0.6))
+        top = lambda: lines()[1].startswith(' ▾ alpha')
+        assert 'more' in screen() and '▼' in screen() and '▲' not in screen() and 'pc-last' not in screen(), screen()
+        wheel(False, 3); assert '▲' in screen() and not top(), screen()  # a few notches scroll by rows, not by a page
+        wheel(False, 60)
+        assert 'pc-last' in screen() and '▲' in screen() and '▼' not in screen(), screen()
+        click(*side('pc-last')); assert until(lambda: 'pc / ● pc-last' in status() and 'ready in pc-last' in screen()), screen()
+        wheel(True, 80); assert top() and '▲' not in screen() and '▼' in screen(), screen()
+        click(*find('▼')); assert '▲' in screen() and not top(), screen()  # a click on the marker pages
+        keys('C-b', '1'); assert until(lambda: 'pc-01' in status()), status()
+        assert until(lambda: any(l.startswith('   ') and 'pc-01' in l[:26] for l in lines())), screen()  # its row is brought into view
+        wheel(True, 80); assert top()
+        keys('C-b', 'w')
+        assert not top() and any(l.startswith('   ') and 'pc-01' in l[:26] for l in lines()), screen()  # the selection starts on the current agent: scrolled to it
+        keys(*['Down'] * 70)
+        assert '▼' not in screen() and '▲' in screen(), screen()
+        keys(*['Up'] * 90)
+        assert top() and '▲' not in screen() and '▼' in screen(), screen()
+        keys('Escape')
+        for n in ('alpha', 'beta', 'pa', 'pb', 'pc'):  # a click on a project opens it, the next one collapses it
+            wheel(True, 80); click(*find(f'▾ {n}'))
+            if f'▾ {n}' in screen(): click(*find(f'▾ {n}'))
+        assert 'more' not in screen() and '▸ pc' in screen(), screen()  # collapsed: all fit, no markers
+    case('the sidebar scrolls: wheel, keyboard, the current agent, and the more lines', sidebar_scroll)
     pathlib.Path(a.report).write_text(json.dumps({'results': results, 'passed': len(results)}, indent=1))
 finally:
     vt('kill-server')
