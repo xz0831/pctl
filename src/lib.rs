@@ -14,6 +14,7 @@ pub mod app;
 pub mod bridge;
 pub mod clipboard;
 pub mod collaboration;
+pub mod docs;
 pub mod human;
 pub mod machine;
 pub mod notify;

@@ -89,6 +89,7 @@ fn op(
         .context("missing op")?
     {
         "list" => list(core),
+        "doc_read" => core.doc_read(text("doc")?),
         "screen" => screen(core, text("agent")?, text("run")?, req, asked),
         "keys" => send_keys(core, text("agent")?, text("run")?, req),
         "paste" => paste(core, text("agent")?, text("run")?, req),
@@ -118,6 +119,7 @@ pub fn list(core: &Core) -> Result<Value> {
         "sessions": sessions.unwrap_or_default(),
         "projects": projects,
         "connected": core.server().is_ok_and(|m| !m.is_empty()),
+        "docs": core.doc_list(None),
     }))
 }
 

@@ -113,6 +113,60 @@ try:
         assert 'second question' in (root / 'threads.jsonl').read_text(), 'the question is kept'
         view_stop()
     case('a blocked main gets nothing typed (exit 6 -> Blocked) and the question is kept', ask_to_blocked_main_is_saved_not_sent)
+    def show_list_read():
+        f = proj / 'shown.md'; f.write_text('# shown\n')
+        doc = cli('show', f, '--project', 'demo', '--title', 'Plan', '--note', 'read the second part')
+        assert doc['new'] is True and doc['title'] == 'Plan' and doc['project'] == 'demo' and doc['path'] == os.path.realpath(f), doc
+        assert 'by' not in doc, 'a person ran it'
+        listed = cli('show', '--list', '--project', 'demo')
+        assert [d['id'] for d in listed] == [doc['id']] and cli('show', '--list', '--project', 'other') == [], listed
+        assert cli('show', '--read', doc['id'])['new'] is False and cli('show', '--list')[0]['new'] is False
+        assert cli('show', f, '--project', 'demo')['new'] is False, 'the same content shown again stays read'
+        f.write_text('# shown, changed\n')
+        again = cli('show', f, '--project', 'demo')
+        assert again['id'] == doc['id'] and again['new'] is True and again['title'] == 'Plan', again
+        assert pathlib.Path(again['previous']['copy']).read_text() == '# shown\n'
+    case('show records a document, --list filters, --read and a changed file flip new', show_list_read)
+
+    def show_as_an_agent():
+        s = cli('session', 'get', 'demo-main')
+        env = {'PCTL_AGENT_ID': s['agent_id'], 'PCTL_RUN_ID': s['run_id']}
+        f = proj / 'by-agent.md'; f.write_text('hello\n')
+        doc = cli('show', f, env=env)
+        assert doc['by'] == 'demo-main' and doc['run'] == s['run_id'] and doc['project'] == 'demo', doc
+        rc, _, err = run('show', '--read', doc['id'], env=env)
+        assert rc != 0 and 'agent_caller' in err, (rc, err)
+        assert cli('show', '--list', '--project', 'demo')[0]['new'] is True
+    case('an agent shows into its own project and cannot mark a document read', show_as_an_agent)
+
+    def refusals():
+        secret = proj / '.env'; secret.write_text('K=1\n')
+        rc, _, err = run('show', secret, '--project', 'demo'); assert rc != 0 and 'private' in err, (rc, err)
+        rc, _, err = run('show', proj / 'missing.md', '--project', 'demo'); assert rc != 0 and 'no such file' in err, err
+        rc, _, err = run('show', proj / 'note.md', '--project', 'nope'); assert rc != 0 and 'project not found' in err, err
+        rc, _, err = run('show', proj / 'note.md'); assert rc != 0 and '--project' in err, err
+    case('private files, missing files, unknown projects and a caller without a project are refused', refusals)
+
+    def answer_arrives():
+        events = [json.loads(l) for l in (root / 'threads.jsonl').read_text().splitlines()]
+        req = next(e['req_id'] for e in events if e['kind'] == 'ask')
+        assert cli('show', '--answer', req, 'because of this')['answered'] == req
+        events = [json.loads(l) for l in (root / 'threads.jsonl').read_text().splitlines()]
+        assert any(e['kind'] == 'answer' and e['text'] == 'because of this' and e['req_id'] == req for e in events), events
+        rc, _, err = run('show', '--answer', 'unknown-id', 'x'); assert rc != 0 and 'unknown request id' in err, err
+    case('show --answer is mdv answer (and rejects an unknown id)', answer_arrives)
+
+    def bridge_lists_documents():
+        env = dict(BASE, PCTL_STATE=str(state))
+        ask = lambda *reqs: [json.loads(l) for l in subprocess.run([B, 'bridge'], input=''.join(json.dumps(r) + '\n' for r in reqs), text=True, capture_output=True, env=env, timeout=30).stdout.splitlines()]
+        hello, listing = ask({'id': 1, 'op': 'list'})[:2]
+        docs = listing['docs']
+        assert {d['title'] for d in docs} >= {'Plan', 'by-agent.md'} and all(d['host'] == hello['host'] for d in docs), (hello, docs)
+        target = next(d for d in docs if d['title'] == 'by-agent.md' and d['new'])
+        assert ask({'id': 2, 'op': 'doc_read', 'doc': target['id']})[1]['ok'] is True
+        assert not next(d for d in cli('show', '--list') if d['id'] == target['id'])['new']
+        assert ask({'id': 3, 'op': 'doc_read', 'doc': 'nope'})[1]['ok'] is False
+    case('the bridge list answer carries the documents of that computer, and doc_read marks one read', bridge_lists_documents)
     json.dump(results, open(a.report, 'w'), indent=2)
 finally:
     view_stop()
