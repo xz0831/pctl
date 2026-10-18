@@ -6,7 +6,7 @@
 use super::{
     Screen, emit, pane_of, read_screen, read_screens, resize, screen_json, small, verified,
 };
-use crate::Core;
+use crate::{Core, control::Control};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -25,6 +25,9 @@ const HOT: Duration = Duration::from_millis(800);
 const RUSH: Duration = Duration::from_millis(120);
 /// The program needs a moment to answer a key; reading sooner would find nothing new.
 const ANSWER_AFTER: Duration = Duration::from_millis(6);
+/// A cell whose pane is covered by a control connection is read when its pane wrote; it is also
+/// read this often in case something changed without output (a resize, a new run).
+const SAFETY: Duration = Duration::from_secs(1);
 /// The most cells one watch holds.
 const MAX_CELLS: usize = 64;
 
@@ -53,6 +56,20 @@ struct Cell {
     hot_until: Instant,
     rush_until: Instant,
     reported: bool,
+    /// Its output reaches us over a control connection, so it is read when `dirty`, not by timer.
+    controlled: bool,
+    dirty: bool,
+    safety: Instant,
+}
+
+impl Cell {
+    /// When this cell is next to be read.
+    fn due_at(&self) -> Instant {
+        match (self.controlled, self.dirty) {
+            (false, _) | (true, true) => self.next,
+            (true, false) => self.next.max(self.safety),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -60,6 +77,7 @@ struct State {
     cells: Vec<Cell>,
     stop: bool,
     started: bool,
+    control: Option<Arc<Control>>,
 }
 
 pub struct Watch {
@@ -108,6 +126,9 @@ impl Watch {
                 hot_until: now + HOT,
                 rush_until: now,
                 reported: false,
+                controlled: false,
+                dirty: false,
+                safety: now,
             };
             ensure!(!cell.key.is_empty(), "a watched cell needs a key");
             cell.pane = pane_of(core, &cell.agent, &cell.run).ok();
@@ -127,6 +148,9 @@ impl Watch {
                 cell.hot_until = old.hot_until;
                 cell.rush_until = old.rush_until;
                 cell.reported = old.reported;
+                cell.controlled = old.controlled;
+                cell.dirty = old.dirty;
+                cell.safety = old.safety;
                 cell.pane = old.pane.take().or(cell.pane.take());
             } else if let Some(pane) = cell.pane.clone() {
                 let size = (cell.width, cell.height);
@@ -141,11 +165,26 @@ impl Watch {
             }
         }
         let n = cells.len();
+        let control = st
+            .control
+            .get_or_insert_with(|| {
+                let control = Control::new(core);
+                let me = self.clone();
+                control.on_dirty(Arc::new(move |pane| me.dirty(pane)));
+                control
+            })
+            .clone();
+        control.watch(
+            &cells
+                .iter()
+                .filter_map(|c| c.pane.clone())
+                .collect::<Vec<_>>(),
+        );
         st.cells = cells;
         if !st.started && n > 0 {
             st.started = true;
             let (core, me) = (core.clone(), self.clone());
-            thread::spawn(move || me.run(&core));
+            thread::spawn(move || me.run(&core, &control));
         }
         self.wake.notify_all();
         Ok(json!({"watching": n}))
@@ -159,8 +198,35 @@ impl Watch {
         for c in st.cells.iter_mut().filter(|c| c.run == run) {
             c.hot_until = now + HOT;
             c.rush_until = now + RUSH;
-            c.next = now + ANSWER_AFTER;
+            // A covered pane answers with output, which makes the cell dirty: nothing to wait for.
+            c.next = if c.controlled {
+                now
+            } else {
+                now + ANSWER_AFTER
+            };
             c.quiet = 0;
+            any = true;
+        }
+        if any {
+            self.wake.notify_all();
+        }
+    }
+
+    /// The control connections of this bridge, once cells are watched.
+    pub fn control(&self) -> Option<Arc<Control>> {
+        lock(&self.state).control.clone()
+    }
+
+    /// A pane wrote (reported by the control connection).
+    fn dirty(&self, pane: &str) {
+        let mut st = lock(&self.state);
+        let mut any = false;
+        for c in st
+            .cells
+            .iter_mut()
+            .filter(|c| c.pane.as_deref() == Some(pane))
+        {
+            c.dirty = true;
             any = true;
         }
         if any {
@@ -174,11 +240,28 @@ impl Watch {
         self.wake.notify_all();
     }
 
-    fn run(&self, core: &Core) {
+    fn run(&self, core: &Core, control: &Arc<Control>) {
         loop {
+            // Which cells have a control connection now (this starts the ones that have none yet).
+            let panes: Vec<(String, String)> = lock(&self.state)
+                .cells
+                .iter()
+                .filter(|c| c.scroll == 0 && !c.reported)
+                .filter_map(|c| Some((c.key.clone(), c.pane.clone()?)))
+                .collect();
+            let covered: Vec<(String, bool)> = panes
+                .into_iter()
+                .map(|(key, pane)| (key, control.covers(&pane)))
+                .collect();
+            control.sweep();
             // The cells due now, copied out so no lock is held while tmux runs.
-            let due: Vec<(String, u64, String, String, u16, usize)> = {
+            let due: Vec<(String, u64, String, String, u16, usize, bool)> = {
                 let mut st = lock(&self.state);
+                for (key, yes) in covered {
+                    for c in st.cells.iter_mut().filter(|c| c.key == key) {
+                        c.controlled = yes;
+                    }
+                }
                 loop {
                     if st.stop {
                         return;
@@ -186,9 +269,10 @@ impl Watch {
                     let now = Instant::now();
                     let due: Vec<_> = st
                         .cells
-                        .iter()
-                        .filter(|c| c.next <= now && !c.reported)
+                        .iter_mut()
+                        .filter(|c| c.due_at() <= now && !c.reported)
                         .map(|c| {
+                            c.dirty = false;
                             (
                                 c.key.clone(),
                                 c.rev,
@@ -196,6 +280,7 @@ impl Watch {
                                 c.run.clone(),
                                 c.height,
                                 c.scroll,
+                                c.controlled,
                             )
                         })
                         .collect();
@@ -206,9 +291,10 @@ impl Watch {
                         .cells
                         .iter()
                         .filter(|c| !c.reported)
-                        .map(|c| c.next.saturating_duration_since(now))
+                        .map(|c| c.due_at().saturating_duration_since(now))
                         .min()
-                        .unwrap_or(Duration::from_millis(250));
+                        .unwrap_or(Duration::from_millis(250))
+                        .min(Duration::from_millis(250));
                     st = self
                         .wake
                         .wait_timeout(st, wait.max(Duration::from_millis(1)))
@@ -216,19 +302,36 @@ impl Watch {
                         .0;
                 }
             };
-            // Live cells in one call, scrolled-back ones (their window needs the pane's height)
-            // each on their own, a cell without a pane is a change.
+            // Live cells in one call (over the control connection when they have one), scrolled-back
+            // ones (their window needs the pane's height) each on their own, a cell without a pane
+            // is a change.
+            let mut read: Vec<Option<Result<Option<Screen>>>> =
+                (0..due.len()).map(|_| None).collect();
             let live: Vec<usize> = (0..due.len())
                 .filter(|&i| due[i].5 == 0 && !due[i].2.is_empty())
                 .collect();
-            let batch: Vec<(&str, &str, u16)> = live
-                .iter()
-                .map(|&i| (due[i].2.as_str(), due[i].3.as_str(), due[i].4))
-                .collect();
-            let mut read: Vec<Option<Result<Option<Screen>>>> =
-                (0..due.len()).map(|_| None).collect();
-            for (&i, r) in live.iter().zip(read_screens(core, &batch)) {
-                read[i] = Some(r);
+            let batch = |ix: &[usize]| -> Vec<(&str, &str, u16)> {
+                ix.iter()
+                    .map(|&i| (due[i].2.as_str(), due[i].3.as_str(), due[i].4))
+                    .collect()
+            };
+            let (via, plain): (Vec<usize>, Vec<usize>) = live.iter().partition(|&&i| due[i].6);
+            let mut plain = plain;
+            match (!via.is_empty())
+                .then(|| control.read_screens(&batch(&via)))
+                .flatten()
+            {
+                Some(answers) => {
+                    for (&i, r) in via.iter().zip(answers) {
+                        read[i] = Some(r);
+                    }
+                }
+                None => plain.extend(&via),
+            }
+            if !plain.is_empty() {
+                for (&i, r) in plain.iter().zip(read_screens(core, &batch(&plain))) {
+                    read[i] = Some(r);
+                }
             }
             for (i, d) in due.iter().enumerate() {
                 if read[i].is_none() {
@@ -267,11 +370,16 @@ impl Watch {
                         push = Some(ev);
                         c.last = Some(s);
                     }
+                    c.safety = now + SAFETY;
                     c.next = now
                         + if now < c.rush_until {
                             RUSH_EVERY
                         } else if now < c.hot_until {
                             HOT_EVERY
+                        } else if c.controlled {
+                            // Output makes it dirty, so this only limits how often a pane that
+                            // writes all the time is read and pushed.
+                            if c.quiet <= 2 { every(0) } else { HOT_EVERY }
                         } else {
                             every(c.quiet)
                         };

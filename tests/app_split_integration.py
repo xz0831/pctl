@@ -174,7 +174,13 @@ try:
         assert 'app_visible' in cli('session', 'get', 'a-main')['swap_blockers']
         say('a-main', 'while-zoomed'); keys('C-b', 'z')
         assert until(lambda: 'zoomed' not in status() and tpos('b-main') >= 0), (status(), titles())
-        assert size('a-main') != f'{COLS - SIDE}x{ROWS - 2}'
+        assert until(lambda: size('a-main') != f'{COLS - SIDE}x{ROWS - 2}'), 'the window is asked for the cell size again'
+        # ...and the app does not spin while it waits for anything: its CPU stays low over 1.5 s
+        pid = subprocess.run(['pgrep', '-f', f'^{B} --state {state}'], text=True, capture_output=True).stdout.split()[0]
+        def cpu():
+            t = subprocess.run(['ps', '-o', 'time=', '-p', pid], text=True, capture_output=True).stdout.strip().replace('.', ':').split(':')
+            return sum(int(x) * m for x, m in zip(reversed(t), (0.01, 1, 60, 3600)))
+        c0 = cpu(); time.sleep(1.5); assert cpu() - c0 < 0.5, 'the app is not busy-looping'
     case('ctrl+b { and } swap with the neighbour; ctrl+b z zooms the cell full-size and back', swap_zoom)
     def keep_layout():
         before = (titles(), [dividers(r) for r in (6, 20)], size('a-main'), size('b-main'), size('a-two'))

@@ -15,6 +15,7 @@ pub mod bridge;
 pub mod build;
 pub mod clipboard;
 pub mod collaboration;
+pub mod control;
 pub mod docs;
 pub mod human;
 pub mod machine;
@@ -182,6 +183,47 @@ fn parse_snapshot_panes(output: &str, expected_instance: &str) -> Result<Vec<Pan
     let panes = parse_panes(rows)?;
     ensure!(!panes.is_empty(), "tmux snapshot contained no panes");
     Ok(panes)
+}
+
+/// UTC time as `2026-10-18T01:02:03Z`, for log lines.
+pub(crate) fn utc_now() -> String {
+    Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Add a line to a log file (0600), and when the file is over `cap` bytes keep its newest half.
+pub(crate) fn append_capped(path: &Path, line: &str, cap: u64) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = (|| -> std::io::Result<()> {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+        writeln!(f, "{line}")?;
+        if f.metadata()?.len() > cap {
+            let bytes = fs::read(path)?;
+            // Start at a line: a cut can fall in the middle of one.
+            let keep = &bytes[bytes.len() - (cap / 2) as usize..];
+            let keep = keep
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(&[][..], |i| &keep[i + 1..]);
+            let tmp = path.with_extension("tmp");
+            let mut out = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            out.write_all(keep)?;
+            fs::rename(&tmp, path)?;
+        }
+        Ok(())
+    })();
 }
 
 #[derive(Clone, Debug)]
@@ -1319,6 +1361,8 @@ impl Core {
         Ok(self
             .tm(&[
                 "list-clients",
+                "-f",
+                bridge::NOT_CONTROL,
                 "-F",
                 "#{client_name}|#{client_pid}|#{client_created}",
             ])?

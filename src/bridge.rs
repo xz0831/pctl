@@ -10,6 +10,7 @@ use crate::{
     human::literal,
 };
 mod watch;
+use crate::control;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::{Map, Value, json};
 use std::{
@@ -33,7 +34,7 @@ const MAX_LINE: usize = 1 << 20;
 /// The hello must arrive this quickly, and one answer within `ANSWER`.
 const HELLO_WITHIN: Duration = Duration::from_secs(10);
 const ANSWER_WITHIN: Duration = Duration::from_secs(5);
-const CURSOR_FORMAT: &str = "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_width} #{pane_height} #{history_size} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{@pctl_run}";
+pub(crate) const CURSOR_FORMAT: &str = "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_width} #{pane_height} #{history_size} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{@pctl_run}";
 
 /// `pctl bridge` (hidden): answer requests on stdin with one JSON object per line on stdout, until
 /// stdin closes. The hello goes out first, unasked, so a client knows who answered.
@@ -228,9 +229,8 @@ pub fn verified(core: &Core, pane: &str, run: &str) -> Result<()> {
 /// to it. `resize-window` sets `window-size` to manual; with no client attached, unset it at once:
 /// tmux 3.8 keeps the size and nothing is left behind however the viewer ends. With a client
 /// attached, unsetting would hand the window straight back to that client's size, so it stays
-/// manual until the viewer leaves.
+/// manual until the viewer leaves. A control client (`crate::control`) is not a viewer.
 pub fn resize(core: &Core, pane: &str, w: u16, h: u16) -> Result<()> {
-    let unset = format!("set-option -wu -t {pane} window-size");
     core.tm(&[
         "resize-window",
         "-t",
@@ -239,16 +239,18 @@ pub fn resize(core: &Core, pane: &str, w: u16, h: u16) -> Result<()> {
         &w.to_string(),
         "-y",
         &h.to_string(),
-        ";",
-        "if-shell",
-        "-F",
-        "-t",
-        pane,
-        "#{==:#{session_attached},0}",
-        &unset,
     ])?;
+    if core
+        .tm(&["list-clients", "-t", pane, "-f", NOT_CONTROL, "-F", "x"])?
+        .is_empty()
+    {
+        core.tm(&["set-option", "-wu", "-t", pane, "window-size"])?;
+    }
     Ok(())
 }
+
+/// A `list-clients` filter that leaves out control clients.
+pub(crate) const NOT_CONTROL: &str = "#{==:#{client_control_mode},0}";
 
 /// A pane's screen as the viewer needs it: the raw text, the cursor when it is visible, the pane
 /// size and the history size, and whether the program there is full-screen (`alt`) and reads the
@@ -324,7 +326,7 @@ pub fn read_screen(
 
 /// A screen from the rows and the `CURSOR_FORMAT` line read after them; None when the pane holds
 /// another run.
-fn screen_from(body: &str, last: &str, run: &str) -> Option<Screen> {
+pub(crate) fn screen_from(body: &str, last: &str, run: &str) -> Option<Screen> {
     let mut fields = last.splitn(10, ' ');
     let m: Vec<u64> = fields
         .by_ref()
@@ -418,6 +420,34 @@ fn while_run(core: &Core, pane: &str, run: &str, then: &str, otherwise: &str) ->
     Ok(!out.contains(RUN_CHANGED))
 }
 
+/// `while_run`, over a control connection when the pane has one (no process start): the same
+/// tmux command, so the check and the act are still one call.
+fn while_run_via(
+    core: &Core,
+    control: Option<Arc<control::Control>>,
+    pane: &str,
+    run: &str,
+    then: &str,
+    otherwise: &str,
+) -> Result<bool> {
+    if !run
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    {
+        return Ok(false);
+    }
+    let line = format!(
+        "if-shell -F -t {pane} {} {} {}",
+        quote(&format!("#{{==:#{{@pctl_run}},{run}}}")),
+        quote(then),
+        quote(&format!("display-message -p {RUN_CHANGED}{otherwise}"))
+    );
+    match control.and_then(|c| c.command(pane, &line)) {
+        Some(out) => Ok(!out?.contains(RUN_CHANGED)),
+        None => while_run(core, pane, run, then, otherwise),
+    }
+}
+
 /// Type the keys (text to send with `-l`, or key names) into the pane, in one tmux call that also
 /// checks the run. Ok(false): the run changed and nothing was typed.
 pub fn type_keys(core: &Core, pane: &str, run: &str, keys: &[(bool, String)]) -> Result<bool> {
@@ -471,7 +501,14 @@ fn send_keys(
     // which the person would feel on every key and wheel tick. It is safe because the app sending
     // these keys told us the run it views (`view`, kept by app_visible), which stops a hand-over of
     // the pane in between; the run check is also inside the tmux call that types.
-    let typed = while_run(core, &pane, run, &send_command(&pane, &keys), "")?;
+    let typed = while_run_via(
+        core,
+        watch.control(),
+        &pane,
+        run,
+        &send_command(&pane, &keys),
+        "",
+    )?;
     watch.heat(run);
     ensure!(
         typed,

@@ -7,43 +7,13 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
 /// The log of a computer's connection changes stays about this long; the newest lines are kept.
 const LOG_CAP: u64 = 1 << 20;
-
-/// Add a line to a log file (0600), and when the file is over `cap` bytes keep its newest half.
-fn append_capped(path: &Path, line: &str, cap: u64) {
-    let _ = (|| -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)?;
-        writeln!(f, "{line}")?;
-        if f.metadata()?.len() > cap {
-            let text = std::fs::read_to_string(path)?;
-            let mut keep = &text[text.len() - (cap / 2) as usize..];
-            // Start at a line: a cut can fall inside a character, or in the middle of a line.
-            keep = keep.split_once('\n').map_or("", |(_, rest)| rest);
-            let tmp = path.with_extension("tmp");
-            let mut out = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            out.write_all(keep.as_bytes())?;
-            std::fs::rename(&tmp, path)?;
-        }
-        Ok(())
-    })();
-}
 
 /// What the app tells a bridge to push for one cell: agent, run, width, height, scroll.
 pub type Watched = (String, String, u16, u16, usize);
@@ -168,13 +138,9 @@ impl Mach {
     /// One line in `app-machines.log`: UTC time, the computer, what changed, and why.
     fn note(&self, what: &str, why: &str) {
         let Some(path) = &self.log else { return };
-        let when = std::process::Command::new("date")
-            .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
+        let when = crate::utc_now();
         let clean = |s: &str| s.replace(['\n', '\t'], " ");
-        append_capped(
+        crate::append_capped(
             path,
             &format!(
                 "{when}\t{}\t{}\t{}",
@@ -425,7 +391,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let log = dir.path().join("app-machines.log");
         for i in 0..200 {
-            append_capped(&log, &format!("line {i:04} {}", "x".repeat(40)), 2000);
+            crate::append_capped(&log, &format!("line {i:04} {}", "x".repeat(40)), 2000);
         }
         let text = std::fs::read_to_string(&log).expect("log");
         assert!(text.len() <= 2000 + 60, "capped: {}", text.len());

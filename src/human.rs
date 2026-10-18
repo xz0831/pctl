@@ -113,8 +113,28 @@ impl Core {
         };
         let mut cmd = self.tmux_cmd();
         if let Some(outer) = outer {
-            cmd.env("TMUX", outer)
-                .args(["switch-client", "-t", &pane.pane]);
+            // Without -c tmux takes "the best client" of the session, which can be a control
+            // client of ours; the person's is the non-control client that was active last.
+            let person = self
+                .tm(&[
+                    "list-clients",
+                    "-f",
+                    crate::bridge::NOT_CONTROL,
+                    "-F",
+                    "#{client_activity} #{client_name}",
+                ])
+                .ok()
+                .and_then(|rows| {
+                    rows.lines()
+                        .filter_map(|l| l.split_once(' '))
+                        .max_by_key(|(t, _)| t.parse::<u64>().unwrap_or(0))
+                        .map(|(_, name)| name.to_string())
+                });
+            cmd.env("TMUX", outer).arg("switch-client");
+            if let Some(name) = &person {
+                cmd.args(["-c", name]);
+            }
+            cmd.args(["-t", &pane.pane]);
         } else {
             self.tm(&["select-window", "-t", &pane.window])?;
             self.tm(&["select-pane", "-t", &pane.pane])?;
