@@ -2065,8 +2065,12 @@ impl App {
         if !a.machine.is_empty() {
             return self.remote_keys(a.clone(), run, &parts);
         }
-        match bridge::type_keys(core, pane, run, &parts) {
-            Ok(true) => {}
+        match bridge::type_keys(core, self.control.clone(), pane, run, &parts) {
+            Ok(true) => {
+                if let Err(e) = bridge::record_input(core, pane, run) {
+                    self.say(format!("Typed into {}, but not recorded: {e:#}", a.name));
+                }
+            }
             Ok(false) => self.changed(&a),
             Err(e) => self.say(format!("Could not type into {}: {e:#}", a.name)),
         }
