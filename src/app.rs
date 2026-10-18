@@ -747,7 +747,8 @@ pub fn run(core: &Core) -> Result<()> {
                                     Err(e) => break Err(e),
                                 }
                                 if batch.len() >= 256
-                                    || !event::poll(Duration::ZERO).unwrap_or(false)
+                                    // Not ZERO: crossterm's /dev/tty reader skips its buffer for a zero timeout and answers false.
+                                    || !event::poll(Duration::from_millis(1)).unwrap_or(false)
                                 {
                                     break Ok(batch);
                                 }
