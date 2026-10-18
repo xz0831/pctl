@@ -769,7 +769,11 @@ pub fn act(core: &Core, req: &Value) -> Result<Value> {
             core.terminate(id, run)?;
         }
         "doc_open" => {
-            return Ok(json!({"name": core.doc_open(text("doc")?)?}));
+            let read = req.get("read").and_then(Value::as_bool).unwrap_or(true);
+            return Ok(json!({"name": core.doc_open_as(text("doc")?, read)?}));
+        }
+        "doc_read" => {
+            core.doc_read(text("doc")?)?;
         }
         "doc_close" => core.doc_close(text("agent")?)?,
         "new_tab" => {

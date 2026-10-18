@@ -96,6 +96,10 @@ def find(t, row=None, start=0):
         if (row is None or i + 1 == row) and t in line[start:]:
             return line.index(t, start) + 1 + len(t) // 2, i + 1
     raise AssertionError(f'{t!r} not on screen:\n{screen()}')
+def into_cell(name, under, how='Show in this cell'):
+    """An agent of another project into the cells on screen (a plain click follows its project): its menu."""
+    x, y = side(name, under); click(x, y, 2)
+    click(*find(how))
 def side(name, under):
     """The sidebar row of an agent listed below the project row `under`."""
     ls = lines(); start = next(i for i, l in enumerate(ls) if under in l[:26] and ('▾' in l[:26] or '▸' in l[:26]))
@@ -333,7 +337,7 @@ try:
         assert until(lambda: 'l-tick' in screen() and 'r-spin' in screen(), 20), screen()
         click(*side('l-tick', 'alpha')); assert until(lambda: 'tick 1' in screen()), screen()
         keys('C-b', '%'); time.sleep(0.5)
-        click(*side('r-spin', 'rproj')); assert until(lambda: 'spin' in screen().split('\n')[3] or 'r-spin' in status(), 5), screen()
+        into_cell('r-spin', 'rproj'); assert until(lambda: 'spin' in screen().split('\n')[3] or 'r-spin' in status(), 5), screen()
         late = []
         end = time.monotonic() + 5
         while time.monotonic() < end:

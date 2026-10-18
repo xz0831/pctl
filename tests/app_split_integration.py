@@ -65,6 +65,12 @@ def drag(x1, y1, x2, y2):
 def release(x, y): vt('send-keys', '-t', 'view', '-l', f'\x1b[<0;{x};{y}m'); time.sleep(0.4)
 def keys(*k): vt('send-keys', '-t', 'view', *k); time.sleep(0.4)
 def text(t): vt('send-keys', '-t', 'view', '-l', t); time.sleep(0.2)
+def into_cell(name, under=None, how='Show in this cell'):
+    """An agent of another project into the cells on screen (a plain click follows its project): its menu."""
+    x, y = side(name, under); click(x, y, 2)
+    for i, l in enumerate(lines()):
+        if how in l: return click(l.index(how) + 1, i + 1)
+    raise AssertionError(f'{how!r} not on screen:\n{screen()}')
 def side(name, under=None):
     """1-based (column, row) of an agent in the sidebar, under the project row `under` when given."""
     ls = lines(); start = 0
@@ -102,7 +108,7 @@ try:
         assert 'ready L in a-main' in cells()[2], 'the first cell keeps its agent'
     case('ctrl+b % splits right: a new empty cell with its placeholder, the agent resized to its cell', split_right)
     def two_agents():
-        click(*side('b-main'))
+        into_cell('b-main')
         assert until(lambda: tpos('b-main') >= 0 and 'ready L in b-main' in screen()), screen()
         assert until(lambda: all('app_visible' in cli('session', 'get', n)['swap_blockers'] for n in ('a-main', 'b-main')))
         assert 'app_visible' not in cli('session', 'get', 'a-two')['swap_blockers']
@@ -130,7 +136,7 @@ try:
     case('an agent already in a cell is focused, never shown twice; another agent replaces the focused cell', never_twice)
     def split_down_and_focus():
         app(); assert until(lambda: 'ready L in a-main' in screen())
-        keys('C-b', '%'); click(*side('b-main')); assert until(lambda: tpos('b-main') >= 0), titles()
+        keys('C-b', '%'); into_cell('b-main'); assert until(lambda: tpos('b-main') >= 0), titles()
         keys('C-b', '"'); click(*side('a-two'))
         assert until(lambda: any(re.search(r' a-two [●!]', l) for l in cells()[3:])), screen()
         say('a-two', 'in-a-two')
@@ -241,7 +247,7 @@ while True:
         app(machines_on=True)
         assert until(lambda: 'rproj' in screen() and 'r-main' in screen()), screen()
         keys('C-b', '%')
-        click(*side('r-main'))
+        into_cell('r-main')
         assert until(lambda: tpos('r-main') >= 0 and 'rm · r-main' in titles() and f'{HOST} · a-two' in titles() and 'ready R in r-main' in screen()), titles() + '\n' + screen()
         say('r-main', 'to-remote', st=remote); assert 'to-remote' not in read('a-two')
         keys('C-b', 'Left'); say('a-two', 'to-local'); assert 'to-local' not in read('r-main', st=remote)

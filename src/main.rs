@@ -149,6 +149,10 @@ enum Cmd {
         /// Mark a document read (the app does this when the person opens it).
         #[arg(long, value_name = "ID", conflicts_with = "path")]
         read: Option<String>,
+        /// Ask the person's app to open it: beside this session's cell (without moving focus), or
+        /// as a tab of the project. Pictures are recorded but not opened.
+        #[arg(long, value_parser = pctl::docs::OPEN_WAYS, conflicts_with_all = ["answer", "list", "read"])]
+        open: Option<String>,
     },
     Skill {
         #[command(subcommand)]
@@ -1311,6 +1315,7 @@ fn run() -> Result<()> {
             answer,
             list,
             read,
+            open,
         } => {
             if let Some(a) = answer {
                 let mut text = a[1].clone();
@@ -1333,12 +1338,18 @@ fn run() -> Result<()> {
                 let path = path.context(
                     "usage: pctl show <file|folder> | --list | --answer <req-id> <text>",
                 )?;
-                print(&core.doc_show(
+                let doc = core.doc_show(
                     &path,
                     title.as_deref(),
                     note.as_deref(),
                     project.as_deref(),
-                )?)?
+                    open.as_deref(),
+                )?;
+                let mut out = serde_json::to_value(&doc)?;
+                if open.is_some() && doc.open.is_none() {
+                    out["open_refused"] = json!("pictures open in the page (later)");
+                }
+                print(&out)?
             }
         }
         Cmd::Skill { cmd } => match cmd {

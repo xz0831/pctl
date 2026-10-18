@@ -13,6 +13,9 @@ pub struct DocRow {
     pub by: Option<String>,
     pub new: bool,
     pub shown: u64,
+    /// How the showing agent asked for it to open ("beside" or "tab"), and which ask this is.
+    pub open: Option<String>,
+    pub open_seq: u64,
 }
 
 /// The `docs` of a `list` answer.
@@ -35,6 +38,8 @@ pub fn parse(machine: &str, answer: &Value) -> Vec<DocRow> {
                 by: d["by"].as_str().map(String::from),
                 new: d["new"].as_bool().unwrap_or(false),
                 shown: d["shown"].as_u64().unwrap_or(0),
+                open: d["open"].as_str().map(String::from),
+                open_seq: d["open_seq"].as_u64().unwrap_or(0),
             })
         })
         .collect()
@@ -90,6 +95,8 @@ mod tests {
             by: Some("p-main".into()),
             new,
             shown,
+            open: None,
+            open_seq: 0,
         }
     }
 

@@ -251,6 +251,10 @@ enum Hit {
     /// The "more" line at the top (true) or bottom of a sidebar that does not fit.
     SideMore(bool),
     Menu(usize),
+    /// The × at the end of a cell's title row.
+    CloseCell(u32),
+    /// A document opened as a tab.
+    DocTab(Id),
     Field(usize),
     Choice(usize, usize),
     Submit,
@@ -272,6 +276,11 @@ enum Act {
     Reconnect(String),
     /// A command on the focused cell, from the agent menu.
     Cell(Action),
+    /// Show the agent in the focused cell / in a new cell right of it, whatever its project.
+    ShowHere(Id),
+    ShowBeside(Id),
+    /// Take a document tab off the bar.
+    CloseDocTab(Id),
 }
 
 struct Field {
@@ -474,6 +483,10 @@ enum Then {
     Form(Id, String),
     /// A document's reader is running: put it in a cell.
     Doc(DocRow),
+    /// A reader started because an agent asked for it beside itself.
+    Beside(DocRow),
+    /// A reader started because the person picked a document tab.
+    DocTab(DocRow),
 }
 
 struct App {
@@ -533,6 +546,16 @@ struct App {
     doc_notified: HashMap<Id, Instant>,
     /// Document readers whose cell went, to be ended.
     ending: Vec<Id>,
+    /// The `open_seq` of each document seen, so an ask to open is acted on once.
+    open_seen: HashMap<Id, u64>,
+    /// Documents an agent asked to open, started in the loop (it needs the core).
+    asked: Vec<DocRow>,
+    /// Documents opened as a tab of their project, in the order asked.
+    doc_tabs: Vec<Id>,
+    /// The cell opened beside an agent for its documents.
+    beside: HashMap<Id, u32>,
+    /// Documents whose cell the person focused while they were new: marked read in the loop.
+    reads: Vec<Id>,
     /// Keys typed in the events just read, for the agent they were typed to: text to send with
     /// `-l` (true) or a key name. They go out as one tmux call, see `flush_typed`.
     typed: Option<(Agent, Vec<(bool, String)>)>,
@@ -581,6 +604,9 @@ fn view_cell(term: Rect, skip: u16, rows: usize, column: u16, row: u16) -> term:
     let r = row.saturating_sub(term.y) as usize + skip as usize;
     (r.min(rows.saturating_sub(1)) as u16, col)
 }
+
+/// Width of the × at the end of a cell's title row.
+const CLOSE_W: u16 = 3;
 
 /// The agent name as it goes into an escape sequence: no control characters, no `;`.
 fn sanitize(name: &str) -> String {
@@ -804,6 +830,8 @@ pub fn run(core: &Core) -> Result<()> {
             dirty |= app.capture_due(core);
             if !std::mem::take(&mut pushed_only) {
                 dirty |= app.end_viewers(core);
+                dirty |= app.open_asked(core);
+                dirty |= app.read_docs(core);
                 app.sync_watches();
                 for machine in &app.machines {
                     if machine.unusable().is_some() {
@@ -937,6 +965,11 @@ impl App {
             docs: vec![],
             doc_notified: HashMap::new(),
             ending: vec![],
+            open_seen: HashMap::new(),
+            asked: vec![],
+            doc_tabs: vec![],
+            beside: HashMap::new(),
+            reads: vec![],
             project: None,
             tab: HashMap::new(),
             collapsed: HashSet::new(),
@@ -1197,7 +1230,9 @@ impl App {
                         if form {
                             self.modal = None;
                         }
-                        self.say(ok);
+                        if !ok.is_empty() {
+                            self.say(ok);
+                        }
                         self.after(then);
                     }
                 }
@@ -1278,6 +1313,22 @@ impl App {
             self.docs.extend(docs);
         }
         let watched = self.machines[mi].loaded;
+        // An ask to open (`pctl show --open`) is acted on once. A computer seen for the first
+        // time only sets the baseline: shows from before the app started open nothing.
+        let mut asks = vec![];
+        for d in self
+            .docs
+            .iter()
+            .filter(|d| d.machine == u.machine && d.open.is_some())
+        {
+            let before = self
+                .open_seen
+                .insert(Id::new(&d.machine, &d.id), d.open_seq);
+            if watched && d.open_seq > before.unwrap_or(0) {
+                asks.push(d.clone());
+            }
+        }
+        self.asked.extend(asks);
         self.machines[mi].loaded = true;
         self.machines[mi].connected = u.connected;
         self.machines[mi].projects = u.projects;
@@ -1571,6 +1622,8 @@ impl App {
             self.tree.focus = i;
             self.sel = None;
             self.in_sidebar = false;
+            let cell = *self.tree.focused();
+            self.note_read(cell);
         }
     }
     fn focus_pane(&mut self, id: u32) {
@@ -1591,8 +1644,17 @@ impl App {
         }
     }
     fn close_cell(&mut self) {
+        self.close_at(self.tree.focus)
+    }
+    /// Close the cell with this number (the × of its title row).
+    fn close_pane(&mut self, id: u32) {
+        if let Some(i) = self.tree.leaves().iter().position(|p| **p == id) {
+            self.close_at(i);
+        }
+    }
+    fn close_at(&mut self, i: usize) {
         let leaves: Vec<u32> = self.tree.leaves().into_iter().copied().collect();
-        match self.tree.close(self.tree.focus) {
+        match self.tree.close(i) {
             Some(id) => {
                 // Only the view goes; the agent keeps running in its tmux window.
                 let gone = self.panes.remove(&id).and_then(|p| p.agent);
@@ -1677,6 +1739,22 @@ impl App {
             }
         }
     }
+    /// Show the agent in the focused cell, whatever its project (the project on screen stays).
+    fn show_here(&mut self, id: &Id) {
+        self.show_agent(id);
+        self.laid_out();
+    }
+    /// Show the agent in a new cell right of the focused one, whatever its project.
+    fn show_beside(&mut self, id: &Id) {
+        if self.pane_of(id).is_some() {
+            return self.show_agent(id);
+        }
+        let before = self.tree.len();
+        self.split(Dir::Right);
+        if self.tree.len() > before {
+            self.show_agent(id);
+        }
+    }
     fn open_agent(&mut self, id: &Id) {
         if let Some(a) = self
             .agents
@@ -1687,11 +1765,9 @@ impl App {
             let project = a.project_id();
             self.collapsed.remove(&project);
             self.tab.insert(project.clone(), a.name.clone());
-            // With one cell the project follows the agent, as it always did; with several, the
-            // agent comes into the focused cell and the project stays.
-            if self.tree.len() == 1 {
-                self.set_project(Some(project));
-            }
+            // The project follows the agent, with the cells that project had. To put an agent of
+            // another project into the cells on screen, use "Show in this cell" / "Show beside".
+            self.set_project(Some(project));
             self.show_agent(&a.id());
             self.sel = None;
         }
@@ -2474,7 +2550,7 @@ impl App {
                         if let Some(h) = hit {
                             // A double-click on an agent or its tab opens its menu, like a
                             // right-click: some terminals (MATE Terminal) keep the right button.
-                            let double = matches!(h, Hit::Agent(_) | Hit::Tab(_))
+                            let double = matches!(h, Hit::Agent(_) | Hit::Tab(_) | Hit::Title(_))
                                 && self.last_click.as_ref().is_some_and(|(t, last)| {
                                     *last == h && t.elapsed() < Duration::from_millis(400)
                                 });
@@ -2490,6 +2566,10 @@ impl App {
                                     let at = self.cell_at(id, m.column, m.row);
                                     self.sel = Some((id, at, at));
                                 }
+                                Hit::Title(id) if double => {
+                                    self.focus_pane(id);
+                                    self.cell_menu(id, m.column, m.row)
+                                }
                                 Hit::Title(id) => self.focus_pane(id),
                                 Hit::Divider(d) => self.dragging = Some((d, false)),
                                 h => self.click(core, h),
@@ -2500,6 +2580,19 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Right) if self.modal.is_none() => match hit {
                 Some(Hit::Agent(a) | Hit::Tab(a)) => self.agent_menu(&a, m.column, m.row),
+                Some(Hit::Title(id) | Hit::CloseCell(id)) => {
+                    self.focus_pane(id);
+                    self.cell_menu(id, m.column, m.row)
+                }
+                Some(Hit::DocTab(d)) => {
+                    self.modal = Some(Modal::Menu {
+                        title: "Document".into(),
+                        items: vec![("Close tab".into(), Act::CloseDocTab(d))],
+                        x: m.column,
+                        y: m.row,
+                        sel: 0,
+                    })
+                }
                 Some(Hit::Project(p) | Hit::NewAgent(p) | Hit::NewTab(p)) => {
                     self.modal = Some(Modal::Menu {
                         title: p.name.clone(),
@@ -2617,6 +2710,11 @@ impl App {
                 self.open_doc(core, &d);
                 self.in_sidebar = false;
             }
+            Hit::DocTab(d) => {
+                self.open_doc_tab(core, &d);
+                self.in_sidebar = false;
+            }
+            Hit::CloseCell(id) => self.close_pane(id),
             Hit::NewAgent(p) => self.agent_form(&p),
             Hit::NewTab(p) => self.new_tab(core, &p),
             Hit::NewProject => self.project_form(),
@@ -2666,6 +2764,48 @@ impl App {
         }
     }
 
+    /// The menu of a cell's title row. The cell has the focus, so the cell commands act on it.
+    fn cell_menu(&mut self, id: u32, x: u16, y: u16) {
+        if !self.panes.contains_key(&id) {
+            return;
+        }
+        let reader = self.agent_in(id).is_some_and(|a| a.viewer);
+        let title = match self.agent_in(id) {
+            Some(a) if a.viewer => self
+                .doc_of(a)
+                .map_or("Document".to_string(), |d| d.title.clone()),
+            Some(a) => a.name.clone(),
+            None => "Cell".to_string(),
+        };
+        let label = |text: &str, action: Action| format!("{text}   {}", self.keys.label(action));
+        let mut items = vec![];
+        if reader {
+            items.push((
+                label("Close (the document stays)", Action::CloseCell),
+                Act::Cell(Action::CloseCell),
+            ));
+        } else {
+            items.push((
+                label("Close cell", Action::CloseCell),
+                Act::Cell(Action::CloseCell),
+            ));
+            items.push((
+                label("Split right", Action::SplitRight),
+                Act::Cell(Action::SplitRight),
+            ));
+            items.push((
+                label("Split down", Action::SplitDown),
+                Act::Cell(Action::SplitDown),
+            ));
+        }
+        self.modal = Some(Modal::Menu {
+            title,
+            items,
+            x,
+            y,
+            sel: 0,
+        });
+    }
     fn agent_menu(&mut self, id: &Id, x: u16, y: u16) {
         let Some(a) = self
             .agents
@@ -2693,6 +2833,12 @@ impl App {
             "New agent in this project".to_string(),
             Act::NewAgent(a.project_id()),
         ));
+        // The cells on screen may mix projects and computers: these two put the agent in them
+        // without switching to its project, as a plain click does.
+        if self.project.is_some() && self.current().is_none_or(|c| c.id() != *id) {
+            items.push(("Show in this cell".to_string(), Act::ShowHere(a.id())));
+            items.push(("Show beside".to_string(), Act::ShowBeside(a.id())));
+        }
         // The cell commands act on the focused cell, so only the agent in it offers them.
         if self.current().is_some_and(|c| c.id() == *id) {
             let mut cell = |text: &str, action: Action| {
@@ -2813,7 +2959,9 @@ impl App {
         if machine.is_empty() {
             match bridge::act(core, &req) {
                 Ok(_) => {
-                    self.say(ok);
+                    if !ok.is_empty() {
+                        self.say(ok);
+                    }
                     self.after(then);
                 }
                 Err(e) => self.say(format!("{e:#}")),
@@ -2869,6 +3017,18 @@ impl App {
             }
             Act::Cell(action) => {
                 self.action(core, *action);
+                return;
+            }
+            Act::ShowHere(a) => {
+                self.show_here(a);
+                return;
+            }
+            Act::ShowBeside(a) => {
+                self.show_beside(a);
+                return;
+            }
+            Act::CloseDocTab(d) => {
+                self.doc_tabs.retain(|t| t != d);
                 return;
             }
             Act::Reconnect(m) => {
@@ -2940,6 +3100,8 @@ impl App {
         match then {
             Then::Opened(p, name) | Then::Form(p, name) => self.opened(&p, &name),
             Then::Doc(d) => self.doc_opened(&d),
+            Then::Beside(d) => self.beside_opened(&d),
+            Then::DocTab(d) => self.doc_tab_opened(&d),
             Then::Nothing => {}
         }
     }
@@ -3010,6 +3172,199 @@ impl App {
         self.sel = None;
         self.recapture();
         self.poke_machine(&d.machine);
+    }
+    /// List a reader at once, even if the next refresh does not have it yet.
+    fn add_viewer(&mut self, d: &DocRow) -> Id {
+        let viewer = Id::new(&d.machine, &crate::docs::viewer_name(&d.id));
+        if !self.agents.iter().any(|a| a.id() == viewer) {
+            let a = Agent {
+                machine: viewer.machine.clone(),
+                name: viewer.name.clone(),
+                project: d.project.clone(),
+                status: "starting".into(),
+                pane: None,
+                run: None,
+                queued: 0,
+                viewer: true,
+                stale: false,
+            };
+            self.fresh.insert(a.id(), (a.clone(), Instant::now()));
+            self.agents.push(a);
+        }
+        viewer
+    }
+    /// The document a reader shows.
+    fn doc_of(&self, viewer: &Agent) -> Option<&DocRow> {
+        self.docs
+            .iter()
+            .find(|d| d.machine == viewer.machine && crate::docs::viewer_name(&d.id) == viewer.name)
+    }
+    /// A new cell right of cell `of`, with the focus, the sidebar and the selection left as they
+    /// were: nothing an agent asked for moves the person's keyboard.
+    fn split_beside(&mut self, of: u32) -> Option<u32> {
+        let (keep, in_sidebar, side_sel) = (self.focused(), self.in_sidebar, self.side_sel);
+        self.focus_pane(of);
+        let id = self.new_pane(None);
+        let made = self.tree.split(Dir::Right, id);
+        if made {
+            self.laid_out();
+        } else {
+            self.panes.remove(&id);
+        }
+        self.focus_pane(keep);
+        (self.in_sidebar, self.side_sel) = (in_sidebar, side_sel);
+        made.then_some(id)
+    }
+    /// An agent asked for documents to open (`pctl show --open`). Beside: the reader starts and
+    /// comes in a cell right of the agent's own, when that is on screen and there is room; else, and
+    /// for a tab, the document becomes a tab of its project. No focus moves.
+    fn open_asked(&mut self, core: &Core) -> bool {
+        let asked = std::mem::take(&mut self.asked);
+        for d in &asked {
+            if !self.can_open_beside(d) {
+                self.add_doc_tab(d);
+                continue;
+            }
+            let req = json!({"action": "doc_open", "doc": d.id, "read": false});
+            let ok = format!(
+                "{} opened {}",
+                d.by.as_deref().unwrap_or("An agent"),
+                d.title
+            );
+            self.act_on(core, &d.machine.clone(), req, ok, Then::Beside(d.clone()));
+        }
+        !asked.is_empty()
+    }
+    /// Whether a document asked for "beside" can come in a cell now: the agent's cell is on
+    /// screen, and there is room or the agent's earlier document has a cell to take over.
+    fn can_open_beside(&self, d: &DocRow) -> bool {
+        let Some(by) = d.by.as_ref().map(|b| Id::new(&d.machine, b)) else {
+            return false;
+        };
+        d.open.as_deref() == Some("beside")
+            && self.pane_of(&by).is_some()
+            && (self.beside_cell(&by).is_some() || self.tree.len() < layout::MAX_CELLS)
+    }
+    fn add_doc_tab(&mut self, d: &DocRow) {
+        let id = Id::new(&d.machine, &d.id);
+        if !self.doc_tabs.contains(&id) {
+            self.doc_tabs.push(id);
+        }
+        self.say(format!(
+            "{} put {} in the tabs of {}",
+            d.by.as_deref().unwrap_or("An agent"),
+            d.title,
+            d.project
+        ));
+    }
+    /// The cell opened beside this agent for its documents, while it still shows a reader.
+    fn beside_cell(&self, agent: &Id) -> Option<u32> {
+        let cell = *self.beside.get(agent)?;
+        let shows_reader = self.tree.leaves().iter().any(|p| **p == cell)
+            && self.agent_in(cell).is_some_and(|a| a.viewer);
+        shows_reader.then_some(cell)
+    }
+    /// The reader asked for beside an agent is running: it takes the cell that agent's earlier
+    /// document has, else a new cell right of the agent's own.
+    fn beside_opened(&mut self, d: &DocRow) {
+        let viewer = self.add_viewer(d);
+        if self.pane_of(&viewer).is_some() {
+            return;
+        }
+        let by = d.by.as_ref().map(|b| Id::new(&d.machine, b));
+        let cell = match by.as_ref().and_then(|b| self.beside_cell(b)) {
+            Some(cell) => Some(cell),
+            None => by
+                .as_ref()
+                .and_then(|b| self.pane_of(b))
+                .and_then(|of| self.split_beside(of)),
+        };
+        let (Some(by), Some(cell)) = (by, cell) else {
+            // No room after all (the agent left the screen while the reader started).
+            self.ending.push(viewer);
+            return self.add_doc_tab(d);
+        };
+        let pane = self.panes.entry(cell).or_default();
+        let old = pane.agent.replace(viewer);
+        pane.view.next = None;
+        self.release(old);
+        self.beside.insert(by, cell);
+        self.recapture();
+    }
+    /// The person picked a document tab.
+    fn open_doc_tab(&mut self, core: &Core, id: &Id) {
+        let Some(d) = self
+            .docs
+            .iter()
+            .find(|d| d.machine == id.machine && d.id == id.name)
+            .cloned()
+        else {
+            return;
+        };
+        let viewer = Id::new(&d.machine, &crate::docs::viewer_name(&d.id));
+        if let Some(cell) = self.pane_of(&viewer) {
+            return self.focus_pane(cell);
+        }
+        let req = json!({"action": "doc_open", "doc": d.id});
+        let ok = format!("Opened {}", d.title);
+        self.act_on(core, &d.machine.clone(), req, ok, Then::DocTab(d));
+    }
+    /// The reader of a tab is running: it takes the focused cell, no split.
+    fn doc_tab_opened(&mut self, d: &DocRow) {
+        let viewer = self.add_viewer(d);
+        if let Some(cell) = self.pane_of(&viewer) {
+            self.focus_pane(cell);
+        } else {
+            let pane = self.panes.entry(self.focused()).or_default();
+            let old = pane.agent.replace(viewer);
+            pane.view.next = None;
+            self.release(old);
+        }
+        for doc in self
+            .docs
+            .iter_mut()
+            .filter(|x| x.machine == d.machine && x.id == d.id)
+        {
+            doc.new = false;
+        }
+        self.sel = None;
+        self.recapture();
+        self.poke_machine(&d.machine);
+    }
+    /// The person focused a cell with a document that is still new: it is read.
+    fn note_read(&mut self, cell: u32) {
+        let Some(d) = self
+            .agent_in(cell)
+            .filter(|a| a.viewer)
+            .and_then(|a| self.doc_of(a))
+            .filter(|d| d.new)
+        else {
+            return;
+        };
+        let id = Id::new(&d.machine, &d.id);
+        if !self.reads.contains(&id) {
+            self.reads.push(id);
+        }
+    }
+    /// Tell the computers which documents the person has now looked at.
+    fn read_docs(&mut self, core: &Core) -> bool {
+        let reads = std::mem::take(&mut self.reads);
+        for id in &reads {
+            for doc in self
+                .docs
+                .iter_mut()
+                .filter(|x| x.machine == id.machine && x.id == id.name)
+            {
+                doc.new = false;
+            }
+            if id.machine.is_empty() {
+                let _ = core.doc_read(&id.name);
+            } else {
+                // The answer is not waited for: the next list says whether it was read.
+                let _ = self.request(&id.machine, json!({"op": "doc_read", "doc": id.name}), None);
+            }
+        }
+        !reads.is_empty()
     }
     /// An agent just added: listed at once, even if the next refresh does not have it yet, and
     /// shown in its project.
@@ -3650,6 +4005,47 @@ impl App {
             self.hit(rect, Hit::Tab(a.id()));
             x += w + 1;
         }
+        // Documents an agent asked to have as tabs of this project.
+        let docs: Vec<DocRow> = self
+            .doc_tabs
+            .iter()
+            .filter_map(|t| {
+                self.docs
+                    .iter()
+                    .find(|d| d.machine == t.machine && d.id == t.name)
+            })
+            .filter(|d| d.machine == project.machine && d.project == project.name)
+            .cloned()
+            .collect();
+        let shown = self
+            .agent_in(self.focused())
+            .and_then(|a| self.doc_of(a))
+            .map(|d| d.id.clone());
+        for d in &docs {
+            let label = format!(" 📄 {} ", fit(&d.title, 24));
+            let w = label.chars().count() as u16 + 1;
+            if x + w + 3 > r.x + r.width {
+                break;
+            }
+            let on = shown.as_deref() == Some(d.id.as_str());
+            let st = match (on, d.new) {
+                (true, _) => Style::default()
+                    .fg(p.text)
+                    .bg(p.raised)
+                    .add_modifier(Modifier::BOLD),
+                (false, true) => Style::default().fg(p.accent).bg(p.panel),
+                (false, false) => Style::default().fg(p.muted).bg(p.panel),
+            };
+            let rect = Rect {
+                x,
+                y: r.y,
+                width: w,
+                height: 1,
+            };
+            f.render_widget(Paragraph::new(label).style(st), rect);
+            self.hit(rect, Hit::DocTab(Id::new(&d.machine, &d.id)));
+            x += w + 1;
+        }
         let plus = Rect {
             x,
             y: r.y,
@@ -3761,6 +4157,14 @@ impl App {
                 let title = Rect { height: 1, ..outer };
                 self.hit(title, Hit::Title(id));
                 self.render_title(f, id, title, id == focus);
+                if title.width >= CLOSE_W * 3 {
+                    let x = Rect {
+                        x: title.x + title.width - CLOSE_W,
+                        width: CLOSE_W,
+                        ..title
+                    };
+                    self.hit(x, Hit::CloseCell(id));
+                }
             }
             self.render_pane(f, id, inner, &project, !titled);
         }
@@ -3821,15 +4225,21 @@ impl App {
         } else {
             Style::default().fg(p.muted).bg(p.panel)
         };
-        let mut spans = vec![Span::styled(
-            fit(&text, r.width.saturating_sub(2) as usize),
-            base,
-        )];
+        let room = r.width.saturating_sub(2 + CLOSE_W) as usize;
+        let mut spans = vec![Span::styled(fit(&text, room), base)];
         if let Some((g, gs)) = glyph {
             spans.push(Span::styled(g, if focused { base } else { gs.bg(p.panel) }));
         }
         f.render_widget(Block::default().style(base), r);
         f.render_widget(Paragraph::new(Line::from(spans)), r);
+        if r.width >= CLOSE_W * 3 {
+            let x = Rect {
+                x: r.x + r.width - CLOSE_W,
+                width: CLOSE_W,
+                ..r
+            };
+            f.render_widget(Paragraph::new(" × ").style(base), x);
+        }
     }
 
     /// What one cell holds. `lone`: it is the only thing on screen, so it also says what the
@@ -4145,6 +4555,9 @@ impl App {
                     ),
                     Line::from(
                         "Some terminals (MATE Terminal) keep the right button: double-click or press ctrl+b m.",
+                    ),
+                    Line::from(
+                        "Cells: right-click (or double-click) a cell's title, or press its ×, to close it; an agent's menu can show it here or beside.",
                     ),
                     Line::from(
                         "States (● idle or working, ! waiting for you, × exited, ○ stopped) are read from",
@@ -4697,10 +5110,22 @@ mod tests {
         assert_eq!(app.tree.len(), 1);
         app.set_project(Some(Id::new("", "p")));
         assert_eq!(app.tree.len(), 2, "p's two cells came back");
-        // With several, an agent of another project goes into the focused cell and the project stays.
+        // A plain open of an agent of another project follows it, with that project's cells.
         app.open_agent(&a_id("b"));
+        assert_eq!(app.project, Some(Id::new("", "q")));
+        assert_eq!(in_cells(&app), [name("b")]);
+        app.set_project(Some(Id::new("", "p")));
+        assert_eq!(app.tree.len(), 2, "p's cells are still there");
+        // "Show in this cell": into the focused cell, the project on screen stays.
+        app.show_here(&a_id("b"));
         assert_eq!(app.project, Some(Id::new("", "p")));
         assert_eq!(in_cells(&app), [name("a"), name("b")]);
+        // "Show beside": a new cell right of the focused one.
+        app.agents.push(agent_on("", "c", "idle"));
+        app.agents.last_mut().unwrap().project = "r".into();
+        app.show_beside(&a_id("c"));
+        assert_eq!(app.project, Some(Id::new("", "p")));
+        assert_eq!(in_cells(&app), [name("a"), name("b"), name("c")]);
         // A single cell whose agent has left the list shows the project's tab again.
         let mut app = app_with(&["a", "b"]);
         app.tab.insert(Id::new("", "p"), "a".into());
@@ -4783,6 +5208,8 @@ mod tests {
             by: Some(by.into()),
             new,
             shown: 1,
+            open: None,
+            open_seq: 0,
         }
     }
     fn viewer_of(id: &str) -> Agent {
@@ -4866,6 +5293,162 @@ mod tests {
         assert_eq!(in_cells(&app), [name("a"), name("b")]);
         assert_eq!(app.ending, [Id::new("", &viewer)]);
     }
+    fn ask(id: &str, by: &str, way: &str, seq: u64) -> Value {
+        json!({"id": id, "project": "p", "title": format!("Doc {id}"), "by": by, "new": true,
+            "shown": seq, "open": way, "open_seq": seq})
+    }
+    fn list_with(docs: Vec<Value>) -> Update {
+        Update::from_list(
+            "",
+            Ok(
+                json!({"sessions": [], "projects": [{"name": "p", "root": "/"}],
+                "connected": true, "docs": docs}),
+            ),
+        )
+    }
+    #[test]
+    fn an_ask_to_open_is_acted_on_once_and_not_for_what_was_there_at_start() {
+        let mut app = app_with(&["a"]);
+        app.machines[0].loaded = false;
+        // First sight of the computer: the shows from before open nothing.
+        app.apply(list_with(vec![ask("d0", "a", "beside", 1)]));
+        assert!(app.asked.is_empty());
+        // The same list again, and a document that was not asked: nothing.
+        app.apply(list_with(vec![ask("d0", "a", "beside", 1)]));
+        assert!(app.asked.is_empty());
+        // A new show, then a second show of the same file (the sequence grew).
+        app.apply(list_with(vec![
+            ask("d0", "a", "beside", 1),
+            ask("d1", "a", "tab", 1),
+        ]));
+        assert_eq!(
+            app.asked.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            ["d1"]
+        );
+        app.asked.clear();
+        app.apply(list_with(vec![
+            ask("d0", "a", "beside", 2),
+            ask("d1", "a", "tab", 1),
+        ]));
+        assert_eq!(
+            app.asked
+                .iter()
+                .map(|d| (d.id.as_str(), d.open_seq))
+                .collect::<Vec<_>>(),
+            [("d0", 2)]
+        );
+        // Reading the same answer again asks nothing more.
+        app.asked.clear();
+        app.apply(list_with(vec![
+            ask("d0", "a", "beside", 2),
+            ask("d1", "a", "tab", 1),
+        ]));
+        assert!(app.asked.is_empty());
+    }
+    #[test]
+    fn a_document_beside_an_agent_moves_no_focus_and_the_next_one_takes_its_cell() {
+        let mut app = app_with(&["a", "b"]);
+        app.open_agent(&a_id("a"));
+        app.split(Dir::Right);
+        app.show_here(&a_id("b"));
+        app.focus_index(1);
+        app.in_sidebar = true;
+        app.side_sel = 3;
+        let d1 = DocRow {
+            open: Some("beside".into()),
+            open_seq: 1,
+            ..doc_row("d1", "a", true)
+        };
+        app.docs = vec![d1.clone()];
+        assert!(app.can_open_beside(&d1));
+        app.beside_opened(&d1);
+        let v1 = crate::docs::viewer_name("d1");
+        assert_eq!(
+            in_cells(&app),
+            [name("a"), name(&v1), name("b")],
+            "right of a's cell"
+        );
+        assert_eq!(
+            app.current().map(|x| x.name.clone()),
+            Some("b".to_string()),
+            "focus stayed"
+        );
+        assert_eq!(
+            (app.in_sidebar, app.side_sel),
+            (true, 3),
+            "the sidebar stayed"
+        );
+        assert!(app.docs[0].new, "still unread");
+        // A second document of the same agent takes that cell; the first reader ends.
+        let d2 = DocRow {
+            open: Some("beside".into()),
+            open_seq: 1,
+            ..doc_row("d2", "a", true)
+        };
+        app.docs.push(d2.clone());
+        app.beside_opened(&d2);
+        let v2 = crate::docs::viewer_name("d2");
+        assert_eq!(in_cells(&app), [name("a"), name(&v2), name("b")]);
+        assert_eq!(app.ending, [Id::new("", &v1)]);
+        // Looking at its cell reads it.
+        app.focus_pane(app.pane_of(&Id::new("", &v2)).unwrap());
+        assert_eq!(app.reads, [Id::new("", "d2")]);
+    }
+    #[test]
+    fn beside_needs_the_agents_cell_on_screen_and_room_else_it_is_a_tab() {
+        let mut app = app_with(&["a", "b"]);
+        app.open_agent(&a_id("a"));
+        let d = DocRow {
+            open: Some("beside".into()),
+            open_seq: 1,
+            ..doc_row("d1", "b", true)
+        };
+        assert!(!app.can_open_beside(&d), "b is not on screen");
+        let tab = DocRow {
+            open: Some("tab".into()),
+            ..doc_row("d2", "a", true)
+        };
+        assert!(!app.can_open_beside(&tab), "a tab is never a cell");
+        let by_a = DocRow {
+            open: Some("beside".into()),
+            ..doc_row("d3", "a", true)
+        };
+        assert!(app.can_open_beside(&by_a));
+        while app.tree.len() < layout::MAX_CELLS {
+            app.split(Dir::Right);
+            app.show_here(&a_id("b"));
+        }
+        app.show_here(&a_id("a"));
+        assert!(!app.can_open_beside(&by_a), "no room");
+        app.docs = vec![d.clone()];
+        app.add_doc_tab(&d);
+        assert_eq!(app.doc_tabs, [Id::new("", "d1")]);
+        app.add_doc_tab(&d);
+        assert_eq!(app.doc_tabs.len(), 1);
+    }
+    #[test]
+    fn the_x_and_the_menu_close_a_cell_and_end_a_reader() {
+        let mut app = app_with(&["a", "b"]);
+        app.open_agent(&a_id("a"));
+        app.split(Dir::Right);
+        app.show_here(&a_id("b"));
+        let b_cell = app.focused();
+        app.close_pane(b_cell);
+        assert_eq!(in_cells(&app), [name("a")]);
+        app.close_pane(app.focused());
+        assert_eq!(in_cells(&app).len(), 1, "the last cell stays");
+        // A reader's cell: closing it ends the reader and nothing else.
+        app.docs = vec![doc_row("d1", "a", false)];
+        let d = app.docs[0].clone();
+        app.split(Dir::Right);
+        app.doc_tab_opened(&d);
+        let v = Id::new("", &crate::docs::viewer_name("d1"));
+        assert!(app.pane_of(&v).is_some());
+        let cell = app.pane_of(&v).unwrap();
+        app.close_pane(cell);
+        assert_eq!(app.ending, [v]);
+        assert_eq!(in_cells(&app), [name("a")]);
+    }
     #[test]
     fn a_failed_list_keeps_the_documents_shown() {
         let mut app = app_with(&["a"]);
@@ -4879,7 +5462,7 @@ mod tests {
         app.agents.push(agent_on("rm", "r", "idle"));
         app.open_agent(&a_id("a"));
         app.split(Dir::Right);
-        app.open_agent(&Id::new("rm", "r"));
+        app.show_here(&Id::new("rm", "r"));
         assert_eq!(app.current().map(|a| a.id()), Some(Id::new("rm", "r")));
         app.focus_index(0);
         assert_eq!(app.current().map(|a| a.id()), Some(a_id("a")));
