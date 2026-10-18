@@ -33,6 +33,13 @@ pub struct Doc {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     pub shown: u64,
+    /// How the showing agent asked the person's app to open it: "beside" or "tab". The app acts
+    /// once per `open_seq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<String>,
+    /// Counts the shows that carried `open`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub open_seq: u64,
     pub host: String,
     /// Not opened by the person yet (or changed since).
     pub new: bool,
@@ -41,6 +48,20 @@ pub struct Doc {
     /// The version before the latest, when the file changed between two shows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<Previous>,
+}
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+/// The ways `pctl show --open` can ask an app to open a document.
+pub const OPEN_WAYS: [&str; 2] = ["beside", "tab"];
+/// A picture: the reader is text, so it cannot open one (the page will).
+pub fn is_picture(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        [
+            "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "tiff",
+        ]
+        .contains(&e.to_ascii_lowercase().as_str())
+    })
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Previous {
@@ -202,8 +223,9 @@ impl Core {
         title: Option<&str>,
         note: Option<&str>,
         project: Option<&str>,
+        open: Option<&str>,
     ) -> Result<Doc> {
-        self.doc_show_within(path, title, note, project, MAX_COPY)
+        self.doc_show_within(path, title, note, project, open, MAX_COPY)
     }
     fn doc_show_within(
         &self,
@@ -211,8 +233,13 @@ impl Core {
         title: Option<&str>,
         note: Option<&str>,
         project: Option<&str>,
+        open: Option<&str>,
         cap: u64,
     ) -> Result<Doc> {
+        ensure!(
+            open.is_none_or(|o| OPEN_WAYS.contains(&o)),
+            "--open is beside or tab"
+        );
         let canon = fs::canonicalize(path)
             .with_context(|| format!("cannot show {}: no such file or folder", path.display()))?;
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
@@ -222,6 +249,8 @@ impl Core {
             path.display()
         );
         let meta = fs::metadata(&canon)?;
+        // A picture is recorded and announced like any file, but not opened.
+        let open = open.filter(|_| !is_picture(&canon)).map(String::from);
         let me = self.session_whoami().ok();
         let by = me
             .as_ref()
@@ -300,6 +329,8 @@ impl Core {
                 d.by = by;
                 d.run = run;
                 d.shown = now();
+                d.open_seq += u64::from(open.is_some());
+                d.open = open;
                 (d.size, d.mtime) = (size, modified);
                 d.clone()
             }
@@ -313,6 +344,8 @@ impl Core {
                     title,
                     note,
                     shown: now(),
+                    open_seq: u64::from(open.is_some()),
+                    open,
                     host: hostname(),
                     new: true,
                     size,
@@ -345,6 +378,11 @@ impl Core {
     /// Start the reader for a document in the project's tmux session and mark it read. The path is
     /// the recorded one, checked again: the file may have been replaced by a link since.
     pub fn doc_open(&self, id: &str) -> Result<String> {
+        self.doc_open_as(id, true)
+    }
+    /// `doc_open`; `read: false` leaves the document `new` (an agent asked for it to open, and the
+    /// person has not looked yet).
+    pub fn doc_open_as(&self, id: &str, read: bool) -> Result<String> {
         let doc = self
             .doc_list(None)
             .into_iter()
@@ -381,7 +419,9 @@ impl Core {
                 self.session_add(&name, dir, Some(&doc.project), argv, None, None, None)?;
             }
         }
-        self.doc_read(id)?;
+        if read {
+            self.doc_read(id)?;
+        }
         Ok(name)
     }
 
@@ -422,7 +462,8 @@ mod tests {
         (d, c)
     }
     fn show(c: &Core, f: &Path, cap: u64) -> Doc {
-        c.doc_show_within(f, None, None, Some("demo"), cap).unwrap()
+        c.doc_show_within(f, None, None, Some("demo"), None, cap)
+            .unwrap()
     }
 
     #[test]
@@ -533,14 +574,49 @@ mod tests {
         let (d, c) = core();
         let f = d.path().join("big.md");
         fs::write(&f, "0123456789").unwrap();
-        let first = c.doc_show_within(&f, None, None, Some("demo"), 5).unwrap();
+        let first = c
+            .doc_show_within(&f, None, None, Some("demo"), None, 5)
+            .unwrap();
         assert!(!c.docs_dir(&first.id).exists(), "no copy over the cap");
         fs::write(&f, "0123456789abc").unwrap();
-        let second = c.doc_show_within(&f, None, None, Some("demo"), 5).unwrap();
+        let second = c
+            .doc_show_within(&f, None, None, Some("demo"), None, 5)
+            .unwrap();
         assert!(second.new, "a changed size is a change");
         assert_eq!(second.previous.unwrap().copy, None);
     }
 
+    #[test]
+    fn an_ask_to_open_counts_per_show_and_a_picture_is_not_opened() {
+        let (d, c) = core();
+        let f = d.path().join("o.md");
+        fs::write(&f, "x").unwrap();
+        let show = |f: &Path, open| c.doc_show(f, None, None, Some("demo"), open).unwrap();
+        let first = show(&f, None);
+        assert_eq!((first.open.as_deref(), first.open_seq), (None, 0));
+        let second = show(&f, Some("beside"));
+        assert_eq!(
+            (second.open.as_deref(), second.open_seq),
+            (Some("beside"), 1)
+        );
+        assert_eq!(show(&f, Some("tab")).open_seq, 2);
+        // A show without the ask does not count again.
+        let plain = show(&f, None);
+        assert_eq!((plain.open.as_deref(), plain.open_seq), (None, 2));
+        assert!(
+            c.doc_show(&f, None, None, Some("demo"), Some("left"))
+                .is_err(),
+            "only beside and tab"
+        );
+        let pic = d.path().join("p.PNG");
+        fs::write(&pic, "x").unwrap();
+        let shown = show(&pic, Some("beside"));
+        assert_eq!(
+            (shown.open, shown.open_seq),
+            (None, 0),
+            "recorded, not opened"
+        );
+    }
     #[test]
     fn project_filter_title_note_and_refusals() {
         let (d, c) = core();
@@ -552,6 +628,7 @@ mod tests {
                 Some("A\ntitle"),
                 Some("read the\nsecond part"),
                 Some("demo"),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -561,22 +638,30 @@ mod tests {
         assert_eq!(c.doc_list(Some("demo")).len(), 1);
         assert!(c.doc_list(Some("other")).is_empty());
         assert!(
-            c.doc_show(&f, None, None, None).is_err(),
+            c.doc_show(&f, None, None, None, None).is_err(),
             "no session and no --project"
         );
-        assert!(c.doc_show(&f, None, None, Some("nope")).is_err());
+        assert!(c.doc_show(&f, None, None, Some("nope"), None).is_err());
         assert!(
-            c.doc_show(&d.path().join("missing.md"), None, None, Some("demo"))
+            c.doc_show(&d.path().join("missing.md"), None, None, Some("demo"), None)
                 .is_err()
         );
         assert!(
-            c.doc_show(&c.state.join("registry.json"), None, None, Some("demo"))
-                .is_err()
+            c.doc_show(
+                &c.state.join("registry.json"),
+                None,
+                None,
+                Some("demo"),
+                None
+            )
+            .is_err()
         );
         assert!(c.doc_read("nope").is_err());
         // A re-show without a title keeps the given one.
         assert_eq!(
-            c.doc_show(&f, None, None, Some("demo")).unwrap().title,
+            c.doc_show(&f, None, None, Some("demo"), None)
+                .unwrap()
+                .title,
             "A title"
         );
     }
