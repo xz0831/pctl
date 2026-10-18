@@ -52,6 +52,13 @@ while True:
         vt('send-keys', '-t', 'view', '-l', word)
         assert until(lambda: typed()[before:] == word), typed()[before:]
     case('a long run of keys arrives whole', burst)
+    def paste_between_keys():
+        # One write, 3 KB bracketed paste between two keys: crossterm's epoll reader would hand over the first key and keep the rest until the next input.
+        before = len(typed()); body = ''.join(chr(97 + i % 26) for i in range(3000))
+        vt('send-keys', '-t', 'view', '-l', '\x1b[200~' + body + '\x1b[201~'); time.sleep(0.3)
+        vt('send-keys', '-t', 'view', '-l', 'a' + '\x1b[200~' + body + '\x1b[201~' + 'b')
+        assert until(lambda: typed()[before:] == body + 'a' + body + 'b', 1), len(typed()[before:])
+    case('a 3 KB bracketed paste, alone or between two keys, arrives whole within 1 s with no more input', paste_between_keys)
     def changed():
         before = typed(); st('set-option', '-p', '-t', pane, '@pctl_run', 'someone-else')
         vt('send-keys', '-t', 'view', '-l', 'nope')
