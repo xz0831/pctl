@@ -449,12 +449,25 @@ fn while_run_via(
 }
 
 /// Type the keys (text to send with `-l`, or key names) into the pane, in one tmux call that also
-/// checks the run. Ok(false): the run changed and nothing was typed.
-pub fn type_keys(core: &Core, pane: &str, run: &str, keys: &[(bool, String)]) -> Result<bool> {
-    if !core.refresh_pane_input(pane, run)? {
-        return Ok(false);
-    }
-    while_run(core, pane, run, &send_command(pane, keys), "")
+/// checks the run, over the pane's control connection when it has one. Ok(false): the run changed
+/// and nothing was typed. Typed first, recorded after (`record_input`): recording the keystroke
+/// for the refresh state takes ~20 ms, which the person would feel on every key. It is safe
+/// because the app typing these keys shows the run (`view`, kept by app_visible), which stops a
+/// hand-over of the pane in between; the run check is also inside the tmux call that types.
+pub fn type_keys(
+    core: &Core,
+    control: Option<Arc<control::Control>>,
+    pane: &str,
+    run: &str,
+    keys: &[(bool, String)],
+) -> Result<bool> {
+    while_run_via(core, control, pane, run, &send_command(pane, keys), "")
+}
+
+/// Record that the pane got input, for the refresh state. Keys already typed stay typed when this
+/// fails, so a caller warns, it does not undo.
+pub fn record_input(core: &Core, pane: &str, run: &str) -> Result<()> {
+    core.refresh_pane_input(pane, run).map(|_| ())
 }
 
 /// The tmux commands that type `keys` into the pane.
@@ -497,26 +510,16 @@ fn send_keys(
         })
         .collect::<Result<_>>()?;
     let pane = pane_of(core, agent, run)?;
-    // Typed first, recorded after: recording the keystroke for the refresh state takes ~20 ms,
-    // which the person would feel on every key and wheel tick. It is safe because the app sending
-    // these keys told us the run it views (`view`, kept by app_visible), which stops a hand-over of
-    // the pane in between; the run check is also inside the tmux call that types.
-    let typed = while_run_via(
-        core,
-        watch.control(),
-        &pane,
-        run,
-        &send_command(&pane, &keys),
-        "",
-    )?;
+    // Typed first, recorded after: see `type_keys`.
+    let typed = type_keys(core, watch.control(), &pane, run, &keys)?;
     watch.heat(run);
     ensure!(
         typed,
         "changed: pane {pane} no longer holds run {run}; touch nothing"
     );
     // The keys are in the pane either way, so a failure here is a warning, not an error.
-    Ok(match core.refresh_pane_input(&pane, run) {
-        Ok(_) => json!({}),
+    Ok(match record_input(core, &pane, run) {
+        Ok(()) => json!({}),
         Err(e) => json!({"warning": format!("typed, but not recorded: {e:#}")}),
     })
 }

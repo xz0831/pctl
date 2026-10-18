@@ -223,9 +223,13 @@ try:
         assert until(lambda: len(controls()) >= 1, 8), 'the app attached a control client for the shown cell'
         time.sleep(1.5); c0 = starts('capture-pane -p -e -N'); time.sleep(2.5)
         assert starts('capture-pane -p -e -N') == c0, 'an idle cell is not polled'
+        epoch = lambda: sorted(v.get('input_epoch', 0) for v in json.load(open(state / 'refresh-observe.json'))['sessions'].values()) if (state / 'refresh-observe.json').exists() else []
+        e0, k0 = epoch(), starts('send-keys')
         vt('send-keys', '-t', 'view', '-l', 'typed in app'); vt('send-keys', '-t', 'view', 'Enter')
         assert until(lambda: any('got:' in l and 'typed in app' in l for l in scr().split('\n')), 5), scr()
         assert starts('capture-pane -p -e -N') == c0, 'and the echo came without a process read'
+        assert starts('send-keys') == k0, 'typing started no tmux process: it went over the connection'
+        assert until(lambda: epoch() != e0, 5), 'and the input was recorded for the refresh state, after it was typed'
         vt('kill-server')
         assert until(lambda: len(controls()) == 0, 8), 'the app takes its control clients with it'
     case('a cell of the app is read after its pane wrote, with no polling; the control clients go with the app', app_cell)
